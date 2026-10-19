@@ -22,6 +22,7 @@
 pub mod aistudio;
 pub mod antigravity;
 pub mod antigravity_auth;
+mod antigravity_cli_ua;
 mod antigravity_compaction;
 pub mod antigravity_credits;
 mod antigravity_models;

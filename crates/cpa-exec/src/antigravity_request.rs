@@ -84,6 +84,9 @@ fn configured_user_agent(credential: &Credential) -> &str {
 
 /// `resolveUserAgent`.
 pub(crate) fn user_agent(credential: &Credential) -> String {
+    if let Some(cli) = crate::antigravity_cli_ua::from_credential(credential) {
+        return cli;
+    }
     crate::antigravity_version::request_user_agent(configured_user_agent(credential))
 }
 

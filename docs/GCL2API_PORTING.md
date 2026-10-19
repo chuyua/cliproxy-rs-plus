@@ -19,6 +19,7 @@ Last updated: 2026-10-19 (Windows developer node)
 
 - `crates/cpa-server/src/antigravity_403.rs`: Python 403 classification priority, decision categories, action flags and 300/600-second durations. Standalone Rust test binary built, 2/2 groups passed.
 - `crates/cpa-server/src/antigravity_health.rs`: phase 2 pure-Rust port of Python egress IP echo parsing, TTL freshness, conservative negative-evidence gating, proxy-drift transition, and eligibility classification. Exposed as `cpa_server::antigravity_health`; scheduler reads optional nested `gcl2api_account_health` credential metadata to apply 403 classification precedence. Persistence, proxy-bound HTTP probes, and rebinding still require integration.
+- `crates/cpa-exec/src/antigravity_cli_ua.rs`: phase 3 Python CLI User-Agent identity and strict semantic-version floor versus adopted-version comparison. Opt-in by per-credential `gcl2api_cli_version` and/or `gcl2api_cli_adopted_version`; optional `gcl2api_cli_os_type`, `gcl2api_cli_arch`, `gcl2api_cli_auth_method`. Integrated with `antigravity_request::user_agent`. The periodic official manifest fetch, successful credential-backed version probe, and persistent global adopted-version store remain future work; normal Go-compatible User-Agent is preserved without explicit opt-in.
 - `crates/cpa-server/src/lib.rs`: register new module.
 - `crates/cpa-server/src/scheduler.rs`: use classified model/validation cooldowns on Antigravity HTTP 403; retain existing Go behavior for all other categories and all other providers. Added an integration-level scheduler regression test, including unknown 403 and unrelated-model guard.
 - `docs/DIFFERENCES-FROM-GO.md`: document private-branch 403 behavior change.
@@ -27,6 +28,7 @@ Last updated: 2026-10-19 (Windows developer node)
 
 - Python source classifier tests: 8 passed.
 - GitHub Actions Linux run 39181764675: **success** (Rust 403 regression test, Linux release build, smoke test, Artifact upload). URL: https://github.com/chuyua/gcl2api-rust-private-build/actions/runs/39181764675
+- GitHub Actions Linux run 39182930168: failed on Rust 1.99 compile due to unavailable `Result::is_err_or`; replaced with stable `map_or`. Subsequent run 39183209799 **passed Rust 403 and health/egress tests**, with release compilation in progress when this checkpoint was written.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.
