@@ -17,6 +17,12 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   Python gcl2api-plus helper, a drifted IP is stored as `observed_egress_ip`
   while `egress_ip` remains the last accepted binding. Repeated probes cannot
   clear `proxy_drift` without a separate explicit rebind/eligibility step.
+  An Antigravity credential `proxy_url` edit now atomically clears the prior bound
+  IP, observed IP and cached eligibility to `unchecked` within the same file
+  write; the next explicit health check must re-establish identity. Unchanged
+  proxy edits keep the current binding. Python has a similar reset on network
+  configuration updates; upstream Go has no gcl2api account-health metadata.
+  Python proxy-group cooldown/reselection is not yet implemented in Rust.
   This metadata is opt-in and is not part of the Go credential format.
 
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).

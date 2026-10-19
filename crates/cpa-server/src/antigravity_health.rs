@@ -37,6 +37,33 @@ pub fn cached_statuses(credential: &Credential) -> (Option<&str>, Option<&str>) 
     )
 }
 
+/// Invalidate a bound IP in the same CAS/file write that changes the account
+/// proxy. The next explicit health check must establish its new binding.
+pub(crate) fn reset_on_proxy_change(previous: &Credential, next: &mut Credential) {
+    if previous.provider != "antigravity" {
+        return;
+    }
+    let old_proxy = previous.str("proxy_url").unwrap_or_default().trim();
+    let new_proxy = next.str("proxy_url").unwrap_or_default().trim();
+    if old_proxy == new_proxy {
+        return;
+    }
+    let Some(Value::Object(health)) = next.metadata.get_mut(CREDENTIAL_HEALTH_FIELD) else {
+        return;
+    };
+    for field in [
+        "egress_ip",
+        "observed_egress_ip",
+        "egress_country",
+        "eligibility_reason",
+        "eligibility_checked_at",
+    ] {
+        health.insert(field.into(), Value::Null);
+    }
+    health.insert("binding_status".into(), Value::from("unchecked"));
+    health.insert("eligibility_status".into(), Value::from("unchecked"));
+}
+
 /// Python `parse_egress_identity`: prefer `ip`, `query`, `origin`,
 /// `address`, take the first comma-separated address and validate it.
 pub fn parse_egress_identity(payload: &Value) -> Result<(IpAddr, Option<String>), &'static str> {
@@ -623,6 +650,32 @@ mod tests {
         .unwrap();
         assert_eq!(cached_statuses(&failed), (Some("proxy_drift"), Some("error")));
         assert_eq!(cached_health(&failed).unwrap()["observed_egress_ip"], "203.0.113.9");
+        // Editing the account's proxy must atomically invalidate both accepted
+        // and observed IPs. Neither a new proxy nor a repeated probe may carry
+        // the previous healthy eligibility verdict forward.
+        let mut network_patch = MetadataPatch::default();
+        network_patch.set.insert("proxy_url".into(), Value::from("direct"));
+        let rebound = store
+            .apply_patch("account.json", failed.revision, &network_patch)
+            .unwrap();
+        assert_eq!(cached_statuses(&rebound), (Some("unchecked"), Some("unchecked")));
+        let rebound_health = cached_health(&rebound).unwrap();
+        for key in [
+            "egress_ip",
+            "observed_egress_ip",
+            "egress_country",
+            "eligibility_checked_at",
+        ] {
+            assert!(rebound_health[key].is_null(), "stale {key} after proxy change");
+        }
+        let new_echo = record_egress(&store, "account.json", "203.0.113.9".parse().unwrap(), None, 1240.0).unwrap();
+        assert_eq!(cached_statuses(&new_echo), (Some("healthy"), Some("unchecked")));
+        assert_eq!(cached_health(&new_echo).unwrap()["egress_ip"], "203.0.113.9");
+        // Idempotent proxy edits must not destroy the newly learned IP.
+        let same_proxy = store
+            .apply_patch("account.json", new_echo.revision, &network_patch)
+            .unwrap();
+        assert_eq!(cached_health(&same_proxy).unwrap()["egress_ip"], "203.0.113.9");
         let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["refresh_token"], "dummy-refresh-token");
         drop(store);

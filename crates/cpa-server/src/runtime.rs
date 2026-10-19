@@ -1474,6 +1474,7 @@ impl CredentialStore {
         };
         let mut next = Credential::clone(slot);
         patch.apply(&mut next.metadata);
+        crate::antigravity_health::reset_on_proxy_change(slot.as_ref(), &mut next);
         next.refresh_derived();
         next.revision = generation;
         // Go `FileTokenStore.Save` always records the disabled state.

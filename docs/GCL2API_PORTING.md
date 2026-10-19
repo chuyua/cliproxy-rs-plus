@@ -1,6 +1,6 @@
 # gcl2api-plus → cliproxy-rs migration checkpoint
 
-Status: **Phase 2 — private CI-verified persistence; bounded egress probe in development**
+Status: **Phase 2 — private CI-verified egress probe; proxy-change health reset under test**
 Last updated: 2026-10-19 (Windows developer node)
 
 ## Ground truth
@@ -33,6 +33,7 @@ Last updated: 2026-10-19 (Windows developer node)
 - GitHub Actions Linux run 39183209799: **Success**, including release build, startup smoke test, and uploaded Linux x86_64 artifact.
 - Run 39183679801: **Success**, including CLI UA focused tests and Linux release.
 - Run 39184467027: **Success**, private remote branch SHA `d720fd20930c05f7fdbdcb80a4920dae81ff3c3a`, including atomic health persistence tests, Ubuntu 24.04 release, smoke test, and `gcl2api-rust-linux-x86_64` artifact (17,792,986 bytes). Fourth-batch Windows local source commit was `c870b46`; its GitHub snapshot was successfully pushed before the Windows session disappeared.
+- Run 39213709142: **Success**, SHA `67744a5ce1c3eacde82f962b9f971a8db12edd42`: Ubuntu 24.04 focused tests and Linux release/smoke after switching the bounded IP echo reader from unsupported `chunk()` to `bytes_stream()`. Prior run 39209666893 failed on the missing method and was superseded.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.
@@ -44,7 +45,7 @@ The Python classifier and CAS-backed account-health persistence are ported. This
 
 ## Continue in next run
 
-1. Check the next GitHub Actions run for the new bounded egress probe and Linux release; fix compilation or test failures before advancing. Verify no credentials enter CI.
+1. Verify the new per-credential proxy edit invalidation: `CredentialStore::apply_patch` atomically resets accepted/observed IP and cached eligibility to `unchecked` when a file-backed Antigravity `proxy_url` changes; identical edits retain the binding. This follows Python `update_credential_network` reset semantics. It does NOT yet support Python proxy-group node cooldown/reselection, inherited configuration changes, or automatically run a health check. Build a focused mock CI regression before extending the path. Verify no credentials enter CI.
 2. Re-run `cargo fmt --all --check`, `git diff --check`, and focused Rust tests with private CI. Check `git status` for only intended changes; do not commit generated binaries.
 3. Phase 2 health logic is now in Rust; verify its focused CI tests. Implement persistent Antigravity health `binding_status`/`eligibility_status` and safe rebind with mock upstream only. Review `src/antigravity_account_health.py` and `src/storage/sqlite_manager.py` in Python. Record schema and migration before touching credential files.
 4. Port credential candidate ranking, cooldown/fallback and image account priority; then add streaming protocol and billing parity cases.
@@ -53,5 +54,5 @@ The Python classifier and CAS-backed account-health persistence are ported. This
 ## Rules
 
 Operate on the private local branch. Do not import real auth files or log tokens. Match behavior and test outcomes, not just Python syntax. Read `AGENTS.md` and the exact Python reference first; keep changes narrow, commit locally only after verified build/tests.
-`n- 2026-10-19 follow-up: transient echo transport errors preserve existing proxy_drift evidence and observed_egress_ip; regression expectation updated. Pending Linux CI validation.
-`n- CI run 39209666893 failed compilation: wreq::Response has no chunk(); switched bounded echo reader to wreq bytes_stream() + futures_util::StreamExt (already a dependency), preserving 64 KiB cap. Pending next CI.
+- 2026-10-19 follow-up: transient echo transport errors preserve existing `proxy_drift` evidence and `observed_egress_ip`; validated in Ubuntu 24.04 run 39213709142.
+- CI run 39209666893 failed compilation: `wreq::Response` has no `chunk()`; switched bounded echo reader to `bytes_stream()` + `futures_util::StreamExt` (already a dependency), preserving the 64 KiB cap. Fixed and verified in run 39213709142.
