@@ -6,9 +6,13 @@
 //! The pure helpers let the probe layer and its tests share exactly one policy.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use cpa_core::credential::Credential;
-use serde_json::Value;
+use anyhow::{Context, bail, ensure};
+use cpa_core::credential::{Credential, MetadataPatch};
+use serde_json::{Map, Value};
+
+use crate::runtime::{CredentialStore, PatchError};
 
 pub const CREDENTIAL_HEALTH_FIELD: &str = "gcl2api_account_health";
 
@@ -155,10 +159,112 @@ pub fn eligibility_from_response(status: u16, body: &Value, text: &str) -> &'sta
     "error"
 }
 
+fn validate_health_update(updates: &Map<String, Value>) -> anyhow::Result<()> {
+    for (key, value) in updates {
+        match key.as_str() {
+            "binding_status" => ensure!(
+                value.is_null()
+                    || matches!(
+                        value.as_str(),
+                        Some("unchecked" | "healthy" | "proxy_drift" | "proxy_failed")
+                    ),
+                "invalid binding_status"
+            ),
+            "eligibility_status" => ensure!(
+                value.is_null()
+                    || matches!(
+                        value.as_str(),
+                        Some(
+                            "unchecked"
+                                | "eligible"
+                                | "geo_blocked"
+                                | "account_blocked"
+                                | "validation_required"
+                                | "error"
+                        )
+                    ),
+                "invalid eligibility_status"
+            ),
+            "egress_ip" => ensure!(
+                value.is_null() || value.as_str().is_some_and(|ip| ip.parse::<IpAddr>().is_ok()),
+                "invalid egress_ip"
+            ),
+            "egress_country" => ensure!(
+                value.is_null() || value.as_str().is_some_and(|s| s.len() <= 32),
+                "invalid egress_country"
+            ),
+            "eligibility_reason" | "last_403_reason" => ensure!(
+                value.is_null() || value.as_str().is_some_and(|s| s.chars().count() <= 1000),
+                "invalid health reason"
+            ),
+            "eligibility_checked_at" | "last_403_at" => ensure!(
+                value.is_null() || numeric_timestamp(value).is_some(),
+                "invalid health timestamp"
+            ),
+            "last_403_category" => ensure!(
+                value.is_null()
+                    || matches!(
+                        value.as_str(),
+                        Some(
+                            "proxy_drift"
+                                | "proxy_failed"
+                                | "validation_required"
+                                | "geo_blocked"
+                                | "model_forbidden"
+                                | "account_forbidden"
+                                | "unknown_403"
+                        )
+                    ),
+                "invalid last_403_category"
+            ),
+            _ => bail!("unknown health update field"),
+        }
+    }
+    Ok(())
+}
+
+/// Apply only account-health fields to an Antigravity credential, preserving
+/// every unrelated field (including refresh/access tokens).
+///
+/// Reuses CredentialStore's atomic file write, private permissions and CAS
+/// revision guard. A concurrent token refresh is re-read rather than lost.
+/// Call from a blocking task in async contexts, as with `apply_patch`.
+///
+/// This is a persistence foundation: the network probe and management caller
+/// must still invoke it explicitly after validating an actual health result.
+pub fn persist_health_update(
+    store: &CredentialStore,
+    credential_id: &str,
+    updates: &Map<String, Value>,
+) -> anyhow::Result<Arc<Credential>> {
+    validate_health_update(updates)?;
+    for _ in 0..4 {
+        let current = store.get(credential_id).context("Antigravity credential not found")?;
+        ensure!(
+            current.provider == "antigravity",
+            "health updates require Antigravity credentials"
+        );
+        let mut fields = cached_health(&current)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        fields.extend(updates.iter().map(|(key, value)| (key.clone(), value.clone())));
+        let mut patch = MetadataPatch::default();
+        patch.set.insert(CREDENTIAL_HEALTH_FIELD.into(), Value::Object(fields));
+        match store.apply_patch(credential_id, current.revision, &patch) {
+            Ok(updated) => return Ok(updated),
+            Err(PatchError::Stale { .. }) => continue,
+            Err(err) => bail!("failed to persist Antigravity account health: {err:?}"),
+        }
+    }
+    bail!("Antigravity account health changed concurrently too many times")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn ip_echo_formats_follow_python_reference() {
@@ -247,5 +353,79 @@ mod tests {
             eligibility_from_response(200, &json!({"cloudaicompanionProject":"project-1"}), ""),
             "eligible"
         );
+    }
+
+    #[test]
+    fn persists_health_and_keeps_tokens_and_other_metadata() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("gcl2api-health-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.json");
+        let initial = json!({
+            "type": "antigravity",
+            "access_token": "dummy-access-token",
+            "refresh_token": "dummy-refresh-token",
+            "account_data": {"keep": true}
+        });
+        std::fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
+        let credential = Credential::from_file(&dir, &path, initial.as_object().unwrap().clone()).unwrap();
+        let store = CredentialStore::new(vec![credential]);
+
+        let first = json!({
+            "egress_ip": "203.0.113.8",
+            "egress_country": "US",
+            "binding_status": "healthy",
+            "eligibility_status": "eligible",
+            "eligibility_checked_at": 1234.0
+        });
+        let updated = persist_health_update(&store, "account.json", first.as_object().unwrap()).unwrap();
+        assert!(updated.revision > 0);
+        assert_eq!(cached_health(&updated).unwrap()["binding_status"], "healthy");
+
+        let second = json!({
+            "last_403_category": "model_forbidden",
+            "last_403_reason": "Model not available",
+            "last_403_at": 1235.0
+        });
+        let second = persist_health_update(&store, "account.json", second.as_object().unwrap()).unwrap();
+        assert!(second.revision > updated.revision);
+        assert_eq!(cached_health(&second).unwrap()["egress_ip"], "203.0.113.8");
+        assert_eq!(cached_health(&second).unwrap()["last_403_category"], "model_forbidden");
+
+        let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["access_token"], "dummy-access-token");
+        assert_eq!(disk["refresh_token"], "dummy-refresh-token");
+        assert_eq!(disk["account_data"], json!({"keep":true}));
+        assert_eq!(disk[CREDENTIAL_HEALTH_FIELD]["eligibility_status"], "eligible");
+        assert_eq!(disk[CREDENTIAL_HEALTH_FIELD]["last_403_category"], "model_forbidden");
+
+        let invalid = json!({"access_token":"overwritten"});
+        assert!(persist_health_update(&store, "account.json", invalid.as_object().unwrap()).is_err());
+        let invalid = json!({"binding_status":"not-a-state"});
+        assert!(persist_health_update(&store, "account.json", invalid.as_object().unwrap()).is_err());
+        let invalid = json!({"egress_ip":"not an ip"});
+        assert!(persist_health_update(&store, "account.json", invalid.as_object().unwrap()).is_err());
+        assert!(persist_health_update(&store, "missing.json", first.as_object().unwrap()).is_err());
+
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk, after, "invalid health updates cannot mutate auth files");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_non_antigravity_metadata_is_unchanged() {
+        let mut data = json!({"type": "claude", "access_token": "dummy"});
+        let metadata = data.as_object_mut().unwrap().clone();
+        let credential = Credential::from_file(
+            std::path::Path::new("/mock"),
+            std::path::Path::new("/mock/not-antigravity.json"),
+            metadata,
+        )
+        .unwrap();
+        let store = CredentialStore::new(vec![credential]);
+        let health = json!({"binding_status":"healthy"});
+        assert!(persist_health_update(&store, "not-antigravity.json", health.as_object().unwrap()).is_err());
+        assert!(cached_health(&store.get("not-antigravity.json").unwrap()).is_none());
     }
 }
