@@ -1,6 +1,6 @@
 # gcl2api-plus → cliproxy-rs migration checkpoint
 
-Status: **Phase 1 started — first Antigravity 403 vertical slice**
+Status: **Phase 2 — private CI-verified persistence; bounded egress probe in development**
 Last updated: 2026-10-19 (Windows developer node)
 
 ## Ground truth
@@ -30,7 +30,9 @@ Last updated: 2026-10-19 (Windows developer node)
 - Python source classifier tests: 8 passed.
 - GitHub Actions Linux run 39181764675: **success** (Rust 403 regression test, Linux release build, smoke test, Artifact upload). URL: https://github.com/chuyua/gcl2api-rust-private-build/actions/runs/39181764675
 - GitHub Actions Linux run 39182930168: failed on Rust 1.99 compile due to unavailable `Result::is_err_or`; replaced with stable `map_or`. Subsequent run 39183209799 **passed Rust 403 and health/egress tests**, with release compilation in progress when this checkpoint was written.
-- GitHub Actions Linux run 39183209799: **Success**, including release build, startup smoke test, and uploaded Linux x86_64 artifact. Run 39183679801: passed Rust 403, health, and CLI UA tests; Linux release build was in progress at the checkpoint.
+- GitHub Actions Linux run 39183209799: **Success**, including release build, startup smoke test, and uploaded Linux x86_64 artifact.
+- Run 39183679801: **Success**, including CLI UA focused tests and Linux release.
+- Run 39184467027: **Success**, private remote branch SHA `d720fd20930c05f7fdbdcb80a4920dae81ff3c3a`, including atomic health persistence tests, Ubuntu 24.04 release, smoke test, and `gcl2api-rust-linux-x86_64` artifact (17,792,986 bytes). Fourth-batch Windows local source commit was `c870b46`; its GitHub snapshot was successfully pushed before the Windows session disappeared.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.
@@ -38,11 +40,11 @@ Last updated: 2026-10-19 (Windows developer node)
 
 ## Important partial scope
 
-The Python classifier is ported, but account-health persistence, binding health probes, proxy-rebind retries, and automatic account disables **are not wired** in the Rust runtime yet. Until those exist, the new scheduler only uses the safe 300/600-second model cooling decisions. Other 403s keep Rust's existing Go-compatible behavior. Do not report full Python parity.
+The Python classifier and CAS-backed account-health persistence are ported. This iteration adds `record_egress`, `fetch_egress` (effective-proxy HTTP echo, 15s timeout, 64 KiB response cap), and `check_egress_and_persist` (blocking-worker persistence), with local mock coverage. Subsequent safety fix: an observed IP drift keeps the last accepted `egress_ip` and records `observed_egress_ip` separately, preventing a second identical echo from silently clearing `proxy_drift`. A separately verified eligibility check and explicit rebind acceptance are still required before moving to the new IP. This is an intentional safety divergence from the Python helper, which overwrites `egress_ip` immediately; verify end-to-end parity before adoption. This is **an opt-in callable API, not yet an automatic runtime scheduler**. Eligibility POST, proxy-rebind retries, dynamic CLI manifest, and account disabling remain unwired. Other 403s keep the existing Go-compatible fallback. Do not report full Python parity.
 
 ## Continue in next run
 
-1. Check latest private GitHub Actions build; review `antigravity_health` and `gcl2api_antigravity` Rust tests and Linux release artifact.
+1. Check the next GitHub Actions run for the new bounded egress probe and Linux release; fix compilation or test failures before advancing. Verify no credentials enter CI.
 2. Re-run `cargo fmt --all --check`, `git diff --check`, and focused Rust tests with private CI. Check `git status` for only intended changes; do not commit generated binaries.
 3. Phase 2 health logic is now in Rust; verify its focused CI tests. Implement persistent Antigravity health `binding_status`/`eligibility_status` and safe rebind with mock upstream only. Review `src/antigravity_account_health.py` and `src/storage/sqlite_manager.py` in Python. Record schema and migration before touching credential files.
 4. Port credential candidate ranking, cooldown/fallback and image account priority; then add streaming protocol and billing parity cases.
@@ -51,3 +53,4 @@ The Python classifier is ported, but account-health persistence, binding health 
 ## Rules
 
 Operate on the private local branch. Do not import real auth files or log tokens. Match behavior and test outcomes, not just Python syntax. Read `AGENTS.md` and the exact Python reference first; keep changes narrow, commit locally only after verified build/tests.
+`n- 2026-10-19 follow-up: transient echo transport errors preserve existing proxy_drift evidence and observed_egress_ip; regression expectation updated. Pending Linux CI validation.

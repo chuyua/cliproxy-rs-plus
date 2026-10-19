@@ -7,9 +7,12 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
+use cpa_core::config::Config;
 use cpa_core::credential::{Credential, MetadataPatch};
+use cpa_exec::proxy::{GoClients, Proxy};
 use serde_json::{Map, Value};
 
 use crate::runtime::{CredentialStore, PatchError};
@@ -160,6 +163,7 @@ pub fn eligibility_from_response(status: u16, body: &Value, text: &str) -> &'sta
 }
 
 fn validate_health_update(updates: &Map<String, Value>) -> anyhow::Result<()> {
+    ensure!(!updates.is_empty(), "empty health update");
     for (key, value) in updates {
         match key.as_str() {
             "binding_status" => ensure!(
@@ -185,7 +189,7 @@ fn validate_health_update(updates: &Map<String, Value>) -> anyhow::Result<()> {
                     ),
                 "invalid eligibility_status"
             ),
-            "egress_ip" => ensure!(
+            "egress_ip" | "observed_egress_ip" => ensure!(
                 value.is_null() || value.as_str().is_some_and(|ip| ip.parse::<IpAddr>().is_ok()),
                 "invalid egress_ip"
             ),
@@ -260,11 +264,185 @@ pub fn persist_health_update(
     bail!("Antigravity account health changed concurrently too many times")
 }
 
+/// Convert an IP echo into a persisted account binding decision.
+pub fn record_egress(
+    store: &CredentialStore,
+    id: &str,
+    ip: IpAddr,
+    country: Option<String>,
+    timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    ensure!(timestamp.is_finite(), "invalid timestamp");
+    let current = store.get(id).context("account not found")?;
+    let prior = cached_health(&current)
+        .and_then(|h| h.get("egress_ip"))
+        .and_then(Value::as_str);
+    let observed = observe_egress(prior, ip, country);
+    let mut fields = Map::new();
+    // Preserve the accepted IP on drift so repeat probes cannot clear it.
+    if observed.should_check_eligibility {
+        fields.insert("egress_ip".into(), Value::from(observed.ip.to_string()));
+        fields.insert("observed_egress_ip".into(), Value::Null);
+    } else {
+        fields.insert("observed_egress_ip".into(), Value::from(observed.ip.to_string()));
+    }
+    fields.insert(
+        "egress_country".into(),
+        observed.country.map_or(Value::Null, Value::from),
+    );
+    fields.insert("binding_status".into(), Value::from(observed.binding_status));
+    if !observed.should_check_eligibility {
+        fields.insert("eligibility_status".into(), Value::from("unchecked"));
+        fields.insert(
+            "eligibility_reason".into(),
+            Value::from("Egress IP changed; rebind required"),
+        );
+    }
+    fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
+    persist_health_update(store, id, &fields)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EchoOutcome {
+    Identity(IpAddr, Option<String>),
+    TemporarilyUnavailable(u16),
+}
+
+/// Check an account's egress through its configured transport, without
+/// falling back to a direct connection when proxy configuration is invalid.
+pub async fn fetch_egress(
+    clients: &GoClients,
+    config: &Config,
+    credential: &Credential,
+    url: &str,
+    user_agent: &str,
+) -> anyhow::Result<EchoOutcome> {
+    ensure!(!url.trim().is_empty(), "missing IP echo URL");
+    let proxy = Proxy::effective(credential, config);
+    ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
+    let client = clients.try_get(&proxy).context("account proxy unavailable")?;
+    let response = client
+        .get(url)
+        .header("User-Agent", user_agent)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await?;
+    if response.status().as_u16() != 200 {
+        return Ok(EchoOutcome::TemporarilyUnavailable(response.status().as_u16()));
+    }
+    let payload: Value = serde_json::from_slice(&read_bounded(response).await?)?;
+    ensure!(payload.is_object(), "IP echo must be an object");
+    let (ip, country) = parse_egress_identity(&payload).map_err(anyhow::Error::msg)?;
+    Ok(EchoOutcome::Identity(ip, country))
+}
+
+async fn read_bounded(mut response: wreq::Response) -> anyhow::Result<Vec<u8>> {
+    const MAX: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(chunk.len() <= MAX - bytes.len(), "IP echo response too large");
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Run the bound IP check and atomically record its outcome.
+pub async fn check_egress_and_persist(
+    store: Arc<CredentialStore>,
+    clients: &GoClients,
+    config: &Config,
+    id: &str,
+    url: &str,
+    user_agent: &str,
+    timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    let current = store.get(id).context("account not found")?;
+    ensure!(current.provider == "antigravity", "wrong provider");
+    ensure!(timestamp.is_finite(), "invalid timestamp");
+    let result = fetch_egress(clients, config, &current, url, user_agent).await;
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || persist_egress_result(&store, &id, result, timestamp))
+        .await
+        .context("health worker failed")?
+}
+
+fn persist_egress_result(
+    store: &CredentialStore,
+    id: &str,
+    result: anyhow::Result<EchoOutcome>,
+    timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    match result {
+        Ok(EchoOutcome::Identity(ip, country)) => record_egress(store, id, ip, country, timestamp),
+        Ok(EchoOutcome::TemporarilyUnavailable(status)) => {
+            let mut fields = Map::new();
+            fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
+            fields.insert("eligibility_reason".into(), Value::from(echo_failure_reason(status)));
+            persist_health_update(store, id, &fields)
+        }
+        Err(_) => persist_echo_error(store, id, timestamp),
+    }
+}
+
+fn persist_echo_error(store: &CredentialStore, id: &str, timestamp: f64) -> anyhow::Result<Arc<Credential>> {
+    let mut fields = Map::new();
+    // A transient echo failure must not erase evidence of an unaccepted IP drift.
+    let drift = store
+        .get(id)
+        .and_then(|credential| {
+            cached_health(&credential)
+                .and_then(|health| health.get("binding_status").and_then(Value::as_str).map(str::to_owned))
+        })
+        .as_deref()
+        == Some("proxy_drift");
+    if !drift {
+        fields.insert("binding_status".into(), Value::from("proxy_failed"));
+    }
+    fields.insert("eligibility_status".into(), Value::from("error"));
+    fields.insert("eligibility_reason".into(), Value::from("IP check failed"));
+    fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
+    persist_health_update(store, id, &fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn ip_echo_uses_only_loopback_mock() {
+        use axum::{Json, Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/ip",
+            get(|| async { Json(json!({"ip":"203.0.113.8","country_code":"us"})) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let data = json!({"type":"antigravity","proxy_url":"direct"});
+        let credential = Credential::from_file(
+            std::path::Path::new("/mock"),
+            std::path::Path::new("/mock/a.json"),
+            data.as_object().unwrap().clone(),
+        )
+        .unwrap();
+        let clients = GoClients::new(Default::default());
+        let result = fetch_egress(
+            &clients,
+            &Config::default(),
+            &credential,
+            &format!("http://{address}/ip"),
+            "mock-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            EchoOutcome::Identity("203.0.113.8".parse().unwrap(), Some("US".into()))
+        );
+        server.abort();
+    }
 
     #[test]
     fn ip_echo_formats_follow_python_reference() {
@@ -409,6 +587,41 @@ mod tests {
 
         let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk, after, "invalid health updates cannot mutate auth files");
+        let stable = record_egress(
+            &store,
+            "account.json",
+            "203.0.113.8".parse().unwrap(),
+            Some("US".into()),
+            1236.0,
+        )
+        .unwrap();
+        assert_eq!(cached_statuses(&stable).0, Some("healthy"));
+        let drift = record_egress(&store, "account.json", "203.0.113.9".parse().unwrap(), None, 1237.0).unwrap();
+        assert_eq!(cached_statuses(&drift), (Some("proxy_drift"), Some("unchecked")));
+        assert_eq!(cached_health(&drift).unwrap()["egress_ip"], "203.0.113.8");
+        assert_eq!(cached_health(&drift).unwrap()["observed_egress_ip"], "203.0.113.9");
+        let repeat = record_egress(&store, "account.json", "203.0.113.9".parse().unwrap(), None, 1237.5).unwrap();
+        assert_eq!(cached_statuses(&repeat), (Some("proxy_drift"), Some("unchecked")));
+        assert_eq!(cached_health(&repeat).unwrap()["egress_ip"], "203.0.113.8");
+        let unavailable = persist_egress_result(
+            &store,
+            "account.json",
+            Ok(EchoOutcome::TemporarilyUnavailable(429)),
+            1238.0,
+        )
+        .unwrap();
+        assert_eq!(cached_statuses(&unavailable), (Some("proxy_drift"), Some("unchecked")));
+        let failed = persist_egress_result(
+            &store,
+            "account.json",
+            Err(anyhow::anyhow!("mock transport failure")),
+            1239.0,
+        )
+        .unwrap();
+        assert_eq!(cached_statuses(&failed), (Some("proxy_drift"), Some("error")));
+        assert_eq!(cached_health(&failed).unwrap()["observed_egress_ip"], "203.0.113.9");
+        let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["refresh_token"], "dummy-refresh-token");
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
