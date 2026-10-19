@@ -54,3 +54,4 @@ The Python classifier and CAS-backed account-health persistence are ported. This
 
 Operate on the private local branch. Do not import real auth files or log tokens. Match behavior and test outcomes, not just Python syntax. Read `AGENTS.md` and the exact Python reference first; keep changes narrow, commit locally only after verified build/tests.
 `n- 2026-10-19 follow-up: transient echo transport errors preserve existing proxy_drift evidence and observed_egress_ip; regression expectation updated. Pending Linux CI validation.
+`n- CI run 39209666893 failed compilation: wreq::Response has no chunk(); switched bounded echo reader to wreq bytes_stream() + futures_util::StreamExt (already a dependency), preserving 64 KiB cap. Pending next CI.

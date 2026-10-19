@@ -336,10 +336,13 @@ pub async fn fetch_egress(
     Ok(EchoOutcome::Identity(ip, country))
 }
 
-async fn read_bounded(mut response: wreq::Response) -> anyhow::Result<Vec<u8>> {
+async fn read_bounded(response: wreq::Response) -> anyhow::Result<Vec<u8>> {
+    use futures_util::StreamExt;
     const MAX: usize = 64 * 1024;
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
         ensure!(chunk.len() <= MAX - bytes.len(), "IP echo response too large");
         bytes.extend_from_slice(&chunk);
     }
