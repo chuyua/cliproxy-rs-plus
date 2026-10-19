@@ -1342,7 +1342,8 @@ impl Scheduler {
         // 600s. Other 403 categories retain the current Go fallback until the
         // account health / proxy rebind flow is ported.
         let antigravity_403_cooldown = if status == 403 && c.provider.eq_ignore_ascii_case("antigravity") {
-            crate::antigravity_403::classify(&text, None, None)
+            let (binding, eligibility) = crate::antigravity_health::cached_statuses(c);
+            crate::antigravity_403::classify(&text, binding, eligibility)
                 .category
                 .model_cooldown_seconds()
                 .map(Duration::from_secs)
@@ -2131,6 +2132,47 @@ mod tests {
         ));
         unchanged.record(&other, "claude-sonnet", &failure, &policy, at);
         assert_eq!(unchanged.wait(&other, "claude-sonnet", at), Some(secs(1800)));
+    }
+
+    /// Health cache is optional. When present, Python's explicit proxy
+    /// failure evidence takes precedence over the response's model markers.
+    #[test]
+    fn gcl2api_antigravity_403_honors_cached_binding_precedence() {
+        let mut account = cred(
+            "antigravity-account",
+            serde_json::json!({
+                "gcl2api_account_health": {
+                    "binding_status": "proxy_drift",
+                    "eligibility_status": "eligible"
+                }
+            }),
+        );
+        account.provider = "antigravity".into();
+        let policy = Policy::default();
+        let at = Instant::now();
+        let fault = Outcome::Failure(ExecError::local(
+            403,
+            FailureScope::Credential,
+            "Model gemini-image is not available for this account",
+        ));
+        let mut s = Scheduler::default();
+        s.record(&account, "gemini-image", &fault, &policy, at);
+        assert_eq!(s.wait(&account, "gemini-image", at), Some(secs(1800)));
+
+        account.metadata.insert(
+            "gcl2api_account_health".into(),
+            serde_json::json!({
+                "binding_status": "healthy",
+                "eligibility_status": "geo_blocked"
+            }),
+        );
+        let mut s = Scheduler::default();
+        s.record(&account, "gemini-image", &fault, &policy, at);
+        assert_eq!(
+            s.wait(&account, "gemini-image", at),
+            Some(secs(300)),
+            "explicit model denial must override stale cached geo status"
+        );
     }
 
     /// A 429 whose stated reset is `stated` from `at`.

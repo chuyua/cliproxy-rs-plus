@@ -3,6 +3,7 @@
 mod access;
 mod affinity;
 mod antigravity_403;
+pub mod antigravity_health;
 pub mod capabilities;
 mod classify;
 mod claude;
