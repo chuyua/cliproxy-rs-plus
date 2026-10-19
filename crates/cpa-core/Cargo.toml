@@ -1,0 +1,21 @@
+[package]
+name = "cpa-core"
+description = "Shared contracts for cliproxy-rs: config, credentials, formats and the execution envelope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tracing.workspace = true
+base64 = "0.22"
+bcrypt = "0.19"
+sha2 = "0.10"
+yaml-edit = "0.3.2"

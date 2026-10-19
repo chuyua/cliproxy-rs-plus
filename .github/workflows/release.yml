@@ -1,0 +1,224 @@
+# Builds release archives for Linux, macOS and Windows, a SHA256SUMS file and the
+# single-file dashboard (management.html) for Go CLIProxyAPI servers.
+#
+# Pushing a tag such as v0.1.0 creates a draft GitHub release with every asset attached;
+# a maintainer reviews and publishes it. A manual run builds the same files as workflow
+# artifacts without creating a release. Publishing updates the Homebrew tap without
+# rebuilding the release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # One exact compiler for every job: the size and allocation budgets are exact numbers
+  # from one compiler and std. Bumping it means re-measuring bench/budgets.txt.
+  RUST_TOOLCHAIN: "1.99.0"
+
+jobs:
+  dashboard:
+    name: dashboard
+    if: github.event_name != 'release'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Check, test and build
+        working-directory: ui
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+      # The binary embeds the committed ui/dist, so it must be what the source builds.
+      - name: Committed build matches the source
+        run: git diff --exit-code -- ui/dist ui/dist-panel ui/PANEL.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: panel
+          path: ui/dist-panel/management.html
+          if-no-files-found: error
+
+  # The same fmt, clippy, network-denied tests and Windows check as every push.
+  test:
+    name: CI
+    if: github.event_name != 'release'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build ${{ matrix.target }}
+    if: github.event_name != 'release'
+    needs: [dashboard, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so the binaries need glibc 2.35 at most.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+      # macOS images ship cmake and Xcode's clang. Windows images ship CMake and LLVM but not
+      # NASM, which BoringSSL needs there: btls-sys sets OPENSSL_NO_ASM only when it
+      # cross-compiles from another host, so a native MSVC build keeps the assembly, and
+      # BoringSSL's CMakeLists assembles x86_64 Windows code with NASM (enable_language(ASM_NASM)).
+      - name: NASM and libclang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          printf '%s\n' 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+          printf 'LIBCLANG_PATH=%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+      - name: Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build
+        run: cargo build --release --locked -p cliproxy --target ${{ matrix.target }}
+      # Pull requests gate Linux; macOS and Windows are gated here, before anything is
+      # published, and weekly by idle.yml. CPU time, wakeups, threads and memory over a
+      # minute without requests, against bench/budgets.txt.
+      - name: Idle gate (macOS, Windows)
+        if: runner.os != 'Linux'
+        run: |
+          exe=cliproxy; os=macos
+          [[ "$RUNNER_OS" == Windows ]] && { exe=cliproxy.exe; os=windows; }
+          bench/gate.sh idle "$os" "target/${{ matrix.target }}/release/$exe" 1
+      - name: Package
+        run: |
+          tagged=false; [[ "$GITHUB_REF" == refs/tags/v* ]] && tagged=true
+          if $tagged; then version="${GITHUB_REF_NAME#v}"; else version="dev-${GITHUB_SHA::7}"; fi
+          name="cliproxy-${version}-${{ matrix.target }}"
+          exe=cliproxy; [[ "$RUNNER_OS" == Windows ]] && exe=cliproxy.exe
+          mkdir -p "$name" out
+          cp "target/${{ matrix.target }}/release/$exe" README.md LICENSE "$name/"
+          # The first line is Go's startup banner; the last is "cliproxy <version>".
+          reported="$("./$name/$exe" --version | tr -d '\r' | tail -n 1)"
+          echo "$reported"
+          if $tagged && [[ "$reported" != "cliproxy $version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the binary version ($reported)"; exit 1
+          fi
+          if [[ "$RUNNER_OS" == Windows ]]; then 7z a -tzip "out/$name.zip" "$name" >/dev/null; else tar -czf "out/$name.tar.gz" "$name"; fi
+          ls -l out
+          bench/gate.sh size "${{ matrix.target }}" "$name/$exe" out/"$name".*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  docker:
+    name: docker image (not pushed)
+    if: github.event_name != 'release'
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -t cliproxy-rs:ci .
+      - name: Smoke test
+        run: docker run --rm cliproxy-rs:ci --version
+      - name: Size gate
+        run: bench/gate.sh image cliproxy-rs:ci
+
+  release:
+    name: draft release
+    needs: [build, docker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --draft
+
+  homebrew:
+    name: update Homebrew tap
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
+    steps:
+      - name: Check tap token
+        id: token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping the tap update."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.token.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.token.outputs.enabled == 'true'
+        with:
+          repository: vayungodara/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Render published release formula
+        if: steps.token.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP/homebrew-release"
+          mkdir -p homebrew-tap/Formula
+          python3 packaging/homebrew/render.py "$RELEASE_TAG" "$RUNNER_TEMP/homebrew-release/SHA256SUMS" homebrew-tap/Formula/cliproxy-rs.rb
+      - name: Commit formula update
+        if: steps.token.outputs.enabled == 'true'
+        working-directory: homebrew-tap
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git add Formula/cliproxy-rs.rb
+          if git diff --cached --quiet; then
+            echo "The formula is already current."
+            exit 0
+          fi
+          git config user.name 'Vayun Godara'
+          git config user.email '187050579+vayungodara@users.noreply.github.com'
+          git commit -m "cliproxy-rs: update to $RELEASE_TAG"
+          git push

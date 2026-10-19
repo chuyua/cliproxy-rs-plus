@@ -1,0 +1,95 @@
+{
+  "name": "chat-nonstream-trailer-credit",
+  "credential": {
+    "api_key": "devin-session-token$fixture",
+    "base_url": "http://127.0.0.1:37121",
+    "device_seed": "seed-1",
+    "session_token": "devin-session-token$fixture",
+    "type": "devin"
+  },
+  "request": {
+    "body": "{\"model\":\"swe-2\",\"messages\":[{\"role\":\"system\",\"content\":\"You are helpful.\\nYou are Claude Code, Anthropic's official CLI for Claude.\\nKeep it short.\"},{\"role\":\"user\",\"content\":\"What's the weather in Paris? chat-nonstream-trailer-credit\"},{\"role\":\"assistant\",\"content\":\"Checking.\",\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"sunny\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Thanks \u003cb\u003e\u0026\u003c/b\u003e\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/webp;base64,UklGRg==\"}}]}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}},{\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"description\":\"Runs a command, returning output or a session ID for ongoing interaction.\",\"parameters\":{\"type\":\"object\"}}}],\"temperature\":0.3,\"max_tokens\":500}",
+    "model": "swe-2",
+    "source": "openai",
+    "stream": false
+  },
+  "responses": [
+    {
+      "status": 200,
+      "headers": [
+        [
+          "Content-Type",
+          "application/connect+proto"
+        ]
+      ],
+      "body": "",
+      "body_b64": "AAAAAAMaAXgCAAAATXsiZXJyb3IiOnsiY29kZSI6ImZhaWxlZF9wcmVjb25kaXRpb24iLCJtZXNzYWdlIjoiQ3JlZGl0IGJhbGFuY2UgZXhoYXVzdGVkIn19"
+    }
+  ],
+  "upstream": [
+    {
+      "method": "POST",
+      "target": "/exa.api_server_pb.ApiServerService/GetChatMessage",
+      "headers": [
+        [
+          "Host",
+          "127.0.0.1:37121"
+        ],
+        [
+          "Content-Length",
+          "1554"
+        ],
+        [
+          "Accept",
+          "*/*"
+        ],
+        [
+          "Authorization",
+          "Basic devin-session-token$fixture-devin-session-token$fixture"
+        ],
+        [
+          "Connect-Protocol-Version",
+          "1"
+        ],
+        [
+          "Content-Type",
+          "application/connect+proto"
+        ],
+        [
+          "Sentry-Trace",
+          "c9c4f1147b53966b2978146b4dc6c972-4460eafd84741162-1"
+        ]
+      ],
+      "body": "",
+      "body_b64": "AAAABg0KsAYKBmNoaXNlbBIKMzAwMC4xMC4yMRobZGV2aW4tc2Vzc2lvbi10b2tlbiRmaXh0dXJlIgJlbioFbGludXg6CjMwMDAuMTAuMjFiBmNoaXNlbPoB3AVkMzU3MTg4YTU3NGM3MmVjMjZhYWU3ODVhZjJhZDhhMjMzZWQzYjAzYjEyNDI1MTljOWFhMTZkOTg2ZjA3NWY3ZjdkMTA4NTk3MmM4MGMzOTVhMWUwYWFjYmYyYjM3Y2ZkMDkzYTQ1M2M0YWU4ZDczYTM5NDUxZjNhMzliZjk0NmM1YTJmMDI4NTBhYmUwOGE1NTYwNWEwY2Q3MzJhYWZjNTg0ZmYzOTA3NjkyM2MxYzQ4ZjIyMzZmMTRlMzg0Yzk0YmUyZjA0NDc5NGEyYzc5MGQ5ZTA4ZTY3NmU0NTExYzdlMzJjMWMzODI3ZjNiNDI2MmY5YTJhNzliZGU5Y2UyMmEwMjBjOWY3MTgxM2Q2OGQ1YTA1MjZjMTdiZDEyZWRmYTY4Y2FiNzA4NjYyMjI1YTVhMTEzZTMyNTVkYzdjYmNkNDJkOGE3Njg0NjM4ZTRkM2ZhNTBhMGVjNTJiNGQ2NTE5N2U3YzdmYzdjNjE4OWVkY2YzNWRkOWI0ZDQzODYyOWVkODYzZGM4NDllNDAyNjExMGEwZGY2MTI1ZDU0MmM0ODMxNDRiZTgzN2VjZjgyMDE2ZjFhYTc1ZTM5YmFlNWRjMGMwMWUyMjJkMGUwNjU1NTdmMWVlZTc3ZWEwMmU1NDBiZjM0ZmYyOWMxNWQ1MjkzYzA0ZmVmNTJhOGVjZjI5N2RjMDNkNGVmOGM5YWRlYmJhMTIxZWM4Nzg1MGU2MzA4OWE4ZGI0NjczNzNjMjNhZmZiMWM0MzU5MGZjNTVlMzFlNDA2Y2M4ZmE2ZDgyZjM5ZGIxZDE0NzU4ZDU2OWYyNjM4YTQ0MTE5YTNhZGZlYTU0YmRkOWE2MDljMTc4OWQwOTNjODU3MDc3ZTQwYzkyZmNlYTFlNGIwYzhhYzRiNjk1MmYxODUzNTY0ZjM5ODc4YzdmYmU2YWExMmM4OTllNTYxMzRhYTBlMTgzYmY2NTgwZGI5OTQ5NGUSH1lvdSBhcmUgaGVscGZ1bC4KS2VlcCBpdCBzaG9ydC4aZAokM2NmZTZjZWItMjk4Yi00M2RjLWFmZGEtZjVmYmU5MTYwYzk2EAEaOldoYXQncyB0aGUgd2VhdGhlciBpbiBQYXJpcz8gY2hhdC1ub25zdHJlYW0tdHJhaWxlci1jcmVkaXQaXAokNzUzZDFkN2ItNDVmNC00NmQwLTkxOTctYjJkM2JiYTQwZDQ2EAIaCUNoZWNraW5nLjInCgZjYWxsX2ESC2dldF93ZWF0aGVyGhB7ImNpdHkiOiJQYXJpcyJ9GjcKJGQ1YmM1MmFiLWRjMTEtNDM0ZS04MzAxLTcyYzVjZmFhMWQ5YRAEGgVzdW5ueToGY2FsbF9hGnEKJGI0NGVhZTQyLTFlMmEtNDgyZC1iZmQ4LTg5NDE0ZmUxNjQzYhABGi9bSW1hZ2UgMTogcGFzdGVkX2ltYWdlXzEud2VicF0KClRoYW5rcyA8Yj4mPC9iPlIWCghVa2xHUmc9PRIKaW1hZ2Uvd2VicDgFQhwIARD0AxiQAykzMzMzMzPTPzgoQQAAAGBmZu4/UlUKC2dldF93ZWF0aGVyEgtHZXQgd2VhdGhlcho5eyJ0eXBlIjoib2JqZWN0IiwicHJvcGVydGllcyI6eyJjaXR5Ijp7InR5cGUiOiJzdHJpbmcifX19Um0KDGV4ZWNfY29tbWFuZBJKUnVucyBhIGNvbW1hbmQsIHJldHVybmluZyBvdXRwdXQgb3IgYW4gc2Vzc2lvbiBJRCBmb3Igb25nb2luZyBpbnRlcmFjdGlvbi4aEXsidHlwZSI6Im9iamVjdCJ9eioKJGM2M2ExMGMyLWVmMjUtNWUzZi1iNjFmLTUwODIyYTUzOWM1ZBgEIA6CASRjNjNhMTBjMi1lZjI1LTVlM2YtYjYxZi01MDgyMmE1MzljNWSgAQGqAQpzd2UtMi1oaWdo"
+    }
+  ],
+  "downstream": {
+    "err_status": 429,
+    "err_body": "devin upstream error (failed_precondition): Credit balance exhausted"
+  },
+  "extra": {
+    "capture": {
+      "origin": "http://127.0.0.1:40897",
+      "request": "=== API REQUEST 1 ===\nTimestamp: \u003ctime\u003e\nUpstream URL: http://127.0.0.1:40897/exa.api_server_pb.ApiServerService/GetChatMessage\nHTTP Method: POST\nAuth: provider=devin, auth_id=devin-fixture.json, label=devin, type=devin value=devi...ture\n\nHeaders:\nAccept: */*\nAuthorization: Basic devi...ture\nConnect-Protocol-Version: 1\nContent-Type: application/connect+proto\nSentry-Trace: 3c16c85877748b9781ead6779764db8d-f7924b24614cf1b7-1\nUser-Agent: \n\nBody:\n=== INTERMEDIATE INTERACTIONS ===\n{\n  \"model\": \"swe-2\",\n  \"input\": [\n    {\n      \"type\": \"user_input\",\n      \"content\": [\n        {\n          \"type\": \"text\",\n          \"text\": \"What's the weather in Paris? chat-nonstream-trailer-credit\"\n        }\n      ]\n    },\n    {\n      \"type\": \"model_output\",\n      \"content\": [\n        {\n          \"type\": \"text\",\n          \"text\": \"Checking.\"\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"name\": \"get_weather\",\n      \"arguments\": {\n        \"city\": \"Paris\"\n      },\n      \"id\": \"call_a\"\n    },\n    {\n      \"type\": \"function_result\",\n      \"result\": \"sunny\",\n      \"call_id\": \"call_a\",\n      \"name\": \"get_weather\"\n    },\n    {\n      \"type\": \"user_input\",\n      \"content\": [\n        {\n          \"type\": \"text\",\n          \"text\": \"Thanks \u003cb\u003e\u0026\u003c/b\u003e\"\n        },\n        {\n          \"type\": \"image\",\n          \"mime_type\": \"image/webp\",\n          \"data\": \"UklGRg==\"\n        }\n      ]\n    }\n  ],\n  \"system_instruction\": \"You are helpful.\\nYou are Claude Code, Anthropic's official CLI for Claude.\\nKeep it short.\",\n  \"generation_config\": {\n    \"max_output_tokens\": 500,\n    \"temperature\": 0.3\n  },\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"name\": \"get_weather\",\n      \"description\": \"Get weather\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"city\": {\n            \"type\": \"string\"\n          }\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"name\": \"exec_command\",\n      \"description\": \"Runs a command, returning output or a session ID for ongoing interaction.\",\n      \"parameters\": {\n        \"type\": \"object\"\n      }\n    }\n  ]\n}\n\n=== DEVIN UPSTREAM REQUEST ===\n{\n  \"model\": \"swe-2-high\",\n  \"session_id\": \"c63a10c2-ef25-5e3f-b61f-50822a539c5d\",\n  \"cascade_id\": \"c63a10c2-ef25-5e3f-b61f-50822a539c5d\",\n  \"system_prompt\": \"You are helpful.\\nKeep it short.\",\n  \"temperature\": 0.3,\n  \"max_tokens\": 500,\n  \"prompts\": [\n    {\n      \"id\": \"1909e447-a144-4cc9-ba73-4b641d3bf286\",\n      \"source\": 1,\n      \"role\": \"user\",\n      \"content\": \"What's the weather in Paris? chat-nonstream-trailer-credit\"\n    },\n    {\n      \"id\": \"1e5d86e1-03e0-420c-80e8-f939bd474235\",\n      \"source\": 2,\n      \"role\": \"assistant\",\n      \"content\": \"Checking.\",\n      \"tool_calls\": [\n        {\n          \"ID\": \"call_a\",\n          \"Name\": \"get_weather\",\n          \"Arguments\": \"{\\\"city\\\":\\\"Paris\\\"}\"\n        }\n      ]\n    },\n    {\n      \"id\": \"46cc2395-b459-473a-9fee-4361f107fdce\",\n      \"source\": 4,\n      \"role\": \"tool\",\n      \"content\": \"sunny\",\n      \"tool_call_id\": \"call_a\"\n    },\n    {\n      \"id\": \"7a778fff-be79-41b4-a51a-34caf000caa6\",\n      \"source\": 1,\n      \"role\": \"user\",\n      \"content\": \"[Image 1: pasted_image_1.webp]\\n\\nThanks \\u003cb\\u003e\\u0026\\u003c/b\\u003e\",\n      \"images\": [\n        {\n          \"mime_type\": \"image/webp\",\n          \"data_len\": 8\n        }\n      ]\n    }\n  ],\n  \"tools\": [\n    {\n      \"name\": \"get_weather\",\n      \"description\": \"Get weather\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"city\": {\n            \"type\": \"string\"\n          }\n        }\n      }\n    },\n    {\n      \"name\": \"exec_command\",\n      \"description\": \"Runs a command, returning output or an session ID for ongoing interaction.\",\n      \"parameters\": {\n        \"type\": \"object\"\n      }\n    }\n  ]\n}\n\n",
+      "response": "=== API RESPONSE 1 ===\nTimestamp: \u003ctime\u003e\n\nStatus: 200\nHeaders:\nContent-Length: 90\nContent-Type: application/connect+proto\n\nBody:\n=== DEVIN UPSTREAM RESPONSE ===\n{\n  \"status\": \"trailer_error(429): devin upstream error (failed_precondition): Credit balance exhausted\",\n  \"frames_count\": 2,\n  \"content\": \"x\"\n}Error: devin upstream error (failed_precondition): Credit balance exhausted\n"
+    },
+    "usage": [
+      {
+        "cached_tokens": 0,
+        "fail_body": "devin upstream error (failed_precondition): Credit balance exhausted",
+        "fail_status": 429,
+        "failed": true,
+        "input_tokens": 0,
+        "model": "swe-2",
+        "output_tokens": 0,
+        "reasoning_effort": "",
+        "reasoning_tokens": 0,
+        "response_model": "",
+        "service_tier": "",
+        "total_tokens": 0,
+        "ttft_set": true
+      }
+    ]
+  }
+}

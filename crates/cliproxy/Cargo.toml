@@ -1,0 +1,42 @@
+[package]
+name = "cliproxy"
+description = "CLIProxyAPI rebuilt in Rust: one binary that turns AI subscriptions into standard APIs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+cpa-common.workspace = true
+cpa-core.workspace = true
+cpa-exec.workspace = true
+cpa-home.workspace = true
+cpa-plugin.workspace = true
+cpa-server.workspace = true
+cpa-store.workspace = true
+getrandom = "0.3"
+libc.workspace = true
+# The -tui management client: the crossterm backend only.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+# `all` for SO_REUSEPORT, which Go sets on mDNS sockets outside Linux.
+socket2 = { workspace = true, features = ["all"] }
+tokio.workspace = true
+tracing.workspace = true
+tokio-util = "0.7"
+futures-util.workspace = true
+# Already in the tree through axum and cpa-server; the heap-trim response hook.
+http-body = "1"
+tower = { version = "0.5", features = ["util"] }
+# Already in the tree through cpa-exec; the TUI client follows redirects itself.
+url = "2"
+# The TUI's management API client.
+wreq.workspace = true
+
+[dev-dependencies]
+cpa-plugin = { workspace = true, features = ["test-support"] }
+cpa-home = { workspace = true, features = ["fake"] }

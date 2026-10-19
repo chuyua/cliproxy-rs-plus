@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Patched third-party crates (see vendor/README.md); not workspace members.
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.2.6"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+cpa-common = { path = "crates/cpa-common" }
+cpa-core = { path = "crates/cpa-core" }
+cpa-exec = { path = "crates/cpa-exec" }
+cpa-home = { path = "crates/cpa-home" }
+cpa-plugin = { path = "crates/cpa-plugin" }
+cpa-server = { path = "crates/cpa-server" }
+cpa-store = { path = "crates/cpa-store" }
+cpa-translate = { path = "crates/cpa-translate" }
+
+anyhow = "1"
+axum = "0.8.9"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+http = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+socket2 = "0.6"
+tokio = { version = "1.53", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wreq = { version = "6.0.0-rc.31", features = ["stream", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# gjson 0.8.1 with SIMD string scanning; behaviour unchanged (vendor/README.md).
+[patch.crates-io]
+gjson = { path = "vendor/gjson" }

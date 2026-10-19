@@ -1,0 +1,157 @@
+# Performance budgets, checked by bench/gate.sh (size, idle) and by
+# crates/cpa-server/tests/alloc_budget.rs (heap per request) on GitHub-hosted runners.
+#
+#   <key> <value> <tolerance %>
+#
+# A measurement fails when it exceeds value * (1 + tolerance / 100). Byte budgets are the
+# last accepted measurement with 2% of room; counts that must stay near zero have none.
+# A change that needs more raises the value here, with a dated line above it that names
+# the feature and its cost, as ui/scripts/size.mjs does for the dashboard:
+#
+#   # 2026-11-02: Homebrew service hook, +18 KB .text.
+#
+# Every budgeted number comes from one pinned compiler (RUST_TOOLCHAIN in the workflows).
+# A toolchain bump re-measures these budgets in the same pull request, with a dated line:
+#
+#   # 2026-10-06: Rust 1.99.0.
+#
+# A key without a line is reported and not gated, so a new target or metric starts by
+# reporting. Targets from docs/BENCHMARKS.md that these do not meet yet are noted next to
+# their lines; the budgets hold today's numbers so that nothing gets worse meanwhile.
+
+# 2026-10-06: Rust 1.99.0.
+
+# Release binary and archive, Linux x86_64 (every pull request). Target: binary 30 MB
+# or less, archive 13 MB or less.
+# 2026-10-05: first budgets, measured by this job (Ubuntu 22.04 runner) on master with
+# file change notifications.
+# 2026-10-13: Google Antigravity provider and Google upstream capture, +710 KB .text
+# (+0.84 MB binary, +0.35 MB archive) over master's build at 586eba0 in this job; the
+# rest of the rise from the previous budget values came with master's changes since
+# 2026-10-05.
+size.x86_64-unknown-linux-gnu.binary_bytes   41_287_408  2
+size.x86_64-unknown-linux-gnu.text_bytes     27_195_447  2
+size.x86_64-unknown-linux-gnu.rodata_bytes    8_508_896  2
+size.x86_64-unknown-linux-gnu.archive_bytes  17_516_134  2
+# Crates linked into the binary in two or more versions; a new one fails until it is
+# justified here. 2026-10-05: base64, block-buffer, cpufeatures, crypto-common, digest,
+# getrandom, hashbrown (3), rand, rand_core, sha2, thiserror.
+deps.x86_64-unknown-linux-gnu.duplicate_crates  11  0
+
+# Idle, Linux (every pull request): 30 s without requests, after 30 s of warm-up,
+# with 1 and with 2,000 auth files. RSS gets 10% of room: three 1-file runs on the Ubuntu
+# runner measured 23,300 to 23,676 KB (1.6% apart); on a shared local VM the same binary
+# varied by up to 11% (bench/results/2026-10-06-idle.jsonl). Target RSS: 15 MB or less
+# with one file.
+# 2026-10-06: wakeups cut from 30 to 3 per 30 s. Every measurement so far is 0 (six CI
+# runs and three local rounds, each at 1 and at 2,000 files); master measured 2,901
+# (bench/results/2026-10-06-idle.jsonl). A ceiling of 30 would pass a new timer firing
+# about once a second, which this gate is there to stop; 3 leaves room for a stray
+# context switch on a shared runner and nothing more.
+idle.linux.1.wakeups           3   0
+idle.linux.1.cpu_ticks         1   0
+idle.linux.1.threads           6   0
+idle.linux.1.rss_kb       23_500  10
+idle.linux.2000.wakeups        3   0
+idle.linux.2000.cpu_ticks      1   0
+idle.linux.2000.threads        6   0
+idle.linux.2000.rss_kb    71_000  10
+
+# Idle, macOS and Windows (release builds and the weekly idle workflow): 60 s without
+# requests, after 30 s of warm-up (10 s for the measurements below). Windows adds one
+# parked thread for file change notifications. macOS keys carry `uname -m`. RSS measured
+# on 2026-10-05: 14,976 to 15,344 KB on macos-15 (Apple silicon), 10,496 to 10,656 KB on
+# macos-15-intel, 15,812 to 16,232 KB on windows-2025 (working set).
+# 2026-10-06: idle_wakeups cut from 30 to 3 per 60 s. Over four CI runs each, macos-15
+# measured 0, 0, 0 and 1, and macos-15-intel 0 every time; 3 sits just above the worst.
+idle.macos-arm64.1.cpu_ms           20   0
+idle.macos-arm64.1.idle_wakeups      3   0
+idle.macos-arm64.1.threads           6   0
+idle.macos-arm64.1.rss_kb       15_400  10
+idle.macos-x86_64.1.cpu_ms          20   0
+idle.macos-x86_64.1.idle_wakeups     3   0
+idle.macos-x86_64.1.threads          6   0
+idle.macos-x86_64.1.rss_kb      10_700  10
+idle.windows.1.cpu_ms         20   0
+idle.windows.1.threads         7   0
+idle.windows.1.rss_kb     16_300  10
+
+# Field-mix soak (bench/soak.sh MIX=field: Claude, Codex and count_tokens requests of
+# 200 KB to 2 MB from 4 sessions, on release tags and weekly): VmHWM at the end of the
+# run, in kB. A 60-minute run of this build on a GitHub-hosted Ubuntu 22.04 runner peaked
+# at 173,072 kB; 0.2.0 peaked at 225,380 kB under the same load. Peaks come from requests
+# that happen to overlap, so a 300-minute run sees more of them: 20% of room keeps the
+# bound (207,686 kB) below both 0.2.0 and this build plus one more o200k_base tokenizer
+# (about 47,700 kB resident).
+# 2026-10-06: first bound.
+soak.field.peak_hwm_kb    173_072  20
+
+# Heap per request through the Claude route (debug test build, counting allocator):
+# peak live bytes above the idle baseline and allocation calls, for one streamed
+# /v1/messages request of about 306 KB and one of about 1.9 MB, the fake upstream not
+# counted, smallest of three sends. Target: peak at most 3x the body; today it is 4x.
+# 2026-10-06: re-measured with the upstream excluded; identical over 9 runs, 4 of them
+# under full CPU contention.
+# 2026-10-06: the test's runtime also holds the Codex API key the Codex budgets below
+# use: +32 bytes and +14 allocations per request.
+# 2026-10-11: the translated body is no longer kept past preparation, the signature
+# sanitizer copies only the messages it edits, rewrites that change nothing pass the body
+# on instead of copying it, and a JSON set that replaces a large value no longer leaves
+# room for a second one: 11,083,177 to 7,420,905 bytes (6.0x to 4.0x) and 26 to 10
+# allocations of 256 KiB or more for 1.9 MB. The runtime also holds the cloaked login
+# below and its request capture.
+alloc.306k.peak_bytes       1_286_793  2
+alloc.306k.allocations          2_337  3
+alloc.1900k.peak_bytes      7_420_905  2
+alloc.1900k.allocations         6_710  3
+
+# The same through the Codex route: one streamed /v1/responses request of about 322 KB and
+# one of about 1.9 MB (reasoning items, function calls and their outputs) through the
+# Codex executor and an API key whose base-url is the fake upstream. Target: peak at most
+# 3x the body; today it is 8.8x (the request is rewritten pass by pass, each pass a new
+# copy of the body).
+# 2026-10-06: first budgets; identical over 4 runs.
+# 2026-10-11: the runtime also holds the cloaked login below and its request capture:
+# +48 bytes and +6 allocations per request.
+alloc.codex.306k.peak_bytes       2_769_147  2
+alloc.codex.306k.allocations          1_683  3
+alloc.codex.1900k.peak_bytes     16_783_275  2
+alloc.codex.1900k.allocations         4_004  3
+
+# count_tokens with the same Claude bodies, counted locally as for an OAuth login: the
+# body as a JSON tree, its text joined, then the shared o200k_base encoder (built by the
+# warm-up, so not counted here). Target: peak at most 3x the body; today it is 6.3x.
+# 2026-10-06: first budgets; identical over 3 runs.
+# 2026-10-11: the same body walks as the Claude route above: 13,530,973 to 11,687,196
+# bytes for 1.9 MB.
+alloc.count.306k.peak_bytes       1_949_324  2
+alloc.count.306k.allocations        275_295  3
+alloc.count.1900k.peak_bytes     11_687_196  2
+alloc.count.1900k.allocations     1_629_779  3
+
+# The Claude bodies through a Claude OAuth login (`cloak/` model prefix in the test) from
+# a client that is not Claude Code, as for a coding agent on a subscription: cloaked,
+# tools renamed, the CLI identity applied and the body signed; only what is particular to
+# api.anthropic.com (context management, diagnostics, the native TLS client) is not run.
+# The requests go through the server's request capture, which with request logs off
+# keeps each upstream body for a possible error log until the response has streamed; a
+# send is measured only once the capture of the one before it is finalized.
+# Target: peak at most 3x the body; today it is 5.1x. Before the changes of 2026-10-11:
+# 2,815,071 and 16,643,303 bytes (9.0x), and 56 allocations of 256 KiB or more for
+# 1.9 MB, now 32.
+# 2026-10-11: first budgets; identical over 7 runs but for 128 bytes at 306k.
+alloc.cloak.306k.peak_bytes       1_635_396  2
+alloc.cloak.306k.allocations          4_443  3
+alloc.cloak.1900k.peak_bytes      9_322_748  2
+alloc.cloak.1900k.allocations        10_388  3
+# Eight of those 1.9 MB requests at once, the fake upstream holding back every answer
+# until all eight have been sent, as a coding agent's prompts wait seconds for their first
+# token. `held`: what the eight keep between them while they wait, each its upstream body
+# (sent and kept for the error log); before 2026-10-11 also the translated body and a
+# copy of the upstream body grown to up to twice its size, 59,983,460 bytes. `peak`
+# (alloc.cloak.1900k.c8.peak_bytes) also counts what their preparations held while they
+# overlapped. It depends on scheduling, so it is reported without a line until runners
+# show how far it varies: 26,495,783 to 30,310,290 bytes over 7 runs on one machine;
+# before, 67,151,533 to 78,173,141 over 5.
+# 2026-10-11: first budget; identical over 7 runs.
+alloc.cloak.1900k.c8.held_bytes  15_662_380  2

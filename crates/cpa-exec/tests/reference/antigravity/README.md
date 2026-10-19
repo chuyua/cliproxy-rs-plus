@@ -1,0 +1,26 @@
+# Antigravity executor and login goldens
+
+`../../fixtures/antigravity_go.json` holds outputs of the unmodified Go
+`AntigravityExecutor`, its login helpers and user agents at CLIProxyAPI `6fecc6e`.
+`../../fixtures/antigravity_v8_0_27_go.json` holds the executor scenarios of
+`v8_0_27.go`, recorded from v8.0.27 (`bf9341629ef2300ac9d846a2e80fe2756f63a671`) for the
+behaviour ported from it. `antigravity_tests.rs` replays both on the Rust executor.
+
+Every executor scenario runs `Execute`, `ExecuteStream` or `CountTokens` against a
+one-shot raw TCP capture server and records the exact upstream request and what the
+executor returned. Nothing contacts Google: the version cache is never refreshed, so
+every user agent uses the fallback version, and every token is fake.
+
+The generator imports Go's internal packages, so it runs from a scratch copy of the Go
+tree (never the reference checkout itself), with external network denied:
+
+```sh
+copy=$(mktemp -d)
+git -C CLIProxyAPI archive 6fecc6e | tar -C "$copy" -xf -
+mkdir -p "$copy/cmd/antigravity-goldens"
+cp *.go "$copy/cmd/antigravity-goldens/"
+cd "$copy" && GOTOOLCHAIN=local GOPROXY=off go run ./cmd/antigravity-goldens out.json
+```
+
+For the v8.0.27 scenarios, archive `v8.0.27` instead and run
+`ANTIGRAVITY_GO_SET=v8.0.27 go run -tags v8027 ./cmd/antigravity-goldens out.json`.
