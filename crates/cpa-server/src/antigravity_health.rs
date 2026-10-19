@@ -106,7 +106,7 @@ pub struct EgressObservation {
 pub fn observe_egress(previous_ip: Option<&str>, ip: IpAddr, country: Option<String>) -> EgressObservation {
     let changed = previous_ip
         .filter(|s| !s.is_empty())
-        .is_some_and(|previous| previous.parse::<IpAddr>().is_err_or(|saved| saved != ip));
+        .is_some_and(|previous| previous.parse::<IpAddr>().map_or(true, |saved| saved != ip));
     EgressObservation {
         ip,
         country,
