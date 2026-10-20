@@ -404,6 +404,112 @@ async fn read_bounded(response: wreq::Response) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A bounded, credential-backed loadCodeAssist eligibility result.
+/// The response body is used only for classification and is never logged or
+/// stored. Persist only the generic status reason, not upstream JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EligibilityObservation {
+    pub http_status: u16,
+    pub eligibility_status: &'static str,
+    pub reason: String,
+}
+
+pub async fn fetch_eligibility(
+    clients: &GoClients,
+    config: &Config,
+    credential: &Credential,
+    api_base_url: &str,
+    access_token: &str,
+    user_agent: &str,
+) -> anyhow::Result<EligibilityObservation> {
+    ensure!(!api_base_url.trim().is_empty(), "missing eligibility API URL");
+    ensure!(!access_token.trim().is_empty(), "missing eligibility access token");
+    let proxy = Proxy::effective(credential, config);
+    ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
+    let client = clients.try_get(&proxy).context("account proxy unavailable")?;
+    let url = format!("{}/v1internal:loadCodeAssist", api_base_url.trim_end_matches('/'));
+    let response = client
+        .post(url.as_str())
+        .header("User-Agent", user_agent)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .body(r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = read_bounded(response).await?;
+    let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let text = String::from_utf8_lossy(&body);
+    Ok(EligibilityObservation {
+        http_status: status,
+        eligibility_status: eligibility_from_response(status, &payload, &text),
+        reason: format!("Eligibility check HTTP {status}"),
+    })
+}
+
+/// Optional full check: the same effective account proxy is used for the IP
+/// echo and eligibility POST. A changed IP skips the POST entirely, and every
+/// result is persisted with the pre-network revision to reject stale probes.
+/// This is not yet scheduled automatically on the request path.
+pub async fn check_account_health_and_persist(
+    store: Arc<CredentialStore>,
+    clients: &GoClients,
+    config: &Config,
+    id: &str,
+    ip_check_url: &str,
+    api_base_url: &str,
+    access_token: &str,
+    user_agent: &str,
+    timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    let current = store.get(id).context("account not found")?;
+    ensure!(current.provider == "antigravity", "wrong provider");
+    ensure!(timestamp.is_finite(), "invalid timestamp");
+    let revision = current.revision;
+    let echo = fetch_egress(clients, config, &current, ip_check_url, user_agent).await;
+    let mut verified = None;
+    if let Ok(EchoOutcome::Identity(ip, country)) = &echo {
+        let prior_ip = cached_health(&current)
+            .and_then(|h| h.get("egress_ip"))
+            .and_then(Value::as_str);
+        if observe_egress(prior_ip, *ip, country.clone()).should_check_eligibility {
+            let result = fetch_eligibility(clients, config, &current, api_base_url, access_token, user_agent).await;
+            verified = Some((*ip, country.clone(), result));
+        }
+    }
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if let Some((ip, country, result)) = verified {
+            let mut fields = Map::new();
+            fields.insert("egress_ip".into(), Value::from(ip.to_string()));
+            fields.insert("observed_egress_ip".into(), Value::Null);
+            fields.insert("egress_country".into(), country.map_or(Value::Null, Value::from));
+            fields.insert("binding_status".into(), Value::from("healthy"));
+            fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
+            match result {
+                Ok(outcome) => {
+                    fields.insert("eligibility_status".into(), Value::from(outcome.eligibility_status));
+                    fields.insert("eligibility_reason".into(), Value::from(outcome.reason));
+                }
+                Err(_) => {
+                    // An eligibility infrastructure error is not evidence of
+                    // account blocking; preserve the previous eligibility verdict.
+                    fields.insert(
+                        "eligibility_reason".into(),
+                        Value::from("Eligibility check temporarily failed"),
+                    );
+                }
+            }
+            persist_health_update_at_revision(&store, &id, &fields, Some(revision))
+        } else {
+            persist_egress_result_at_revision(&store, &id, echo, timestamp, Some(revision))
+        }
+    })
+    .await
+    .context("health worker failed")?
+}
+
 /// Run the bound IP check and atomically record its outcome.
 pub async fn check_egress_and_persist(
     store: Arc<CredentialStore>,
@@ -521,6 +627,107 @@ mod tests {
             EchoOutcome::Identity("203.0.113.8".parse().unwrap(), Some("US".into()))
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ip_then_eligibility_post_uses_loopback_mock_and_stops_on_drift() {
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&post_count);
+        let app = Router::new()
+            .route(
+                "/ip",
+                get(|headers: HeaderMap| async move {
+                    assert!(
+                        !headers.contains_key("authorization"),
+                        "IP echo must never receive OAuth"
+                    );
+                    Json(json!({"ip":"203.0.113.8","country_code":"US"}))
+                }),
+            )
+            .route(
+                "/drift",
+                get(|| async { Json(json!({"ip":"203.0.113.9","country_code":"US"})) }),
+            )
+            .route(
+                "/v1internal:loadCodeAssist",
+                post(move |headers: HeaderMap, body: String| {
+                    let count = Arc::clone(&count);
+                    async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer dummy-access");
+                        assert_eq!(body, r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#);
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"currentTier":{"id":"free-tier"},"cloudaicompanionProject":"mock-project"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("gcl2api-eligibility-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("account.json");
+        let data = json!({
+            "type":"antigravity",
+            "proxy_url":"direct",
+            "access_token":"dummy-access",
+            "refresh_token":"dummy-refresh"
+        });
+        std::fs::write(&file, serde_json::to_vec(&data).unwrap()).unwrap();
+        let credential = Credential::from_file(&dir, &file, data.as_object().unwrap().clone()).unwrap();
+        let store = Arc::new(CredentialStore::new(vec![credential]));
+        let clients = GoClients::new(Default::default());
+        let base = format!("http://{address}");
+        let healthy = check_account_health_and_persist(
+            Arc::clone(&store),
+            &clients,
+            &Config::default(),
+            "account.json",
+            &format!("{base}/ip"),
+            &base,
+            "dummy-access",
+            "mock-test",
+            1000.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached_statuses(&healthy), (Some("healthy"), Some("eligible")));
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+        let drift = check_account_health_and_persist(
+            Arc::clone(&store),
+            &clients,
+            &Config::default(),
+            "account.json",
+            &format!("{base}/drift"),
+            &base,
+            "dummy-access",
+            "mock-test",
+            1001.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached_statuses(&drift), (Some("proxy_drift"), Some("unchecked")));
+        assert_eq!(cached_health(&drift).unwrap()["egress_ip"], "203.0.113.8");
+        assert_eq!(cached_health(&drift).unwrap()["observed_egress_ip"], "203.0.113.9");
+        assert_eq!(
+            post_count.load(Ordering::SeqCst),
+            1,
+            "drift must skip credential-backed POST"
+        );
+        let disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(disk["access_token"], "dummy-access");
+        assert_eq!(disk["refresh_token"], "dummy-refresh");
+        server.abort();
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

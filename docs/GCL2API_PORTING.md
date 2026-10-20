@@ -1,6 +1,6 @@
 # gcl2api-plus → cliproxy-rs migration checkpoint
 
-Status: **Phase 2 — CI-verified proxy-change invalidation; in-flight probe CAS guard pending CI**
+Status: **Phase 2 — proxy-change invalidation CI-verified; guarded eligibility POST mock path under test**
 Last updated: 2026-10-20 (Windows developer node)
 
 ## Ground truth
@@ -36,6 +36,7 @@ Last updated: 2026-10-20 (Windows developer node)
 - Run 39213709142: **Success**, SHA `67744a5ce1c3eacde82f962b9f971a8db12edd42`: Ubuntu 24.04 focused tests and Linux release/smoke after switching the bounded IP echo reader from unsupported `chunk()` to `bytes_stream()`. Prior run 39209666893 failed on the missing method and was superseded.
 - Run 39222627510: **Success**, SHA `8c3c43e789f89633ba8dc5207cd937377aed0c58`: Ubuntu 24.04 403/health/CLI UA tests, Release, smoke and artifact upload. A later run 39234892913 of the same SHA also **succeeded**.
 - Current in-flight network probe CAS guard: `check_egress_and_persist` captures the credential revision before HTTP I/O and rejects stale results after a concurrent proxy edit/token change. Isolated file/mock regressions cover old-IP success, HTTP 429 and transport error; **not yet Linux CI verified**. This must not be reported as complete parity.
+- Next optional API: `check_account_health_and_persist` checks IP echo first and calls `v1internal:loadCodeAssist` with a dummy-test credential through the same effective proxy only if IP is stable. The actual code accepts an explicitly supplied access token; the loopback mock verifies POST body, Authorization placement, atomic health persistence, and no POST after drift. Response bytes never enter logs or credential metadata (only a generic HTTP status reason). No automatic scheduler, real-account check, `fetchUserInfo`/`listExperiments` warmup, group node rebind, or production opt-in yet. **Linux CI pending**.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.
