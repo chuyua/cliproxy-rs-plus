@@ -414,6 +414,48 @@ pub struct EligibilityObservation {
     pub reason: String,
 }
 
+fn warmup_project_id(payload: &Value) -> Option<&str> {
+    ["cloudaicompanionProject", "projectId"]
+        .iter()
+        .filter_map(|key| payload.get(*key))
+        .filter_map(|value| match value {
+            Value::String(value) => Some(value.as_str()),
+            Value::Object(fields) => fields.get("id").and_then(Value::as_str),
+            _ => None,
+        })
+        .find(|id| !id.trim().is_empty() && id.len() <= 256)
+}
+
+/// Python's low-frequency Antigravity environment warmup. Failures must not
+/// replace the result of loadCodeAssist; neither bodies nor tokens are logged.
+async fn warmup_antigravity_environment(
+    client: &wreq::Client,
+    api_base_url: &str,
+    project_id: &str,
+    access_token: &str,
+    user_agent: &str,
+) {
+    let requests = [
+        ("fetchUserInfo", serde_json::json!({"project": project_id})),
+        (
+            "listExperiments",
+            serde_json::json!({"project": project_id, "metadata": {"updateChannel": "stable"}}),
+        ),
+    ];
+    for (path, body) in requests {
+        let url = format!("{}/v1internal:{path}", api_base_url.trim_end_matches('/'));
+        let request = client
+            .post(url.as_str())
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", user_agent)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .timeout(Duration::from_secs(15))
+            .send();
+        let _ = tokio::time::timeout(Duration::from_secs(15), request).await;
+    }
+}
+
 pub async fn fetch_eligibility(
     clients: &GoClients,
     config: &Config,
@@ -445,9 +487,15 @@ pub async fn fetch_eligibility(
     let body = read_bounded(response).await?;
     let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     let text = String::from_utf8_lossy(&body);
+    let eligibility_status = eligibility_from_response(status, &payload, &text);
+    if status == 200 {
+        if let Some(project_id) = warmup_project_id(&payload) {
+            warmup_antigravity_environment(&client, api_base_url, project_id, access_token, user_agent).await;
+        }
+    }
     Ok(EligibilityObservation {
         http_status: status,
-        eligibility_status: eligibility_from_response(status, &payload, &text),
+        eligibility_status,
         reason: format!("Eligibility check HTTP {status}"),
     })
 }
@@ -711,6 +759,9 @@ mod tests {
 
         let post_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&post_count);
+        let warmup_count = Arc::new(AtomicUsize::new(0));
+        let user_info_count = Arc::clone(&warmup_count);
+        let experiments_count = Arc::clone(&warmup_count);
         let app = Router::new()
             .route(
                 "/ip",
@@ -735,6 +786,33 @@ mod tests {
                         assert_eq!(body, r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#);
                         count.fetch_add(1, Ordering::SeqCst);
                         Json(json!({"currentTier":{"id":"free-tier"},"cloudaicompanionProject":"mock-project"}))
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:fetchUserInfo",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let count = Arc::clone(&user_info_count);
+                    async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer dummy-access");
+                        assert_eq!(body, json!({"project":"mock-project"}));
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:listExperiments",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let count = Arc::clone(&experiments_count);
+                    async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer dummy-access");
+                        assert_eq!(
+                            body,
+                            json!({"project":"mock-project","metadata":{"updateChannel":"stable"}})
+                        );
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({}))
                     }
                 }),
             );
@@ -772,6 +850,7 @@ mod tests {
         .unwrap();
         assert_eq!(cached_statuses(&healthy), (Some("healthy"), Some("eligible")));
         assert_eq!(post_count.load(Ordering::SeqCst), 1);
+        assert_eq!(warmup_count.load(Ordering::SeqCst), 2);
         assert!(
             check_account_health_and_persist(
                 Arc::clone(&store),
@@ -810,6 +889,7 @@ mod tests {
             1,
             "drift must skip credential-backed POST"
         );
+        assert_eq!(warmup_count.load(Ordering::SeqCst), 2);
         let drift_ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert!(
             confirm_egress_rebind_and_persist(
@@ -865,6 +945,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached_statuses(&confirmed), (Some("healthy"), Some("eligible")));
+        assert_eq!(warmup_count.load(Ordering::SeqCst), 4);
         assert_eq!(cached_health(&confirmed).unwrap()["egress_ip"], "203.0.113.9");
         assert!(cached_health(&confirmed).unwrap()["observed_egress_ip"].is_null());
         assert_eq!(post_count.load(Ordering::SeqCst), 2);
@@ -916,6 +997,25 @@ mod tests {
                 assert!(outcome.is_err(), "reject malformed IP echo");
             }
         }
+    }
+
+    #[test]
+    fn warmup_project_id_accepts_only_bounded_known_shapes() {
+        assert_eq!(
+            warmup_project_id(&json!({"cloudaicompanionProject":"project-1"})),
+            Some("project-1")
+        );
+        assert_eq!(
+            warmup_project_id(&json!({"projectId":{"id":"project-2"}})),
+            Some("project-2")
+        );
+        assert_eq!(warmup_project_id(&json!({"projectId":42})), None);
+        assert_eq!(warmup_project_id(&json!({"projectId":""})), None);
+        assert_eq!(warmup_project_id(&json!({"projectId":"x".repeat(257)})), None);
+        assert_eq!(
+            warmup_project_id(&json!({"cloudaicompanionProject":null,"projectId":"fallback"})),
+            Some("fallback")
+        );
     }
 
     #[test]

@@ -30,8 +30,10 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   The optional Rust eligibility probe runs `loadCodeAssist` only after a
   stable account-bound IP echo. It stores only a generic HTTP status reason,
   not the upstream response body (which Python stores up to 1000 characters).
-  Python's `fetchUserInfo` and `listExperiments` warmup is not yet ported,
-  and the Rust helper is not connected to an automatic request-time scheduler.
+  The opt-in Rust eligibility probe now calls `fetchUserInfo` and
+  `listExperiments` with a validated project ID, as Python does; both are
+  best effort and bounded. The helper is still not connected to an
+  automatic request-time scheduler or Python proxy-group management.
   The explicit Rust probe also checks that the supplied access token matches
   the selected credential before any network I/O, preventing a token for one
   account from being sent through another account's effective proxy.
