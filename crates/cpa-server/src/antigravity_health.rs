@@ -268,12 +268,26 @@ pub fn persist_health_update(
     credential_id: &str,
     updates: &Map<String, Value>,
 ) -> anyhow::Result<Arc<Credential>> {
+    persist_health_update_at_revision(store, credential_id, updates, None)
+}
+
+/// Drop a stale network result if the credential changed while it was in flight.
+fn persist_health_update_at_revision(
+    store: &CredentialStore,
+    credential_id: &str,
+    updates: &Map<String, Value>,
+    expected_revision: Option<u64>,
+) -> anyhow::Result<Arc<Credential>> {
     validate_health_update(updates)?;
     for _ in 0..4 {
         let current = store.get(credential_id).context("Antigravity credential not found")?;
         ensure!(
             current.provider == "antigravity",
             "health updates require Antigravity credentials"
+        );
+        ensure!(
+            expected_revision.is_none_or(|revision| revision == current.revision),
+            "stale account health probe"
         );
         let mut fields = cached_health(&current)
             .and_then(Value::as_object)
@@ -284,6 +298,9 @@ pub fn persist_health_update(
         patch.set.insert(CREDENTIAL_HEALTH_FIELD.into(), Value::Object(fields));
         match store.apply_patch(credential_id, current.revision, &patch) {
             Ok(updated) => return Ok(updated),
+            Err(PatchError::Stale { .. }) if expected_revision.is_some() => {
+                bail!("stale account health probe")
+            }
             Err(PatchError::Stale { .. }) => continue,
             Err(err) => bail!("failed to persist Antigravity account health: {err:?}"),
         }
@@ -298,6 +315,17 @@ pub fn record_egress(
     ip: IpAddr,
     country: Option<String>,
     timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    record_egress_at_revision(store, id, ip, country, timestamp, None)
+}
+
+fn record_egress_at_revision(
+    store: &CredentialStore,
+    id: &str,
+    ip: IpAddr,
+    country: Option<String>,
+    timestamp: f64,
+    expected_revision: Option<u64>,
 ) -> anyhow::Result<Arc<Credential>> {
     ensure!(timestamp.is_finite(), "invalid timestamp");
     let current = store.get(id).context("account not found")?;
@@ -326,7 +354,7 @@ pub fn record_egress(
         );
     }
     fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
-    persist_health_update(store, id, &fields)
+    persist_health_update_at_revision(store, id, &fields, expected_revision)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,30 +419,51 @@ pub async fn check_egress_and_persist(
     ensure!(timestamp.is_finite(), "invalid timestamp");
     let result = fetch_egress(clients, config, &current, url, user_agent).await;
     let id = id.to_owned();
-    tokio::task::spawn_blocking(move || persist_egress_result(&store, &id, result, timestamp))
-        .await
-        .context("health worker failed")?
+    let revision = current.revision;
+    tokio::task::spawn_blocking(move || {
+        persist_egress_result_at_revision(&store, &id, result, timestamp, Some(revision))
+    })
+    .await
+    .context("health worker failed")?
 }
 
+#[cfg(test)]
 fn persist_egress_result(
     store: &CredentialStore,
     id: &str,
     result: anyhow::Result<EchoOutcome>,
     timestamp: f64,
 ) -> anyhow::Result<Arc<Credential>> {
+    persist_egress_result_at_revision(store, id, result, timestamp, None)
+}
+
+fn persist_egress_result_at_revision(
+    store: &CredentialStore,
+    id: &str,
+    result: anyhow::Result<EchoOutcome>,
+    timestamp: f64,
+    expected_revision: Option<u64>,
+) -> anyhow::Result<Arc<Credential>> {
     match result {
-        Ok(EchoOutcome::Identity(ip, country)) => record_egress(store, id, ip, country, timestamp),
+        Ok(EchoOutcome::Identity(ip, country)) => {
+            record_egress_at_revision(store, id, ip, country, timestamp, expected_revision)
+        }
         Ok(EchoOutcome::TemporarilyUnavailable(status)) => {
             let mut fields = Map::new();
             fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
             fields.insert("eligibility_reason".into(), Value::from(echo_failure_reason(status)));
-            persist_health_update(store, id, &fields)
+            persist_health_update_at_revision(store, id, &fields, expected_revision)
         }
-        Err(_) => persist_echo_error(store, id, timestamp),
+        Err(_) => persist_echo_error(store, id, timestamp, expected_revision),
     }
 }
 
-fn persist_echo_error(store: &CredentialStore, id: &str, timestamp: f64) -> anyhow::Result<Arc<Credential>> {
+fn persist_echo_error(
+    store: &CredentialStore,
+    id: &str,
+    timestamp: f64,
+    expected_revision: Option<u64>,
+) -> anyhow::Result<Arc<Credential>> {
     let mut fields = Map::new();
     // A transient echo failure must not erase evidence of an unaccepted IP drift.
     let drift = store
@@ -431,7 +480,7 @@ fn persist_echo_error(store: &CredentialStore, id: &str, timestamp: f64) -> anyh
     fields.insert("eligibility_status".into(), Value::from("error"));
     fields.insert("eligibility_reason".into(), Value::from("IP check failed"));
     fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
-    persist_health_update(store, id, &fields)
+    persist_health_update_at_revision(store, id, &fields, expected_revision)
 }
 
 #[cfg(test)]
@@ -659,6 +708,23 @@ mod tests {
             .apply_patch("account.json", failed.revision, &network_patch)
             .unwrap();
         assert_eq!(cached_statuses(&rebound), (Some("unchecked"), Some("unchecked")));
+        // A probe launched against the old proxy must never re-establish its
+        // former binding after the proxy edit. Cover every network outcome.
+        for outcome in [
+            Ok(EchoOutcome::Identity("203.0.113.8".parse().unwrap(), None)),
+            Ok(EchoOutcome::TemporarilyUnavailable(429)),
+            Err(anyhow::anyhow!("mock old-proxy failure")),
+        ] {
+            assert!(
+                persist_egress_result_at_revision(&store, "account.json", outcome, 1239.5, Some(failed.revision),)
+                    .is_err(),
+                "stale network probe must not overwrite the new proxy binding"
+            );
+        }
+        assert_eq!(
+            cached_statuses(&store.get("account.json").unwrap()),
+            (Some("unchecked"), Some("unchecked"))
+        );
         let rebound_health = cached_health(&rebound).unwrap();
         for key in [
             "egress_ip",

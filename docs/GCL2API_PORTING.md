@@ -1,7 +1,7 @@
 # gcl2api-plus → cliproxy-rs migration checkpoint
 
-Status: **Phase 2 — private CI-verified egress probe; proxy-change health reset under test**
-Last updated: 2026-10-19 (Windows developer node)
+Status: **Phase 2 — CI-verified proxy-change invalidation; in-flight probe CAS guard pending CI**
+Last updated: 2026-10-20 (Windows developer node)
 
 ## Ground truth
 
@@ -34,6 +34,8 @@ Last updated: 2026-10-19 (Windows developer node)
 - Run 39183679801: **Success**, including CLI UA focused tests and Linux release.
 - Run 39184467027: **Success**, private remote branch SHA `d720fd20930c05f7fdbdcb80a4920dae81ff3c3a`, including atomic health persistence tests, Ubuntu 24.04 release, smoke test, and `gcl2api-rust-linux-x86_64` artifact (17,792,986 bytes). Fourth-batch Windows local source commit was `c870b46`; its GitHub snapshot was successfully pushed before the Windows session disappeared.
 - Run 39213709142: **Success**, SHA `67744a5ce1c3eacde82f962b9f971a8db12edd42`: Ubuntu 24.04 focused tests and Linux release/smoke after switching the bounded IP echo reader from unsupported `chunk()` to `bytes_stream()`. Prior run 39209666893 failed on the missing method and was superseded.
+- Run 39222627510: **Success**, SHA `8c3c43e789f89633ba8dc5207cd937377aed0c58`: Ubuntu 24.04 403/health/CLI UA tests, Release, smoke and artifact upload. A later run 39234892913 of the same SHA also **succeeded**.
+- Current in-flight network probe CAS guard: `check_egress_and_persist` captures the credential revision before HTTP I/O and rejects stale results after a concurrent proxy edit/token change. Isolated file/mock regressions cover old-IP success, HTTP 429 and transport error; **not yet Linux CI verified**. This must not be reported as complete parity.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.
