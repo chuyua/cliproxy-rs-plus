@@ -424,6 +424,10 @@ pub async fn fetch_eligibility(
 ) -> anyhow::Result<EligibilityObservation> {
     ensure!(!api_base_url.trim().is_empty(), "missing eligibility API URL");
     ensure!(!access_token.trim().is_empty(), "missing eligibility access token");
+    ensure!(
+        credential.str("access_token") == Some(access_token),
+        "eligibility token does not match the bound account"
+    );
     let proxy = Proxy::effective(credential, config);
     ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
     let client = clients.try_get(&proxy).context("account proxy unavailable")?;
@@ -466,6 +470,10 @@ pub async fn check_account_health_and_persist(
     let current = store.get(id).context("account not found")?;
     ensure!(current.provider == "antigravity", "wrong provider");
     ensure!(timestamp.is_finite(), "invalid timestamp");
+    ensure!(
+        current.str("access_token") == Some(access_token),
+        "eligibility token does not match the bound account"
+    );
     let revision = current.revision;
     let echo = fetch_egress(clients, config, &current, ip_check_url, user_agent).await;
     let mut verified = None;
@@ -700,6 +708,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached_statuses(&healthy), (Some("healthy"), Some("eligible")));
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+        assert!(
+            check_account_health_and_persist(
+                Arc::clone(&store),
+                &clients,
+                &Config::default(),
+                "account.json",
+                &format!("{base}/ip"),
+                &base,
+                "wrong-account-token",
+                "mock-test",
+                1000.5,
+            )
+            .await
+            .is_err(),
+            "never send a different account token through this bound proxy"
+        );
         assert_eq!(post_count.load(Ordering::SeqCst), 1);
         let drift = check_account_health_and_persist(
             Arc::clone(&store),

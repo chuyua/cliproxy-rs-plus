@@ -32,6 +32,9 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   not the upstream response body (which Python stores up to 1000 characters).
   Python's `fetchUserInfo` and `listExperiments` warmup is not yet ported,
   and the Rust helper is not connected to an automatic request-time scheduler.
+  The explicit Rust probe also checks that the supplied access token matches
+  the selected credential before any network I/O, preventing a token for one
+  account from being sent through another account's effective proxy.
   This metadata is opt-in and is not part of the Go credential format.
 
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).
