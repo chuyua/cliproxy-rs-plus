@@ -43,6 +43,8 @@ jobs:
         run: cargo test --locked -p cpa-server --lib antigravity_health -- --nocapture
       - name: Antigravity proxy group selection tests
         run: cargo test --locked -p cpa-server --lib antigravity_proxy_group -- --nocapture
+      - name: Antigravity SQLite binding transaction tests
+        run: cargo test --locked -p cpa-server --lib antigravity_proxy_sqlite -- --nocapture
       - name: Antigravity CLI identity compatibility
         run: cargo test --locked -p cpa-exec --lib antigravity_cli_ua -- --nocapture
       - name: Compile release Linux executable

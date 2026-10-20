@@ -5,6 +5,7 @@ mod affinity;
 mod antigravity_403;
 pub mod antigravity_health;
 pub mod antigravity_proxy_group;
+pub mod antigravity_proxy_sqlite;
 pub mod capabilities;
 mod classify;
 mod claude;
