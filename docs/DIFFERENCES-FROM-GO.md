@@ -42,6 +42,10 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   eligibility check and atomic credential-revision match; the Python group
   rebinder instead releases the old proxy node, cools it and chooses another.
   No automatic proxy group selection is asserted by the Rust helper.
+  The `antigravity_proxy_group` helper now models Python's node strategies and
+  failed-node cooldown as pure functions. It does not yet persist the group
+  cursor, node cooldown or account-to-node binding in one SQLite transaction,
+  nor does it take effect on production request routing.
   This metadata is opt-in and is not part of the Go credential format.
 
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).
