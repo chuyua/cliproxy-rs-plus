@@ -1,6 +1,6 @@
 # gcl2api-plus → cliproxy-rs migration checkpoint
 
-Status: **Phase 2 — proxy-change invalidation CI-verified; guarded eligibility POST mock path under test**
+Status: **Phase 2 — guarded eligibility and binding verified in private CI; explicit rebind confirmation under test**
 Last updated: 2026-10-20 (Windows developer node)
 
 ## Ground truth
@@ -35,9 +35,10 @@ Last updated: 2026-10-20 (Windows developer node)
 - Run 39184467027: **Success**, private remote branch SHA `d720fd20930c05f7fdbdcb80a4920dae81ff3c3a`, including atomic health persistence tests, Ubuntu 24.04 release, smoke test, and `gcl2api-rust-linux-x86_64` artifact (17,792,986 bytes). Fourth-batch Windows local source commit was `c870b46`; its GitHub snapshot was successfully pushed before the Windows session disappeared.
 - Run 39213709142: **Success**, SHA `67744a5ce1c3eacde82f962b9f971a8db12edd42`: Ubuntu 24.04 focused tests and Linux release/smoke after switching the bounded IP echo reader from unsupported `chunk()` to `bytes_stream()`. Prior run 39209666893 failed on the missing method and was superseded.
 - Run 39222627510: **Success**, SHA `8c3c43e789f89633ba8dc5207cd937377aed0c58`: Ubuntu 24.04 403/health/CLI UA tests, Release, smoke and artifact upload. A later run 39234892913 of the same SHA also **succeeded**.
-- Current in-flight network probe CAS guard: `check_egress_and_persist` captures the credential revision before HTTP I/O and rejects stale results after a concurrent proxy edit/token change. Isolated file/mock regressions cover old-IP success, HTTP 429 and transport error; **not yet Linux CI verified**. This must not be reported as complete parity.
-- Next optional API: `check_account_health_and_persist` checks IP echo first and calls `v1internal:loadCodeAssist` with a dummy-test credential through the same effective proxy only if IP is stable. The actual code accepts an explicitly supplied access token; the loopback mock verifies POST body, Authorization placement, atomic health persistence, and no POST after drift. Response bytes never enter logs or credential metadata (only a generic HTTP status reason). No automatic scheduler, real-account check, `fetchUserInfo`/`listExperiments` warmup, group node rebind, or production opt-in yet. **Linux CI pending**.
-- Follow-up safety check (not in snapshot 297457c): the optional full probe and direct eligibility helper reject an access token that differs from the credential's own `access_token`, before sending requests. An additional mock assertion rejects an intentionally mismatched dummy token. Requires its own CI validation.
+- Run 39363746266: **Success**, SHA `5262b1371139baa115f46df4bbddf7f67b6d3f54`: credential-revision CAS guard for in-flight echo results, Ubuntu 24.04 tests, Release, smoke and artifact upload.
+- Run 39364271678: **Success**, SHA `297457c9f996f5e01b6a70ec6dee9e37f9967356`: optional same-proxy egress echo then bounded `v1internal:loadCodeAssist` eligibility POST; mock checks no OAuth on echo and no credential-backed POST after drift.
+- Run 39365041772: **Success**, SHA `ce6cd3caefa326ec7a0c6046854dcb72322b604b`: reject mismatched account access token before health network I/O; Ubuntu 24.04 tests, Release, smoke and artifact upload.
+- New optional `confirm_egress_rebind_and_persist`: requires an existing `proxy_drift` with an exactly matching approved `observed_egress_ip`; repeat echo must agree, eligibility POST must confirm eligible, and CAS must still match the pre-network revision. Invalid approval, echo mismatch, no fresh drift evidence, or failed eligibility leave the existing drift untouched. Only fake local HTTP endpoints and dummy account files are used in tests. **New CI not yet verified**. This is *not* proxy-group node cooldown/reselection or automatic request-time scheduling.
 - Standalone Rust classifier tests via `rustc --edition=2024 --test crates/cpa-server/src/antigravity_403.rs`: 2 groups passed.
 - `cargo fmt --all`: ran; `git diff --check`: clean at previous checkpoint.
 - Windows native `cargo test` failed during third-party `btls-sys` BoringSSL compilation, after working around non-ASCII MinGW toolchain paths. **GitHub Actions Ubuntu 24.04 now supplies the authoritative Linux compile/test gate.** Existing successful run: 39181764675. All subsequent feature additions must pass fresh CI before being called verified.

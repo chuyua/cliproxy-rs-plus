@@ -518,6 +518,69 @@ pub async fn check_account_health_and_persist(
     .context("health worker failed")?
 }
 
+/// Explicitly accept a previously observed egress IP only after a new echo
+/// through this credential's effective proxy and a successful eligibility
+/// probe. This does not select another proxy node or run automatically.
+/// The caller must explicitly authorize the exact observed IP.
+pub async fn confirm_egress_rebind_and_persist(
+    store: Arc<CredentialStore>,
+    clients: &GoClients,
+    config: &Config,
+    id: &str,
+    expected_ip: IpAddr,
+    ip_check_url: &str,
+    api_base_url: &str,
+    access_token: &str,
+    user_agent: &str,
+    timestamp: f64,
+) -> anyhow::Result<Arc<Credential>> {
+    let current = store.get(id).context("account not found")?;
+    ensure!(current.provider == "antigravity", "wrong provider");
+    ensure!(timestamp.is_finite(), "invalid timestamp");
+    ensure!(
+        current.str("access_token") == Some(access_token),
+        "rebind token does not match the bound account"
+    );
+    let health = cached_health(&current).context("account has no drift evidence")?;
+    ensure!(
+        health.get("binding_status").and_then(Value::as_str) == Some("proxy_drift"),
+        "explicit rebind requires a drifted binding"
+    );
+    ensure!(
+        health
+            .get("observed_egress_ip")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            == Some(expected_ip),
+        "rebind IP does not match the observed drift"
+    );
+    let revision = current.revision;
+    let (verified_ip, country) = match fetch_egress(clients, config, &current, ip_check_url, user_agent).await? {
+        EchoOutcome::Identity(ip, country) if ip == expected_ip => (ip, country),
+        _ => bail!("rebind echo did not confirm the observed IP"),
+    };
+    let eligibility = fetch_eligibility(clients, config, &current, api_base_url, access_token, user_agent).await?;
+    ensure!(
+        eligibility.http_status == 200 && eligibility.eligibility_status == "eligible",
+        "rebind eligibility was not confirmed"
+    );
+    let mut fields = Map::new();
+    fields.insert("egress_ip".into(), Value::from(verified_ip.to_string()));
+    fields.insert("observed_egress_ip".into(), Value::Null);
+    fields.insert("egress_country".into(), country.map_or(Value::Null, Value::from));
+    fields.insert("binding_status".into(), Value::from("healthy"));
+    fields.insert("eligibility_status".into(), Value::from("eligible"));
+    fields.insert(
+        "eligibility_reason".into(),
+        Value::from("Rebind confirmed by eligibility check"),
+    );
+    fields.insert("eligibility_checked_at".into(), Value::from(timestamp));
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || persist_health_update_at_revision(&store, &id, &fields, Some(revision)))
+        .await
+        .context("health worker failed")?
+}
+
 /// Run the bound IP check and atomically record its outcome.
 pub async fn check_egress_and_persist(
     store: Arc<CredentialStore>,
@@ -747,6 +810,82 @@ mod tests {
             1,
             "drift must skip credential-backed POST"
         );
+        let drift_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(
+            confirm_egress_rebind_and_persist(
+                Arc::clone(&store),
+                &clients,
+                &Config::default(),
+                "account.json",
+                "203.0.113.10".parse().unwrap(),
+                &format!("{base}/drift"),
+                &base,
+                "dummy-access",
+                "mock-test",
+                1001.5,
+            )
+            .await
+            .is_err(),
+            "an unobserved IP cannot be approved"
+        );
+        assert!(
+            confirm_egress_rebind_and_persist(
+                Arc::clone(&store),
+                &clients,
+                &Config::default(),
+                "account.json",
+                drift_ip,
+                &format!("{base}/ip"),
+                &base,
+                "dummy-access",
+                "mock-test",
+                1001.6,
+            )
+            .await
+            .is_err(),
+            "the new echo must still match the approved IP"
+        );
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cached_statuses(&store.get("account.json").unwrap()),
+            (Some("proxy_drift"), Some("unchecked"))
+        );
+        let confirmed = confirm_egress_rebind_and_persist(
+            Arc::clone(&store),
+            &clients,
+            &Config::default(),
+            "account.json",
+            drift_ip,
+            &format!("{base}/drift"),
+            &base,
+            "dummy-access",
+            "mock-test",
+            1002.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached_statuses(&confirmed), (Some("healthy"), Some("eligible")));
+        assert_eq!(cached_health(&confirmed).unwrap()["egress_ip"], "203.0.113.9");
+        assert!(cached_health(&confirmed).unwrap()["observed_egress_ip"].is_null());
+        assert_eq!(post_count.load(Ordering::SeqCst), 2);
+        assert!(
+            confirm_egress_rebind_and_persist(
+                Arc::clone(&store),
+                &clients,
+                &Config::default(),
+                "account.json",
+                drift_ip,
+                &format!("{base}/drift"),
+                &base,
+                "dummy-access",
+                "mock-test",
+                1003.0,
+            )
+            .await
+            .is_err(),
+            "a healthy binding must not be rebound without new drift evidence"
+        );
+        assert_eq!(post_count.load(Ordering::SeqCst), 2);
         let disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(disk["access_token"], "dummy-access");
         assert_eq!(disk["refresh_token"], "dummy-refresh");
