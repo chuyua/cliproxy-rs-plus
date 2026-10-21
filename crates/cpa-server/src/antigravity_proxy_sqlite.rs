@@ -18,8 +18,8 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use crate::antigravity_proxy_group::{self, Group, Node, Strategy};
 
 const SCHEMA: &str = r#"
-CREATE TABLE rust_ag_meta (version INTEGER PRIMARY KEY CHECK(version=1));
-INSERT INTO rust_ag_meta (version) VALUES (1);
+CREATE TABLE rust_ag_meta (version INTEGER PRIMARY KEY CHECK(version=2));
+INSERT INTO rust_ag_meta (version) VALUES (2);
 CREATE TABLE rust_ag_groups (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
     strategy TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
@@ -37,6 +37,7 @@ CREATE TABLE rust_ag_accounts (
     proxy_mode TEXT NOT NULL DEFAULT 'group' CHECK(proxy_mode='group'),
     group_id INTEGER NOT NULL REFERENCES rust_ag_groups(id),
     bound_node_id INTEGER REFERENCES rust_ag_nodes(id),
+    binding_generation INTEGER NOT NULL DEFAULT 0 CHECK(binding_generation >= 0),
     binding_status TEXT NOT NULL DEFAULT 'unchecked',
     eligibility_status TEXT NOT NULL DEFAULT 'unchecked',
     egress_ip TEXT, observed_egress_ip TEXT
@@ -52,11 +53,13 @@ pub struct ProxyGroupDb {
 pub struct BoundProxy {
     pub node_id: i64,
     pub proxy_url: String,
+    pub binding_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingState {
     pub node_id: Option<i64>,
+    pub binding_generation: i64,
     pub binding_status: String,
     pub eligibility_status: String,
     pub egress_ip: Option<String>,
@@ -90,11 +93,23 @@ impl ProxyGroupDb {
         let db = Self {
             path: path.as_ref().to_owned(),
         };
-        let connection = db.connection_raw()?;
-        let version: i64 = connection
+        let mut connection = db.connection_raw()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx
             .query_row("SELECT version FROM rust_ag_meta LIMIT 1", [], |row| row.get(0))
             .context("not a supported isolated proxy-group database")?;
-        ensure!(version == 1, "unsupported proxy-group schema");
+        if version == 1 {
+            tx.execute_batch(
+                "ALTER TABLE rust_ag_accounts ADD COLUMN binding_generation INTEGER NOT NULL DEFAULT 0 CHECK(binding_generation >= 0);
+                 UPDATE rust_ag_accounts SET binding_generation=1 WHERE bound_node_id IS NOT NULL;
+                 DROP TABLE rust_ag_meta;
+                 CREATE TABLE rust_ag_meta (version INTEGER PRIMARY KEY CHECK(version=2));
+                 INSERT INTO rust_ag_meta (version) VALUES (2);",
+            )?;
+        } else {
+            ensure!(version == 2, "unsupported proxy-group schema");
+        }
+        tx.commit()?;
         Ok(db)
     }
 
@@ -114,7 +129,7 @@ impl ProxyGroupDb {
         let version: i64 = conn
             .query_row("SELECT version FROM rust_ag_meta LIMIT 1", [], |r| r.get(0))
             .context("isolated proxy-group schema missing")?;
-        ensure!(version == 1, "unsupported proxy-group schema");
+        ensure!(version == 2, "unsupported proxy-group schema");
         Ok(conn)
     }
 
@@ -166,16 +181,17 @@ impl ProxyGroupDb {
     pub fn binding(&self, name: &str) -> Result<BindingState> {
         self.connection()?
             .query_row(
-                "SELECT bound_node_id,binding_status,eligibility_status,egress_ip,observed_egress_ip
+                "SELECT bound_node_id,binding_generation,binding_status,eligibility_status,egress_ip,observed_egress_ip
                  FROM rust_ag_accounts WHERE credential_name=?1",
                 [name],
                 |r| {
                     Ok(BindingState {
                         node_id: r.get(0)?,
-                        binding_status: r.get(1)?,
-                        eligibility_status: r.get(2)?,
-                        egress_ip: r.get(3)?,
-                        observed_egress_ip: r.get(4)?,
+                        binding_generation: r.get(1)?,
+                        binding_status: r.get(2)?,
+                        eligibility_status: r.get(3)?,
+                        egress_ip: r.get(4)?,
+                        observed_egress_ip: r.get(5)?,
                     })
                 },
             )
@@ -199,17 +215,27 @@ impl ProxyGroupDb {
         &self,
         name: &str,
         expected_node_id: i64,
+        expected_generation: i64,
         now: i64,
         cooldown_seconds: i64,
         random_slot: usize,
     ) -> Result<Option<BoundProxy>> {
-        self.invalidate_inner(name, expected_node_id, now, cooldown_seconds, random_slot, false)
+        self.invalidate_inner(
+            name,
+            expected_node_id,
+            expected_generation,
+            now,
+            cooldown_seconds,
+            random_slot,
+            false,
+        )
     }
 
     fn invalidate_inner(
         &self,
         name: &str,
         expected_node_id: i64,
+        expected_generation: i64,
         now: i64,
         cooldown_seconds: i64,
         random_slot: usize,
@@ -217,18 +243,21 @@ impl ProxyGroupDb {
     ) -> Result<Option<BoundProxy>> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (group_id, node_id): (i64, Option<i64>) = tx
+        let (group_id, node_id, generation): (i64, Option<i64>, i64) = tx
             .query_row(
-                "SELECT group_id,bound_node_id FROM rust_ag_accounts WHERE credential_name=?1 AND proxy_mode='group'",
+                "SELECT group_id,bound_node_id,binding_generation FROM rust_ag_accounts WHERE credential_name=?1 AND proxy_mode='group'",
                 [name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .context("group account not found")?;
         let Some(node_id) = node_id else {
             tx.commit()?;
             return Ok(None);
         };
-        ensure!(node_id == expected_node_id, "stale proxy failure: bound node changed");
+        ensure!(
+            node_id == expected_node_id && generation == expected_generation,
+            "stale proxy failure: binding node or generation changed"
+        );
         let until = now.saturating_add(cooldown_seconds.max(0));
         let updated = tx.execute(
             "UPDATE rust_ag_nodes SET failure_count=CASE
@@ -310,20 +339,31 @@ fn reset_account(tx: &Transaction<'_>, name: &str, selected: Option<i64>) -> Res
     let updated = tx.execute(
         "UPDATE rust_ag_accounts SET bound_node_id=?2,
          binding_status='unchecked',eligibility_status='unchecked',
-         egress_ip=NULL,observed_egress_ip=NULL WHERE credential_name=?1",
+         egress_ip=NULL,observed_egress_ip=NULL,
+         binding_generation=binding_generation+1
+         WHERE credential_name=?1 AND binding_generation<9223372036854775807",
         params![name, selected],
     )?;
     ensure!(updated == 1, "account binding disappeared");
     Ok(())
 }
 
-fn bound_proxy(tx: &Transaction<'_>, node_id: i64, group_id: i64) -> Result<BoundProxy> {
+fn bound_proxy(tx: &Transaction<'_>, name: &str, node_id: i64, group_id: i64) -> Result<BoundProxy> {
+    let binding_generation: i64 = tx.query_row(
+        "SELECT binding_generation FROM rust_ag_accounts WHERE credential_name=?1",
+        [name],
+        |r| r.get(0),
+    )?;
     let proxy_url: String = tx.query_row(
         "SELECT proxy_url FROM rust_ag_nodes WHERE id=?1 AND group_id=?2",
         params![node_id, group_id],
         |r| r.get(0),
     )?;
-    Ok(BoundProxy { node_id, proxy_url })
+    Ok(BoundProxy {
+        node_id,
+        proxy_url,
+        binding_generation,
+    })
 }
 
 fn bind_in_tx(tx: &Transaction<'_>, name: &str, now: i64, random_slot: usize) -> Result<Option<BoundProxy>> {
@@ -343,7 +383,7 @@ fn bind_in_tx(tx: &Transaction<'_>, name: &str, now: i64, random_slot: usize) ->
                 .iter()
                 .any(|node| node.id == id && node.enabled && node.cooldown_until.is_none_or(|until| until <= now))
         {
-            return bound_proxy(tx, id, group_id).map(Some);
+            return bound_proxy(tx, name, id, group_id).map(Some);
         }
         reset_account(tx, name, None)?;
     }
@@ -361,7 +401,7 @@ fn bind_in_tx(tx: &Transaction<'_>, name: &str, now: i64, random_slot: usize) ->
         "UPDATE rust_ag_nodes SET last_used_at=?1 WHERE id=?2 AND group_id=?3",
         params![now, chosen.node_id, group_id],
     )?;
-    bound_proxy(tx, chosen.node_id, group_id).map(Some)
+    bound_proxy(tx, name, chosen.node_id, group_id).map(Some)
 }
 
 #[cfg(test)]
@@ -425,7 +465,7 @@ mod tests {
         db.select_and_bind("mock-1.json", 100, 0).unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
         let changed = db
-            .invalidate_and_rebind("mock-1.json", 1, 101, 300, 0)
+            .invalidate_and_rebind("mock-1.json", 1, 1, 101, 300, 0)
             .unwrap()
             .unwrap();
         assert_eq!(changed.node_id, 2);
@@ -433,6 +473,7 @@ mod tests {
             db.binding("mock-1.json").unwrap(),
             BindingState {
                 node_id: Some(2),
+                binding_generation: 3,
                 binding_status: "unchecked".into(),
                 eligibility_status: "unchecked".into(),
                 egress_ip: None,
@@ -459,7 +500,7 @@ mod tests {
             .unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
         assert!(
-            db.invalidate_and_rebind("mock-1.json", 1, 101, 300, 0)
+            db.invalidate_and_rebind("mock-1.json", 1, 1, 101, 300, 0)
                 .unwrap()
                 .is_none()
         );
@@ -477,7 +518,7 @@ mod tests {
         let (db, dir) = sandbox();
         db.select_and_bind("mock-1.json", 100, 0).unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
-        assert!(db.invalidate_inner("mock-1.json", 1, 101, 300, 0, true).is_err());
+        assert!(db.invalidate_inner("mock-1.json", 1, 1, 101, 300, 0, true).is_err());
         assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 0);
         assert_eq!(db.binding("mock-1.json").unwrap().binding_status, "healthy");
         assert_eq!(db.binding("mock-1.json").unwrap().node_id, Some(1));
@@ -491,20 +532,90 @@ mod tests {
         let original = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
         assert_eq!(original.node_id, 1);
         let replacement = db
-            .invalidate_and_rebind("mock-1.json", original.node_id, 101, 300, 0)
+            .invalidate_and_rebind(
+                "mock-1.json",
+                original.node_id,
+                original.binding_generation,
+                101,
+                300,
+                0,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(replacement.node_id, 2);
         db.update_cached_health_for_test("mock-1.json").unwrap();
         let before = db.binding("mock-1.json").unwrap();
         assert!(
-            db.invalidate_and_rebind("mock-1.json", original.node_id, 102, 300, 0)
-                .is_err()
+            db.invalidate_and_rebind(
+                "mock-1.json",
+                original.node_id,
+                original.binding_generation,
+                102,
+                300,
+                0
+            )
+            .is_err()
         );
         assert_eq!(db.binding("mock-1.json").unwrap(), before);
         assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=2"), 0);
         assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 1);
         drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_node_aba_rebinding_rejects_old_request_generation() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        assert_eq!(first.node_id, 1);
+        let second = db
+            .invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, 300, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.node_id, 2);
+        // Once node 1 leaves cooldown, A -> B -> A reuses the same node ID.
+        let third = db
+            .invalidate_and_rebind("mock-1.json", second.node_id, second.binding_generation, 402, 300, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.node_id, first.node_id);
+        assert!(third.binding_generation > first.binding_generation);
+        db.update_cached_health_for_test("mock-1.json").unwrap();
+        let before = db.binding("mock-1.json").unwrap();
+        assert!(
+            db.invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 403, 300, 0,)
+                .is_err()
+        );
+        assert_eq!(db.binding("mock-1.json").unwrap(), before);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 1);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=2"), 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_v1_companion_database_migrates_without_losing_binding() {
+        let (db, dir) = sandbox();
+        let initial = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        let path = dir.join("proxy.sqlite");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "ALTER TABLE rust_ag_accounts DROP COLUMN binding_generation;
+             DROP TABLE rust_ag_meta;
+             CREATE TABLE rust_ag_meta (version INTEGER PRIMARY KEY CHECK(version=1));
+             INSERT INTO rust_ag_meta (version) VALUES (1);",
+        )
+        .unwrap();
+        drop(old);
+        drop(db);
+        let upgraded = ProxyGroupDb::reopen(&path).unwrap();
+        assert_eq!(db_value(&upgraded, "SELECT version FROM rust_ag_meta"), 2);
+        assert_eq!(upgraded.binding("mock-1.json").unwrap().node_id, Some(initial.node_id));
+        assert_eq!(upgraded.binding("mock-1.json").unwrap().binding_generation, 1);
+        let same = upgraded.select_and_bind("mock-1.json", 101, 0).unwrap().unwrap();
+        assert_eq!(same.node_id, initial.node_id);
+        assert_eq!(same.binding_generation, 1);
+        drop(upgraded);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
