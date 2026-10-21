@@ -196,7 +196,10 @@ mod tests {
         let (db, credential, dir) = sandbox();
         let store = CredentialStore::new(vec![credential.clone()]);
         let first = db.select_and_bind(&credential.id, 100, 0).unwrap().unwrap();
-        let lease = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        // CredentialStore assigns a new monotonically increasing revision on
+        // registration; the actual lease must use that live snapshot.
+        let current = store.get(&credential.id).unwrap();
+        let lease = resolve_group_proxy_lease(&db, &current, 100).unwrap();
         assert!(lease_is_current(&db, &store, &lease, 100).unwrap());
         assert!(
             db.invalidate_and_rebind(&credential.id, first.node_id, first.binding_generation, 101, 300, 0)
@@ -214,11 +217,15 @@ mod tests {
         let (db, credential, dir) = sandbox();
         let store = CredentialStore::new(vec![credential.clone()]);
         db.select_and_bind(&credential.id, 100, 0).unwrap();
-        let lease = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        let current = store.get(&credential.id).unwrap();
+        // A view created before store registration is stale by definition.
+        let stale = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        assert!(!lease_is_current(&db, &store, &stale, 100).unwrap());
+        let lease = resolve_group_proxy_lease(&db, &current, 100).unwrap();
         assert!(lease_is_current(&db, &store, &lease, 100).unwrap());
         let mut patch = MetadataPatch::default();
         patch.set.insert("access_token".into(), json!("dummy-new-token"));
-        let updated = store.apply_patch(&credential.id, credential.revision, &patch).unwrap();
+        let updated = store.apply_patch(&credential.id, current.revision, &patch).unwrap();
         assert!(updated.revision > lease.credential_revision);
         assert!(!lease_is_current(&db, &store, &lease, 101).unwrap());
         assert_eq!(updated.str("access_token"), Some("dummy-new-token"));
