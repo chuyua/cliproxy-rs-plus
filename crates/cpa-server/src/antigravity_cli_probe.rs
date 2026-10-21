@@ -57,8 +57,36 @@ pub async fn fetch_manifest_candidate(
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProbeVerdict {
-    pub verified: bool,
-    pub attempted: usize,
+    // Opaque evidence: the validated version is bound to its successful
+    // upstream fetch, so a verdict for v1 cannot be reused to adopt v2.
+    verified_version: Option<String>,
+    attempted: usize,
+}
+
+impl ProbeVerdict {
+    pub fn verified_version(&self) -> Option<&str> {
+        self.verified_version.as_deref()
+    }
+
+    pub fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_verified(version: &str) -> Self {
+        Self {
+            verified_version: Some(version.to_owned()),
+            attempted: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_failed() -> Self {
+        Self {
+            verified_version: None,
+            attempted: 1,
+        }
+    }
 }
 
 /// Tries no more than three accounts. A 2xx fetchAvailableModels response is
@@ -120,13 +148,13 @@ pub async fn probe_candidate(
             .await;
         if outcome.is_ok_and(|r| (200..300).contains(&r.status().as_u16())) {
             return Ok(ProbeVerdict {
-                verified: true,
+                verified_version: Some(version.to_owned()),
                 attempted,
             });
         }
     }
     Ok(ProbeVerdict {
-        verified: false,
+        verified_version: None,
         attempted,
     })
 }
@@ -218,24 +246,45 @@ mod tests {
             fake_account("b.json", "dummy-allowed"),
         ];
         let previous = accounts[0].metadata.clone();
+        let verified = probe_candidate(
+            &clients,
+            &Config::default(),
+            &accounts,
+            &base,
+            &candidate,
+            "linux",
+            "amd64",
+            "consumer",
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            probe_candidate(
-                &clients,
-                &Config::default(),
-                &accounts,
-                &base,
-                &candidate,
-                "linux",
-                "amd64",
-                "consumer"
-            )
-            .await
-            .unwrap(),
+            verified,
             ProbeVerdict {
-                verified: true,
+                verified_version: Some(candidate.clone()),
                 attempted: 2
             }
         );
+        // Only the version bound to actual mock HTTP 2xx evidence may be
+        // adopted. Neither OAuth JSON nor account health is written.
+        let dir = std::env::temp_dir().join(format!("gcl2api-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let versions = crate::antigravity_cli_state::CliVersionDb::create_new(dir.join("versions.sqlite")).unwrap();
+        assert_eq!(versions.load_adopted().unwrap(), None);
+        assert_eq!(
+            versions.adopt_after_probe("1.3.1", &verified).unwrap().as_deref(),
+            Some("1.3.2")
+        );
+        assert_eq!(
+            crate::antigravity_cli_state::CliVersionDb::reopen(dir.join("versions.sqlite"))
+                .unwrap()
+                .load_adopted()
+                .unwrap()
+                .as_deref(),
+            Some("1.3.2")
+        );
+        drop(versions);
+        std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(posts.load(Ordering::SeqCst), 2);
         assert_eq!(accounts[0].metadata, previous);
         server.abort();
@@ -263,7 +312,7 @@ mod tests {
         assert_eq!(
             negative,
             ProbeVerdict {
-                verified: false,
+                verified_version: None,
                 attempted: 0
             }
         );
