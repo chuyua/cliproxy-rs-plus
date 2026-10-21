@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::antigravity_proxy_group::{self, Group, Node, Strategy};
 
@@ -54,6 +54,12 @@ pub struct BoundProxy {
     pub node_id: i64,
     pub proxy_url: String,
     pub binding_generation: i64,
+}
+
+/// Validated group assignment snapshot from the companion database.
+pub struct ActiveBoundProxy {
+    pub group_id: i64,
+    pub binding: BoundProxy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +202,35 @@ impl ProxyGroupDb {
                 },
             )
             .context("account binding not found")
+    }
+
+    /// Snapshot a usable group binding without changing SQLite or OAuth JSON.
+    /// Disabled/cooling/mismatched nodes are never treated as direct access.
+    pub fn active_bound_proxy(&self, name: &str, now: i64) -> Result<Option<ActiveBoundProxy>> {
+        let conn = self.connection()?;
+        let selected = conn
+            .query_row(
+                "SELECT a.group_id,n.id,a.binding_generation,n.proxy_url
+                 FROM rust_ag_accounts a
+                 JOIN rust_ag_groups g ON g.id=a.group_id AND g.enabled=1
+                 JOIN rust_ag_nodes n ON n.id=a.bound_node_id
+                   AND n.group_id=a.group_id AND n.enabled=1
+                 WHERE a.credential_name=?1 AND a.proxy_mode='group'
+                   AND (n.cooldown_until IS NULL OR n.cooldown_until<=?2)",
+                params![name, now],
+                |r| {
+                    Ok(ActiveBoundProxy {
+                        group_id: r.get(0)?,
+                        binding: BoundProxy {
+                            node_id: r.get(1)?,
+                            binding_generation: r.get(2)?,
+                            proxy_url: r.get(3)?,
+                        },
+                    })
+                },
+            )
+            .optional()?;
+        Ok(selected)
     }
 
     /// Stable assignment: concurrent callers get the same bound node.

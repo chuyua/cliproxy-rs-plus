@@ -45,6 +45,8 @@ jobs:
         run: cargo test --locked -p cpa-server --lib antigravity_proxy_group -- --nocapture
       - name: Antigravity SQLite binding transaction tests
         run: cargo test --locked -p cpa-server --lib antigravity_proxy_sqlite -- --nocapture
+      - name: Antigravity read-only proxy bridge tests
+        run: cargo test --locked -p cpa-server --lib antigravity_proxy_bridge -- --nocapture
       - name: Antigravity CLI identity compatibility
         run: cargo test --locked -p cpa-exec --lib antigravity_cli_ua -- --nocapture
       - name: Compile release Linux executable
