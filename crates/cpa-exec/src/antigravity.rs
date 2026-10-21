@@ -50,6 +50,9 @@ const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(210);
 /// `antigravityDefaultMaxIdleConnsPerHost` and `antigravityMaxAllowedMaxIdleConnsPerHost`.
 const DEFAULT_MAX_IDLE: usize = 2;
 const MAX_MAX_IDLE: usize = 100;
+/// A malformed background loadCodeAssist response must not exhaust a small
+/// proxy process or turn truncated JSON into a false "no credits" hint.
+const MAX_CREDITS_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// `antigravityPoolSettings` from `oauth.providers.antigravity.connection-pool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,9 +313,19 @@ impl AntigravityExecutor {
                 headers.set("User-Agent", user_agent);
                 let body = Bytes::from_static(br#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#);
                 let upstream = proxy::send(&client, &url, headers, body, None).await.ok()?;
-                let ok = (200..300).contains(&upstream.status);
-                let data = proxy::read_all(upstream.body, usize::MAX, false).await.ok()?;
-                ok.then(|| credits::hint_from_load_code_assist(&data)).flatten()
+                if !(200..300).contains(&upstream.status) {
+                    return None;
+                }
+                let data = proxy::read_all(upstream.body, MAX_CREDITS_RESPONSE_BYTES, false)
+                    .await
+                    .ok()?;
+                // read_all clips at the limit without telling the caller
+                // whether more bytes were pending. Do not parse a clipped body
+                // as an authoritative empty balance.
+                if data.len() >= MAX_CREDITS_RESPONSE_BYTES {
+                    return None;
+                }
+                credits::hint_from_load_code_assist(&data)
             };
             let hint = tokio::time::timeout(budget, lookup).await.ok().flatten();
             if let Some(hint) = hint {

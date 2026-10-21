@@ -668,6 +668,57 @@ async fn web_search_grounding_matches_go() {
     }
 }
 
+#[tokio::test]
+async fn oversized_background_credits_body_keeps_quota_unknown() {
+    use axum::extract::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&lookups);
+    let huge = "x".repeat(MAX_CREDITS_RESPONSE_BYTES + 8192);
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let large = huge.clone();
+        let seen = Arc::clone(&seen);
+        async move {
+            if req.uri().path().ends_with(":loadCodeAssist") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                large
+            } else {
+                r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}"#.to_owned()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut scenario = scenario("gemini_execute_basic").clone();
+    scenario["auth_id"] = Value::String("ag-credits-oversize".into());
+    scenario["attributes"] = serde_json::json!({"base_url":base});
+    let cfg = Config::parse("quota-exceeded:\n  antigravity-credits: true\n").unwrap();
+    let credential = credential(&scenario, "");
+    assert!(credits::hint(&credential.id).is_none());
+    let executor = AntigravityExecutor::default();
+    executor.execute(&credential, request(&scenario), &cfg).await.unwrap();
+    for _ in 0..300 {
+        if lookups.load(Ordering::SeqCst) > 0 && !credits::refreshing(&credential.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "large background response must be exercised"
+    );
+    assert!(
+        !credits::refreshing(&credential.id),
+        "background lookup must release its gate"
+    );
+    assert!(
+        credits::hint(&credential.id).is_none(),
+        "oversized/truncated response must not mark the account as out of credits"
+    );
+}
+
 /// Go `maybeRefreshAntigravityCreditsHint` / `updateAntigravityCreditsBalanceForTask`
 /// (TestEnsureAccessToken_WarmTokenLoadsCreditsHint,
 /// TestUpdateAntigravityCreditsBalance_LoadCodeAssistUserAgent): with credits on, a
