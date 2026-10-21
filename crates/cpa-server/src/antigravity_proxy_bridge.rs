@@ -8,10 +8,12 @@ use cpa_core::credential::{Credential, Source};
 use cpa_exec::proxy::Proxy;
 
 use crate::antigravity_proxy_sqlite::ProxyGroupDb;
+use crate::runtime::CredentialStore;
 
 /// Ephemeral, request-scoped view. Carries secrets; never log or serialize.
 pub struct GroupProxyLease {
     pub credential: Credential,
+    pub group_id: i64,
     pub node_id: i64,
     pub binding_generation: i64,
     pub credential_revision: u64,
@@ -53,10 +55,32 @@ pub fn resolve_group_proxy_lease(db: &ProxyGroupDb, credential: &Credential, now
     view.attributes.insert("proxy_url".into(), active.binding.proxy_url);
     Ok(GroupProxyLease {
         credential: view,
+        group_id,
         node_id: active.binding.node_id,
         binding_generation: active.binding.binding_generation,
         credential_revision: credential.revision,
     })
+}
+
+/// Best-effort pre-dispatch revalidation against the live credential revision
+/// and the current SQLite assignment. Any stale revision, disabled/cooling
+/// node, reassignment, or edited proxy URL refuses admission. This is not a
+/// cross-store atomic snapshot; request leases retain their generation for
+/// safe failure callbacks even if binding changes after this check.
+pub fn lease_is_current(db: &ProxyGroupDb, store: &CredentialStore, lease: &GroupProxyLease, now: i64) -> Result<bool> {
+    let Some(current) = store.get(&lease.credential.id) else {
+        return Ok(false);
+    };
+    if current.revision != lease.credential_revision || current.disabled {
+        return Ok(false);
+    }
+    let Some(active) = db.active_bound_proxy(&current.id, now)? else {
+        return Ok(false);
+    };
+    Ok(active.group_id == lease.group_id
+        && active.binding.node_id == lease.node_id
+        && active.binding.binding_generation == lease.binding_generation
+        && lease.credential.attributes.get("proxy_url") == Some(&active.binding.proxy_url))
 }
 
 #[cfg(test)]
@@ -64,6 +88,7 @@ mod tests {
     use super::*;
     use crate::antigravity_proxy_group::{Node, Strategy};
     use cpa_core::config::Config;
+    use cpa_core::credential::MetadataPatch;
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,6 +188,40 @@ mod tests {
                 .binding_generation,
             rebound.binding_generation
         );
+        finish(db, dir);
+    }
+
+    #[test]
+    fn revalidation_rejects_stale_sqlite_binding_after_node_reuse() {
+        let (db, credential, dir) = sandbox();
+        let store = CredentialStore::new(vec![credential.clone()]);
+        let first = db.select_and_bind(&credential.id, 100, 0).unwrap().unwrap();
+        let lease = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        assert!(lease_is_current(&db, &store, &lease, 100).unwrap());
+        assert!(
+            db.invalidate_and_rebind(&credential.id, first.node_id, first.binding_generation, 101, 300, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!lease_is_current(&db, &store, &lease, 101).unwrap());
+        db.select_and_bind(&credential.id, 402, 0).unwrap().unwrap();
+        assert!(!lease_is_current(&db, &store, &lease, 402).unwrap());
+        finish(db, dir);
+    }
+
+    #[test]
+    fn revalidation_rejects_a_refreshed_credential_revision() {
+        let (db, credential, dir) = sandbox();
+        let store = CredentialStore::new(vec![credential.clone()]);
+        db.select_and_bind(&credential.id, 100, 0).unwrap();
+        let lease = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        assert!(lease_is_current(&db, &store, &lease, 100).unwrap());
+        let mut patch = MetadataPatch::default();
+        patch.set.insert("access_token".into(), json!("dummy-new-token"));
+        let updated = store.apply_patch(&credential.id, credential.revision, &patch).unwrap();
+        assert!(updated.revision > lease.credential_revision);
+        assert!(!lease_is_current(&db, &store, &lease, 101).unwrap());
+        assert_eq!(updated.str("access_token"), Some("dummy-new-token"));
         finish(db, dir);
     }
 }
