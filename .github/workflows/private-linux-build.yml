@@ -51,6 +51,8 @@ jobs:
         run: cargo test --locked -p cpa-exec --lib antigravity_cli_ua -- --nocapture
       - name: Antigravity fail-closed grouped proxy regression
         run: cargo test --locked -p cpa-exec --lib group_proxy_fail_closed -- --nocapture
+      - name: Antigravity Go differential executor regression
+        run: cargo test --locked -p cpa-exec --lib antigravity_tests -- --nocapture
       - name: Antigravity CLI manifest and isolated version probe
         run: cargo test --locked -p cpa-server --lib antigravity_cli_probe -- --nocapture
       - name: Antigravity verified CLI version SQLite tests

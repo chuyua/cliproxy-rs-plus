@@ -318,7 +318,10 @@ impl Probes {
         };
         let present: HashSet<&str> = credentials
             .iter()
-            .filter(|c| c.provider == crate::antigravity::PROVIDER)
+            // Group-mode credentials are not probeable until the dispatcher
+            // has issued a bound lease. Treat them as absent from the hint
+            // cache too, so switching modes clears stale capabilities.
+            .filter(|c| c.provider == crate::antigravity::PROVIDER && c.str("proxy_mode") != Some("group"))
             .map(|c| c.id.as_str())
             .collect();
         let mut seen = lock(&self.seen);

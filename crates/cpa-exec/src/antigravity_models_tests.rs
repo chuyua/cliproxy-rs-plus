@@ -580,6 +580,41 @@ async fn group_proxy_fail_closed_skips_background_model_probe() {
 }
 
 #[tokio::test]
+async fn group_proxy_fail_closed_clears_stale_capability_hints_after_mode_switch() {
+    let up = upstream(|_| Reply::Answer(200, r#"{"webSearchModelIds":["claude-sonnet-4-6"]}"#)).await;
+    let probes = Arc::new(Probes::default());
+    let clients = GoClients::new(Default::default());
+    let cfg = Config::default();
+    let mut account = credential("group-mode-switch-hints", "dummy-switch", &[("base_url", &up.base)]);
+    probes.registered(&clients, &[Arc::new(account.clone())], &cfg);
+    let flagged = |credential: &Credential| {
+        cpa_core::registry::dynamic::models_for(&cfg, &HashMap::new(), credential, 0)
+            .into_iter()
+            .any(|m| m.id == "claude-sonnet-4-6" && m.supports_web_search)
+    };
+    for _ in 0..200 {
+        if flagged(&account) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(flagged(&account));
+    assert_eq!(up.hits.load(Ordering::SeqCst), 1);
+
+    account.revision += 1;
+    account.metadata.insert("proxy_mode".into(), "group".into());
+    probes.registered(&clients, &[Arc::new(account.clone())], &cfg);
+    assert!(!flagged(&account), "mode switch must clear old capability hints");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        up.hits.load(Ordering::SeqCst),
+        1,
+        "group mode must not trigger another probe"
+    );
+    probes.registered(&clients, &[], &cfg);
+}
+
+#[tokio::test]
 async fn a_stale_probe_never_replaces_a_newer_one() {
     // TestAntigravityAsyncProbe_DiscardsStaleProbeWhenAuthReRegistered: the probe of an
     // older revision finishes last and is dropped.
