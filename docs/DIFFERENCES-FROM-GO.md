@@ -53,6 +53,10 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   it is not compatible with Python's live SQLite database, and it does not
   commit the corresponding Rust auth-dir credential JSON in the same SQL
   transaction. Actual group routing and management APIs remain unwired.
+  Explicit failed-node rebinding takes the original node ID and refuses to
+  cool a later replacement after a binding change. An automatic dispatcher
+  must additionally carry a binding generation to protect same-node ABA;
+  this helper remains isolated from live request routing.
   This metadata is opt-in and is not part of the Go credential format.
 
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).

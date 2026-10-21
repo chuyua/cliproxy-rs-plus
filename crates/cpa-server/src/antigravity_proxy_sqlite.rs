@@ -198,16 +198,18 @@ impl ProxyGroupDb {
     pub fn invalidate_and_rebind(
         &self,
         name: &str,
+        expected_node_id: i64,
         now: i64,
         cooldown_seconds: i64,
         random_slot: usize,
     ) -> Result<Option<BoundProxy>> {
-        self.invalidate_inner(name, now, cooldown_seconds, random_slot, false)
+        self.invalidate_inner(name, expected_node_id, now, cooldown_seconds, random_slot, false)
     }
 
     fn invalidate_inner(
         &self,
         name: &str,
+        expected_node_id: i64,
         now: i64,
         cooldown_seconds: i64,
         random_slot: usize,
@@ -226,6 +228,7 @@ impl ProxyGroupDb {
             tx.commit()?;
             return Ok(None);
         };
+        ensure!(node_id == expected_node_id, "stale proxy failure: bound node changed");
         let until = now.saturating_add(cooldown_seconds.max(0));
         let updated = tx.execute(
             "UPDATE rust_ag_nodes SET failure_count=CASE
@@ -421,7 +424,10 @@ mod tests {
         let (db, dir) = sandbox();
         db.select_and_bind("mock-1.json", 100, 0).unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
-        let changed = db.invalidate_and_rebind("mock-1.json", 101, 300, 0).unwrap().unwrap();
+        let changed = db
+            .invalidate_and_rebind("mock-1.json", 1, 101, 300, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(changed.node_id, 2);
         assert_eq!(
             db.binding("mock-1.json").unwrap(),
@@ -452,7 +458,11 @@ mod tests {
             .execute("UPDATE rust_ag_nodes SET enabled=0 WHERE id=2", [])
             .unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
-        assert!(db.invalidate_and_rebind("mock-1.json", 101, 300, 0).unwrap().is_none());
+        assert!(
+            db.invalidate_and_rebind("mock-1.json", 1, 101, 300, 0)
+                .unwrap()
+                .is_none()
+        );
         let state = db.binding("mock-1.json").unwrap();
         assert!(state.node_id.is_none());
         assert_eq!(state.binding_status, "unchecked");
@@ -467,10 +477,33 @@ mod tests {
         let (db, dir) = sandbox();
         db.select_and_bind("mock-1.json", 100, 0).unwrap();
         db.update_cached_health_for_test("mock-1.json").unwrap();
-        assert!(db.invalidate_inner("mock-1.json", 101, 300, 0, true).is_err());
+        assert!(db.invalidate_inner("mock-1.json", 1, 101, 300, 0, true).is_err());
         assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 0);
         assert_eq!(db.binding("mock-1.json").unwrap().binding_status, "healthy");
         assert_eq!(db.binding("mock-1.json").unwrap().node_id, Some(1));
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_failure_cannot_cool_the_replacement_node() {
+        let (db, dir) = sandbox();
+        let original = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        assert_eq!(original.node_id, 1);
+        let replacement = db
+            .invalidate_and_rebind("mock-1.json", original.node_id, 101, 300, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.node_id, 2);
+        db.update_cached_health_for_test("mock-1.json").unwrap();
+        let before = db.binding("mock-1.json").unwrap();
+        assert!(
+            db.invalidate_and_rebind("mock-1.json", original.node_id, 102, 300, 0)
+                .is_err()
+        );
+        assert_eq!(db.binding("mock-1.json").unwrap(), before);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=2"), 0);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 1);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }
