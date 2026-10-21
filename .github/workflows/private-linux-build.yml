@@ -49,6 +49,8 @@ jobs:
         run: cargo test --locked -p cpa-server --lib antigravity_proxy_bridge -- --nocapture
       - name: Antigravity CLI identity compatibility
         run: cargo test --locked -p cpa-exec --lib antigravity_cli_ua -- --nocapture
+      - name: Antigravity CLI manifest and isolated version probe
+        run: cargo test --locked -p cpa-server --lib antigravity_cli_probe -- --nocapture
       - name: Compile release Linux executable
         run: cargo build --release --locked -p cliproxy
       - name: Smoke test and checksum

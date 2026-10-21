@@ -3,6 +3,7 @@
 mod access;
 mod affinity;
 mod antigravity_403;
+pub mod antigravity_cli_probe;
 pub mod antigravity_health;
 pub mod antigravity_proxy_bridge;
 pub mod antigravity_proxy_group;
