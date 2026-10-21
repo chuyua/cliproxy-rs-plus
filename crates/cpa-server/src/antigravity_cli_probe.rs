@@ -105,7 +105,9 @@ pub async fn probe_candidate(
         if matches!(proxy, Proxy::Invalid) {
             continue;
         }
-        let Ok(client) = clients.try_get(&proxy) else { continue };
+        let Some(client) = clients.try_get(&proxy) else {
+            continue;
+        };
         attempted += 1;
         let outcome = client
             .post(endpoint.as_str())
