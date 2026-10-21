@@ -78,6 +78,13 @@ Where cliproxy-rs has a feature, it aims to behave exactly as CLIProxyAPI does a
   adopted versions and safely reopen after restart; it does not use Python's
   config storage or change the running User-Agent. The scheduled validator
   and user-visible management controls remain unwired.
+  For Antigravity credentials explicitly configured with `proxy_mode=group`,
+  the executor and background probes deliberately reject missing or invalid
+  request-scoped group bindings instead of using GoClients' Go-compatible
+  default transport. Only a supported `proxy_url` in the ephemeral
+  credential attributes may select a group proxy; failure to build that client
+  also fails closed. Ordinary non-group/Go-compatible proxy fallback remains
+  unchanged. This guard does not activate live group selection by itself.
   This metadata is opt-in and is not part of the Go credential format.
 
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).

@@ -564,6 +564,22 @@ async fn registration_probes_each_new_revision_once() {
 }
 
 #[tokio::test]
+async fn group_proxy_fail_closed_skips_background_model_probe() {
+    let up = upstream(|_| Reply::Answer(200, r#"{"webSearchModelIds":["claude-sonnet-4-6"]}"#)).await;
+    let probes = Arc::new(Probes::default());
+    let clients = GoClients::new(Default::default());
+    let mut account = credential("group-probe-skipped", "dummy-group", &[("base_url", &up.base)]);
+    account.metadata.insert("proxy_mode".into(), "group".into());
+    // Even a global or direct proxy setting must not be used before the
+    // SQLite binding creates a request-scoped proxy lease.
+    let cfg = Config::parse("requests:\n  proxy-url: direct\n").unwrap();
+    probes.registered(&clients, &[Arc::new(account)], &cfg);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(up.hits.load(Ordering::SeqCst), 0);
+    probes.registered(&clients, &[], &cfg);
+}
+
+#[tokio::test]
 async fn a_stale_probe_never_replaces_a_newer_one() {
     // TestAntigravityAsyncProbe_DiscardsStaleProbeWhenAuthReRegistered: the probe of an
     // older revision finishes last and is dropped.

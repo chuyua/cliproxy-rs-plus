@@ -16,6 +16,83 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use super::*;
 use crate::gemini::tests::{Captured, Captures, Mock, UsageReports, check_attempt, client_bytes};
 
+/// Group mode is a deliberate extension to Go's normal proxy semantics:
+/// missing/invalid companion bindings may never use a direct/default client.
+#[tokio::test]
+async fn group_proxy_fail_closed_for_prepare_generate_stream_and_count() {
+    let cfg = Config::parse("requests:\n  proxy-url: http://global.invalid:9999\n").unwrap();
+    let executor = AntigravityExecutor::default();
+    let metadata = serde_json::json!({
+        "type": "antigravity",
+        "proxy_mode": "group",
+        "proxy_group_id": 9,
+        "access_token": "dummy-access",
+        "refresh_token": "dummy-refresh",
+        "proxy_url": "http://metadata-proxy.invalid:8080"
+    });
+    let mut group = Credential::from_file(
+        std::path::Path::new("/mock"),
+        std::path::Path::new("/mock/group.json"),
+        metadata.as_object().unwrap().clone(),
+    )
+    .unwrap();
+    let assert_rejected = |result: Result<wreq::Client, ExecError>| {
+        let error = result.err().expect("group without bound proxy must fail closed");
+        assert_eq!(error.status, 503);
+        assert_eq!(error.scope, FailureScope::Credential);
+    };
+    assert_rejected(executor.client(&group, &cfg));
+    assert_eq!(
+        executor
+            .prepare(&group, &cfg)
+            .await
+            .err()
+            .expect("prepare must reject group")
+            .status,
+        503
+    );
+    let source = &scenarios()[0];
+    for operation in [Operation::Generate, Operation::CountTokens] {
+        let mut req = request(source);
+        req.operation = operation;
+        assert_eq!(
+            executor
+                .execute(&group, req, &cfg)
+                .await
+                .err()
+                .expect("execute must reject group")
+                .status,
+            503
+        );
+    }
+    let mut req = request(source);
+    req.stream = true;
+    assert_eq!(
+        executor
+            .execute(&group, req, &cfg)
+            .await
+            .err()
+            .expect("stream must reject group")
+            .status,
+        503
+    );
+
+    for invalid in ["direct", "none", "ftp://proxy.invalid", ""] {
+        group.attributes.insert("proxy_url".into(), invalid.into());
+        assert_rejected(executor.client(&group, &cfg));
+    }
+    // A bridge-owned, ephemeral URL is accepted, without making any request.
+    group
+        .attributes
+        .insert("proxy_url".into(), "http://127.0.0.1:23123".into());
+    assert!(executor.client(&group, &cfg).is_ok());
+    assert!(executor.grounding_client(&group, &cfg).is_some());
+    // Non-group credentials retain the Go-compatible default transport.
+    group.metadata.remove("proxy_mode");
+    group.attributes.remove("proxy_url");
+    assert!(executor.client(&group, &cfg).is_ok());
+}
+
 fn fixture() -> &'static Value {
     static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| serde_json::from_str(include_str!("../tests/fixtures/antigravity_go.json")).unwrap())

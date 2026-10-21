@@ -24,7 +24,7 @@ use cpa_common::json as gj;
 use cpa_common::thinking::parse_suffix;
 use cpa_core::config::Config;
 use cpa_core::credential::{Credential, MetadataPatch};
-use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, Operation, ResponseBody};
+use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, FailureScope, Operation, ResponseBody};
 use cpa_core::format::Format;
 use cpa_translate::RequestCtx;
 use futures_util::StreamExt;
@@ -250,6 +250,9 @@ impl AntigravityExecutor {
     /// Credential preparation, then Go's post-refresh credits lookup
     /// (`queueAntigravityCreditsRefresh` after `refreshToken`).
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        // Group-mode credentials must not refresh OAuth over a fallback
+        // direct or inherited proxy when the explicit node is unavailable.
+        let _ = self.client(credential, cfg)?;
         let patch = auth::prepare(&self.clients_for(credential, cfg), credential, cfg).await?;
         if let Some(token) = patch.set.get("access_token").and_then(serde_json::Value::as_str) {
             let mut current = credential.clone();
@@ -289,7 +292,10 @@ impl AntigravityExecutor {
             credits::end_refresh(&id);
             return;
         };
-        let client = self.client(credential, cfg);
+        let Ok(client) = self.client(credential, cfg) else {
+            credits::end_refresh(&id);
+            return;
+        };
         let url = format!(
             "{}/v1internal:loadCodeAssist",
             ag::load_code_assist_base_url(credential)
@@ -355,9 +361,38 @@ impl AntigravityExecutor {
             .retain(|(s, ..)| s != scope);
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
-        self.clients_for(credential, cfg)
-            .get(&Proxy::effective(credential, cfg))
+    fn client(&self, credential: &Credential, cfg: &Config) -> Result<wreq::Client, ExecError> {
+        let clients = self.clients_for(credential, cfg);
+        if credential.str("proxy_mode") == Some("group") {
+            // GoClients::get() deliberately falls back to a default transport
+            // for malformed/failed proxy configuration. That is unsafe for an
+            // explicitly grouped credential, so use try_get() only.
+            let Some(Proxy::Url(url)) = credential.attributes.get("proxy_url").map(|proxy| Proxy::parse(proxy)) else {
+                return Err(ExecError::local(
+                    503,
+                    FailureScope::Credential,
+                    "Antigravity group proxy binding unavailable",
+                ));
+            };
+            return clients.try_get(&Proxy::Url(url)).ok_or_else(|| {
+                ExecError::local(
+                    503,
+                    FailureScope::Credential,
+                    "Antigravity group proxy transport unavailable",
+                )
+            });
+        }
+        Ok(clients.get(&Proxy::effective(credential, cfg)))
+    }
+
+    /// Web-search grounding URLs are optional. Never use a direct fallback
+    /// when an explicitly grouped account's grounding proxy cannot be built.
+    fn grounding_client(&self, credential: &Credential, cfg: &Config) -> Option<wreq::Client> {
+        let proxy = Proxy::effective(credential, cfg);
+        if credential.str("proxy_mode") == Some("group") {
+            return self.plain.try_get(&proxy);
+        }
+        Some(self.plain.get(&proxy))
     }
 
     /// `getSensitiveWordMatcher` for `antigravity.sensitive-words` (v8
@@ -459,6 +494,8 @@ impl AntigravityExecutor {
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        // The guard must run before CountTokens, compaction and credit refresh.
+        let _ = self.client(credential, cfg)?;
         if req.operation == Operation::CountTokens {
             return self.count_tokens(credential, req, cfg).await;
         }
@@ -608,7 +645,7 @@ impl AntigravityExecutor {
         headers.set("Authorization", format!("Bearer {token}"));
         headers.set("User-Agent", ag::user_agent(credential));
         gemini::set_custom_headers(&mut headers, credential, req);
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         gemini::send_captured(
             req.capture(),
             credential,
@@ -744,10 +781,10 @@ impl AntigravityExecutor {
         // Usage filtering and split-payload joining come before grounding resolution, as
         // in Go, which resolves each joined payload.
         lines = gemini::antigravity_payloads(lines);
-        if ag::resolves_grounding_urls(req.source_format, &req.body, &prepared.translated) {
-            let resolver = Grounding {
-                client: self.plain.get(&Proxy::effective(credential, cfg)),
-            };
+        if ag::resolves_grounding_urls(req.source_format, &req.body, &prepared.translated)
+            && let Some(client) = self.grounding_client(credential, cfg)
+        {
+            let resolver = Grounding { client };
             lines = lines
                 .then(move |item| {
                     let resolver = resolver.clone();
@@ -788,9 +825,10 @@ impl AntigravityExecutor {
         if !ag::resolves_grounding_urls(from, &req.body, translated) {
             return body;
         }
-        let resolver = Grounding {
-            client: self.plain.get(&Proxy::effective(credential, cfg)),
+        let Some(client) = self.grounding_client(credential, cfg) else {
+            return body;
         };
+        let resolver = Grounding { client };
         resolver.payload(body).await
     }
 
@@ -906,7 +944,7 @@ impl AntigravityExecutor {
         headers.set("Authorization", format!("Bearer {token}"));
         headers.set("User-Agent", ag::user_agent(credential));
         gemini::set_custom_headers(&mut headers, credential, &req);
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         let upstream = gemini::send_captured(
             req.capture(),
             credential,

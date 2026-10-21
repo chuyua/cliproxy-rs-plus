@@ -333,6 +333,11 @@ impl Probes {
             if credential.provider != crate::antigravity::PROVIDER || credential.disabled {
                 continue;
             }
+            // The registration snapshot is auth JSON, not a validated proxy
+            // group lease. Do not probe an unbound group on the default client.
+            if credential.str("proxy_mode") == Some("group") {
+                continue;
+            }
             if seen
                 .get(&credential.id)
                 .is_some_and(|(revision, _)| *revision == credential.revision)
