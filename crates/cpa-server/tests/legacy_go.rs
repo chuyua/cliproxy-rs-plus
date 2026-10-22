@@ -256,8 +256,9 @@ async fn go_v0_routes_replay_byte_for_byte() {
     );
 }
 
-/// v0 aliases must answer exactly like the v8 routes they wrap, and list entries carry
-/// the same `auth_index` the credentials listing reports for that key.
+/// v0 aliases must have the same semantics as v8 routes. OAuth URLs carry
+/// independent random states, so those are compared after removing the nonce.
+/// List entries carry the same `auth_index` as the credentials listing.
 #[tokio::test]
 async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
     let hash = bcrypt::hash("fake-secret", 4).unwrap();
@@ -307,7 +308,28 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
     ] {
         let (a, b) = (get("GET", v0).await.unwrap(), get("GET", v8).await.unwrap());
         assert_eq!(a.status(), b.status(), "{v0}");
-        assert_eq!(a.text().await.unwrap(), b.text().await.unwrap(), "{v0}");
+        let (a, b) = (a.text().await.unwrap(), b.text().await.unwrap());
+        if v0 == "/v0/management/antigravity-auth-url" {
+            let (a, b): (Value, Value) = (serde_json::from_str(&a).unwrap(), serde_json::from_str(&b).unwrap());
+            assert_eq!(a["status"], "ok");
+            assert_eq!(b["status"], "ok");
+            let normalize = |value: &Value| {
+                let sid = value["state"].as_str().unwrap();
+                assert_eq!(sid.len(), 32);
+                let mut url = url::Url::parse(value["url"].as_str().unwrap()).unwrap();
+                assert_eq!(url.query_pairs().find(|(key, _)| key == "state").unwrap().1, sid);
+                let params: Vec<(String, String)> = url
+                    .query_pairs()
+                    .filter(|(key, _)| key != "state")
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                url.query_pairs_mut().clear().extend_pairs(params);
+                url.to_string()
+            };
+            assert_eq!(normalize(&a), normalize(&b), "{v0}");
+        } else {
+            assert_eq!(a, b, "{v0}");
+        }
     }
     let (a, b) = (
         get("POST", "/v0/management/vertex/import").await.unwrap(),

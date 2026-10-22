@@ -724,10 +724,19 @@ fn request_path_plugins_match_go() {
                     );
                 }
             }
-            let (got, want) = match step["op"].as_str() {
+            let (mut got, mut want) = match step["op"].as_str() {
                 Some("records") => (async_completions_last(got), async_completions_last(want)),
                 _ => (got, want),
             };
+            // These three independent model-list requests finish through
+            // asynchronous plugin callbacks. The event set is deterministic,
+            // but their cross-request callback order is not.
+            if name == "model list interceptors" && n == 8 && step["op"] == "records" {
+                if let (Some(actual), Some(expected)) = (got.as_array_mut(), want.as_array_mut()) {
+                    actual.sort_by_key(Value::to_string);
+                    expected.sort_by_key(Value::to_string);
+                }
+            }
             if got != want {
                 failures.push(format!(
                     "{name} step {n} {}\n  go:   {want}\n  rust: {got}",
