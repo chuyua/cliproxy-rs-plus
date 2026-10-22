@@ -2445,12 +2445,15 @@ async fn antigravity_management_signin_saves_a_usable_credential() {
     let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
     assert_eq!(query["redirect_uri"], "http://localhost:51121/oauth-callback");
     assert_eq!(query["state"], sid);
-    assert!(!f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-        provider: "codex",
-        state: sid.to_owned(),
-        code: "wrong-provider".into(),
-        error: String::new(),
-    }));
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state: sid.to_owned(),
+            code: "wrong-provider".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::NotPending
+    );
     assert_eq!(
         oauth_get(&base, &format!("/oauth/status?state={sid}")).await["status"],
         "wait"
@@ -2487,12 +2490,15 @@ async fn antigravity_management_denial_does_not_save_a_credential() {
     let (base, _state, server) = login_server(&f, &fake).await;
     let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
     let sid = started["state"].as_str().unwrap();
-    assert!(f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-        provider: "antigravity",
-        state: sid.to_owned(),
-        code: String::new(),
-        error: "access_denied".into(),
-    }));
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "antigravity",
+            state: sid.to_owned(),
+            code: String::new(),
+            error: "access_denied".into(),
+        }),
+        cpa_server::runtime::OAuthDelivery::Delivered
+    );
     assert_eq!(final_status(&base, sid, 5).await["status"], "error");
     assert!(f.rt.store().snapshot().iter().all(|c| c.provider != "antigravity"));
     server.abort();

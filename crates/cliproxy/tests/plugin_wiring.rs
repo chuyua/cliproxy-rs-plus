@@ -731,11 +731,13 @@ fn request_path_plugins_match_go() {
             // These three independent model-list requests finish through
             // asynchronous plugin callbacks. The event set is deterministic,
             // but their cross-request callback order is not.
-            if name == "model list interceptors" && n == 8 && step["op"] == "records" {
-                if let (Some(actual), Some(expected)) = (got.as_array_mut(), want.as_array_mut()) {
-                    actual.sort_by_key(Value::to_string);
-                    expected.sort_by_key(Value::to_string);
-                }
+            if name == "model list interceptors"
+                && n == 8
+                && step["op"] == "records"
+                && let (Some(actual), Some(expected)) = (got.as_array_mut(), want.as_array_mut())
+            {
+                actual.sort_by_key(Value::to_string);
+                expected.sort_by_key(Value::to_string);
             }
             if got != want {
                 failures.push(format!(
