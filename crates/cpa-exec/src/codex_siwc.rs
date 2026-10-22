@@ -39,6 +39,409 @@ pub fn identifier(cfg: &Config) -> String {
         .unwrap_or_else(|| DEFAULT_IDENTIFIER.to_owned())
 }
 
+/// Go `codexUseSIWC`: the `use_siwc` attribute (`strconv.ParseBool`), else the metadata
+/// bool or string.
+pub fn enabled(credential: &cpa_core::credential::Credential) -> bool {
+    let attribute = credential
+        .attributes
+        .get("use_siwc")
+        .and_then(|raw| parse_bool(raw.trim()))
+        .unwrap_or(false);
+    attribute
+        || match credential.metadata.get("use_siwc") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => parse_bool(s.trim()).unwrap_or(false),
+            _ => false,
+        }
+}
+
+/// Go `codexSIWCAccessToken`: `siwc.access_token`, else `siwc.access`, trimmed.
+pub fn access_token(credential: &cpa_core::credential::Credential) -> &str {
+    let Some(Value::Object(siwc)) = credential.metadata.get("siwc") else {
+        return "";
+    };
+    ["access_token", "access"]
+        .iter()
+        .filter_map(|k| siwc.get(*k).and_then(Value::as_str).map(str::trim))
+        .find(|t| !t.is_empty())
+        .unwrap_or_default()
+}
+
+/// Go `ensureCodexSIWCCredentials`: an SIWC credential without its token fails before
+/// any request is built.
+pub fn require_token(credential: &cpa_core::credential::Credential) -> Result<(), ExecError> {
+    if enabled(credential) && access_token(credential).is_empty() {
+        return Err(siwc_error(
+            401,
+            "codex executor: use_siwc is enabled but siwc access_token is missing",
+        ));
+    }
+    Ok(())
+}
+
+fn partition(credential: &cpa_core::credential::Credential) -> Option<&Map<String, Value>> {
+    match credential.metadata.get("siwc") {
+        Some(Value::Object(siwc)) if !siwc.is_empty() => Some(siwc),
+        _ => None,
+    }
+}
+
+fn text<'a>(siwc: &'a Map<String, Value>, key: &str) -> &'a str {
+    siwc.get(key).and_then(Value::as_str).map(str::trim).unwrap_or_default()
+}
+
+type Time = chrono::DateTime<chrono::Utc>;
+
+/// A Go `time.Time` instant as Unix nanoseconds. chrono cannot hold every instant Go
+/// reads here (a millisecond Unix value up to `i64::MAX` is some 292 million years out),
+/// and a range failure must not read as Go's zero time.
+type GoTime = i128;
+const NANOS: i128 = 1_000_000_000;
+/// Go's zero time, 0001-01-01T00:00:00Z: `IsZero` treats it as unset.
+const ZERO: GoTime = -62_135_596_800 * NANOS;
+
+fn go_now(now: Time) -> GoTime {
+    i128::from(now.timestamp()) * NANOS + i128::from(now.timestamp_subsec_nanos())
+}
+
+/// Go's `int64(f)` for a JSON number (decoded as float64). Go leaves an out-of-range
+/// result to the platform: amd64 gives `math.MinInt64`, arm64 saturates as Rust does.
+fn go_float_to_int(f: f64) -> i64 {
+    if cfg!(target_arch = "x86_64") && !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
+        return i64::MIN;
+    }
+    f as i64
+}
+
+/// Go `normaliseUnix`: a non-positive value is the zero time; above 1e12, milliseconds.
+fn go_unix(raw: i64) -> GoTime {
+    match raw {
+        ..=0 => ZERO,
+        1_000_000_000_001.. => i128::from(raw) * 1_000_000,
+        _ => i128::from(raw) * NANOS,
+    }
+}
+
+/// Go `time.Parse` for the layouts `parseTimeValue` tries: `2006-01-02T15:04:05Z07:00`
+/// (RFC3339; RFC3339Nano accepts the same strings) with `sep` `T` and `zone`, and
+/// `2006-01-02 15:04:05` / `2006-01-02 15:04` with `sep` space. Go's grammar, not
+/// RFC 3339's: a one- or two-digit hour, a `.` or `,` fraction after the seconds even
+/// where the layout has none, no leap second, only an upper-case `Z`, and a space in the
+/// layout matching any run of spaces.
+fn go_parse(s: &str, sep: u8, seconds: bool, zone: bool) -> Option<GoTime> {
+    // Go `getnum`: one or two digits, two when `fixed`.
+    fn num(v: &[u8], fixed: bool) -> Option<(i64, &[u8])> {
+        let digit = |i: usize| v.get(i).filter(|b| b.is_ascii_digit()).map(|b| i64::from(b - b'0'));
+        let first = digit(0)?;
+        match digit(1) {
+            Some(second) => Some((first * 10 + second, &v[2..])),
+            None if fixed => None,
+            None => Some((first, &v[1..])),
+        }
+    }
+    // Go `skip` for a one-byte layout literal.
+    fn lit(v: &[u8], b: u8) -> Option<&[u8]> {
+        if b == b' ' {
+            if v.first().is_some_and(|c| *c != b' ') {
+                return None;
+            }
+            return Some(&v[v.iter().take_while(|c| **c == b' ').count()..]);
+        }
+        (v.first() == Some(&b)).then(|| &v[1..])
+    }
+    let v = s.as_bytes();
+    // stdLongYear: four bytes through `atoi`, so four digits.
+    if v.len() < 4 || !v[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let year: i32 = s[..4].parse().ok()?;
+    let (month, v) = num(lit(&v[4..], b'-')?, true)?;
+    let (day, v) = num(lit(v, b'-')?, true)?;
+    let (hour, v) = num(lit(v, sep)?, false)?;
+    let (min, mut v) = num(lit(v, b':')?, true)?;
+    if !(1..=12).contains(&month) || hour >= 24 || min >= 60 {
+        return None;
+    }
+    let (mut sec, mut nsec) = (0, 0);
+    if seconds {
+        (sec, v) = num(lit(v, b':')?, true)?;
+        if sec >= 60 {
+            return None;
+        }
+        // Go `parseNanoseconds`: at most nine digits count; the rest are read and dropped.
+        if v.len() >= 2 && matches!(v[0], b'.' | b',') && v[1].is_ascii_digit() {
+            let n = 1 + v[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let digits = &v[1..n.min(10)];
+            nsec =
+                digits.iter().fold(0i128, |n, d| n * 10 + i128::from(d - b'0')) * 10i128.pow(9 - digits.len() as u32);
+            v = &v[n..];
+        }
+    }
+    let mut offset = 0;
+    if zone {
+        if v.first() == Some(&b'Z') {
+            v = &v[1..];
+        } else {
+            // stdISO8601ColonTZ: `±hh:mm`; Go allows up to 24 hours and 60 minutes.
+            if v.len() < 6 || v[3] != b':' {
+                return None;
+            }
+            let (hr, _) = num(&v[1..3], true)?;
+            let (mm, _) = num(&v[4..6], true)?;
+            if hr > 24 || mm > 60 {
+                return None;
+            }
+            offset = match v[0] {
+                b'+' => (hr * 60 + mm) * 60,
+                b'-' => -(hr * 60 + mm) * 60,
+                _ => return None,
+            };
+            v = &v[6..];
+        }
+    }
+    if !v.is_empty() {
+        return None;
+    }
+    let midnight = chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc()
+        .timestamp();
+    Some(i128::from(midnight + hour * 3600 + min * 60 + sec - offset) * NANOS + nsec)
+}
+
+/// Go `parseTimeValue` on a decoded JSON value; `None` when it does not parse. The zero
+/// time is a value: it still ends a key search.
+fn go_time(value: &Value) -> Option<GoTime> {
+    match value {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            go_parse(s, b'T', true, true)
+                .or_else(|| go_parse(s, b' ', true, false))
+                .or_else(|| go_parse(s, b' ', false, false))
+                .or_else(|| s.parse().ok().map(go_unix))
+        }
+        Value::Number(n) => Some(go_unix(go_float_to_int(n.as_f64()?))),
+        _ => None,
+    }
+}
+
+/// Go `lookupMetadataTime`: the first key whose value parses, zero time included.
+fn lookup_time(map: &Map<String, Value>, keys: &[&str]) -> Option<GoTime> {
+    keys.iter().find_map(|k| map.get(*k).and_then(go_time))
+}
+
+/// Go `parseIntAny` for `expires_in`: whole seconds from a number or a decimal string.
+fn go_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => Some(go_float_to_int(n.as_f64()?)),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Go `expirationFromMap`: the expiry keys, then `expires_in` after its issue time, then
+/// a nested `token` or `Token` map.
+fn expiration_from_map(map: &Map<String, Value>) -> Option<GoTime> {
+    if let Some(t) = lookup_time(
+        map,
+        &["expired", "expire", "expires_at", "expiresAt", "expiry", "expires"],
+    ) {
+        return Some(t);
+    }
+    let seconds = ["expires_in", "expiresIn"]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(go_int).filter(|s| *s > 0));
+    if let Some(seconds) = seconds {
+        let issued = ["timestamp", "issued_at", "issuedAt"]
+            .iter()
+            .find_map(|k| map.get(*k).and_then(go_time).filter(|t| *t != ZERO));
+        if let Some(issued) = issued {
+            // `time.Duration(expiresIn) * time.Second` wraps like Go's int64 product.
+            return Some(issued + i128::from(seconds.wrapping_mul(1_000_000_000)));
+        }
+    }
+    ["token", "Token"].iter().find_map(|k| match map.get(*k) {
+        Some(Value::Object(nested)) => expiration_from_map(nested),
+        _ => None,
+    })
+}
+
+/// Go `parseJWTExp`'s payload decoding: the middle of exactly three `.`-separated
+/// segments, through `base64.URLEncoding` with the padding its length implies and then
+/// `RawURLEncoding`. Both skip CR and LF and accept non-zero trailing bits.
+fn jwt_payload(token: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    let [_, segment, _] = parts[..] else {
+        return None;
+    };
+    let engine = |mode| {
+        let config = GeneralPurposeConfig::new()
+            .with_decode_padding_mode(mode)
+            .with_decode_allow_trailing_bits(true);
+        GeneralPurpose::new(&base64::alphabet::URL_SAFE, config)
+    };
+    let strip = |s: &str| s.bytes().filter(|b| !matches!(b, b'\r' | b'\n')).collect::<Vec<u8>>();
+    // The padding comes from the length before CR and LF are skipped, as in Go.
+    let pad = ["", "", "==", "="][segment.len() % 4];
+    engine(DecodePaddingMode::RequireCanonical)
+        .decode(strip(&format!("{segment}{pad}")))
+        .or_else(|_| engine(DecodePaddingMode::RequireNone).decode(strip(segment)))
+        .ok()
+}
+
+/// Go `json.Unmarshal` of a JWT payload into `struct{ Exp any }`: every member whose
+/// name folds to `exp` (ASCII case; nothing else folds into those letters) replaces the
+/// field in input order, null clearing it; other members are skipped unconverted. `None`
+/// when the payload is not one JSON object or null, or a value fails to decode.
+// ponytail: an `exp` value holding invalid UTF-8 or a lone surrogate fails here, where Go
+// substitutes U+FFFD; such a value is never a number, so only a later `exp` in the same
+// payload could read differently.
+fn jwt_exp_claim(payload: &[u8]) -> Option<Value> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    struct IsExp(bool);
+    impl<'de> serde::Deserialize<'de> for IsExp {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Key;
+            impl Visitor<'_> for Key {
+                type Value = IsExp;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a member name")
+                }
+                fn visit_bytes<E>(self, v: &[u8]) -> Result<IsExp, E> {
+                    Ok(IsExp(v.eq_ignore_ascii_case(b"exp")))
+                }
+                fn visit_str<E>(self, v: &str) -> Result<IsExp, E> {
+                    Ok(IsExp(v.eq_ignore_ascii_case("exp")))
+                }
+            }
+            // Raw bytes: a name that is not UTF-8 is skipped, not an error.
+            d.deserialize_bytes(Key)
+        }
+    }
+    struct Claims;
+    impl<'de> DeserializeSeed<'de> for Claims {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Claims {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an object or null")
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut exp = Value::Null;
+            while let Some(IsExp(is_exp)) = map.next_key()? {
+                if is_exp {
+                    exp = map.next_value()?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(exp)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(payload);
+    let exp = Claims.deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(exp)
+}
+
+/// Go `parseJWTExp`: a positive number or decimal string, through `normaliseUnix`.
+fn jwt_exp(token: &str) -> Option<GoTime> {
+    match jwt_exp_claim(&jwt_payload(token)?)? {
+        Value::Number(n) => n.as_f64().filter(|f| *f > 0.0).map(|f| go_unix(go_float_to_int(f))),
+        Value::String(s) => s.trim().parse::<i64>().ok().filter(|s| *s > 0).map(go_unix),
+        _ => None,
+    }
+}
+
+/// Go `SIWCExpirationTime`: the partition's expiration, else its access token's JWT
+/// `exp`; a zero time is no expiration.
+fn expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
+    expiration_from_map(siwc)
+        .filter(|t| *t != ZERO)
+        .or_else(|| jwt_exp(text(siwc, "access_token")).filter(|t| *t != ZERO))
+}
+
+/// Go `CodexSIWCNeedsRefresh`: `None` when the partition cannot refresh (no refresh
+/// token or client ID), else whether it is due at `now`: no access token, five minutes
+/// before its expiry, five minutes after its last refresh, or now when neither is known.
+pub fn refresh_due(credential: &cpa_core::credential::Credential, now: Time) -> Option<bool> {
+    let siwc = partition(credential)?;
+    if text(siwc, "refresh_token").is_empty() || text(siwc, "client_id").is_empty() {
+        return None;
+    }
+    if text(siwc, "access_token").is_empty() {
+        return Some(true);
+    }
+    let (now, lead) = (go_now(now), 5 * 60 * NANOS);
+    if let Some(expiry) = expiry(siwc) {
+        return Some(expiry - lead <= now);
+    }
+    let last = lookup_time(siwc, &["last_refresh", "lastRefresh"]).filter(|t| *t != ZERO);
+    Some(last.is_none_or(|last| last + lead <= now))
+}
+
+/// The partition's request token is present and not expired at `now`.
+pub(crate) fn access_usable(credential: &cpa_core::credential::Credential, now: Time) -> bool {
+    !access_token(credential).is_empty()
+        && partition(credential)
+            .and_then(expiry)
+            .is_none_or(|exp| exp > go_now(now))
+}
+
+/// The `siwc` patch of a refresh: the stored partition with the refreshed fields over it.
+pub(crate) fn refresh_patch(
+    credential: &cpa_core::credential::Credential,
+    tokens: &Tokens,
+) -> cpa_core::credential::MetadataPatch {
+    let mut merged = partition(credential).cloned().unwrap_or_default();
+    merged.extend(tokens.to_map());
+    let mut patch = cpa_core::credential::MetadataPatch::default();
+    patch.set.insert("siwc".into(), Value::Object(merged));
+    patch
+}
+
+/// The partition's refresh grant inputs: refresh token, client ID and device ID.
+pub(crate) fn refresh_inputs(credential: &cpa_core::credential::Credential) -> (&str, &str, &str) {
+    partition(credential).map_or(("", "", ""), |siwc| {
+        (
+            text(siwc, "refresh_token"),
+            text(siwc, "client_id"),
+            text(siwc, "device_id"),
+        )
+    })
+}
+
+/// Go `codexSIWCUserAgent`: `<identifier> (<GOOS>; <GOARCH>)`.
+pub fn user_agent(cfg: &Config) -> String {
+    format!(
+        "{} ({}; {})",
+        identifier(cfg),
+        crate::kimi_http::go_os(),
+        crate::kimi_http::go_arch()
+    )
+}
+
+/// Go `strconv.ParseBool`.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// Go `IsValidUUID`: a canonical 36-character UUID, any case, surrounding space ignored.
 pub fn is_valid_uuid(raw: &str) -> bool {
     let raw = raw.trim().as_bytes();
@@ -179,6 +582,17 @@ impl CodexOAuth {
                 body.into_bytes(),
             )
             .await?;
+        if status != 200 && !require_id_token {
+            // A refresh keeps the OAuth error code (Go echoes the body), so
+            // `refresh_token_reused` stops the retries; bodies may echo request material.
+            return Err(crate::codex_oauth::refresh_error(
+                status,
+                &format!(
+                    "OpenAI OAuth token request failed ({status}): {}",
+                    crate::codex_oauth::oauth_code(&body)
+                ),
+            ));
+        }
         if status != 200 {
             return Err(siwc_error(
                 status,

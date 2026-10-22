@@ -464,6 +464,18 @@ impl Runtime {
         cfg: &Config,
         failed: Option<u64>,
     ) -> Result<Arc<Credential>, ExecError> {
+        self.prepare_credential_with(id, cfg, failed, false).await
+    }
+
+    /// [`Self::prepare_credential`]; `management` marks a management refresh, which
+    /// refreshes every Codex token partition (Go `IsForceRefreshContext`).
+    async fn prepare_credential_with(
+        &self,
+        id: &str,
+        cfg: &Config,
+        failed: Option<u64>,
+        management: bool,
+    ) -> Result<Arc<Credential>, ExecError> {
         // Owned: the commit below moves it into its blocking job, which a cancelled caller
         // cannot stop, so the lock covers the read through the commit either way.
         let guard = self.store.prepare_lock(id).lock_owned().await;
@@ -483,6 +495,7 @@ impl Runtime {
         }
         let view = self.for_executor(&current);
         let patch = match failed {
+            Some(_) if management => self.executors.prepare_management(&view, cfg).await?,
             Some(_) => self.executors.prepare_forced(&view, cfg).await?,
             None => self.executors.prepare(&view, cfg).await?,
         };
@@ -507,10 +520,15 @@ impl Runtime {
                         // and a credential version on `Credential` would close both.
                         Err(PatchError::Stale { .. }) => {
                             let latest = store.get(&id).ok_or(PatchError::NotFound)?;
-                            if credentials_changed(&current, &latest) {
+                            let (rebased, partition_applies) =
+                                rebase_patch(&current.provider, &current.metadata, &latest.metadata, &patch);
+                            // Go 7b0319fb: a Codex token partition the refresh still matches
+                            // applies even when the other partition changed meanwhile
+                            // (`CredentialRefreshPatch.CanApplyTo`).
+                            if credentials_changed(&current, &latest) && !partition_applies {
                                 return Ok(latest);
                             }
-                            attempt = rebase_patch(&current.provider, &current.metadata, &latest.metadata, &patch);
+                            attempt = rebased;
                             if attempt.set.is_empty() && attempt.remove.is_empty() {
                                 return Ok(latest);
                             }
@@ -2340,7 +2358,7 @@ impl Runtime {
     pub async fn refresh_credential(&self, id: &str) -> Result<Arc<Credential>, ExecError> {
         let cfg = self.config();
         let revision = self.store.get(id).map(|c| c.revision);
-        self.prepare_credential(id, &cfg, revision).await
+        self.prepare_credential_with(id, &cfg, revision, true).await
     }
 }
 
@@ -2349,14 +2367,16 @@ impl Runtime {
 /// `patch` to apply on top of `user`. A value the patch did not change keeps the edit;
 /// a value both changed keeps the edit unless it is a token payload. A missing key is
 /// not JSON null. Codex outer tokens move as one partition (Go `CredentialRefreshPatch`).
-// ponytail: no prepare patch sets `proxy_url`, `siwc` or `use_siwc`, so Go's dedicated
-// merges for those keys are not ported; add them with the first producer.
+/// The Sign in with ChatGPT partition (`siwc`) moves the same way, inside its map. The
+/// flag reports whether a refreshed Codex partition still matches the stored version.
+// ponytail: no prepare patch sets `proxy_url` or `use_siwc`, so Go's dedicated merges for
+// those keys are not ported; add them with the first producer.
 fn rebase_patch(
     provider: &str,
     base: &Map<String, Value>,
     user: &Map<String, Value>,
     patch: &MetadataPatch,
-) -> MetadataPatch {
+) -> (MetadataPatch, bool) {
     // Go `codexOuterCredentialKeys` (internal/auth/codex/token.go).
     const CODEX_OUTER: [&str; 8] = [
         "id_token",
@@ -2389,8 +2409,9 @@ fn rebase_patch(
     let codex = provider == "codex";
     let kept_by_user = |k: &str| base.get(k) == user.get(k);
     let mut out = MetadataPatch::default();
+    let mut partition_applies = false;
     for (k, v) in &patch.set {
-        let outer = codex && CODEX_OUTER.contains(&k.as_str());
+        let outer = codex && (CODEX_OUTER.contains(&k.as_str()) || k == "siwc");
         if !outer && base.get(k) != Some(v) && (kept_by_user(k) || token_payload(k)) {
             out.set.insert(k.clone(), v.clone());
         }
@@ -2405,18 +2426,15 @@ fn rebase_patch(
         // Go `CredentialRefreshPatch.Apply`: the refreshed tokens apply only while the
         // stored identity is still the one refreshed (or its result), and then only the
         // fields the refresh changed.
-        let fields = |m: &Map<String, Value>| -> Map<String, Value> {
-            CODEX_OUTER
-                .iter()
+        let fields = |m: &Map<String, Value>, keys: &[&str]| -> Map<String, Value> {
+            keys.iter()
                 .filter_map(|k| m.get(*k).map(|v| ((*k).to_owned(), v.clone())))
                 .collect()
         };
-        let before = fields(base);
         let mut updated = base.clone();
         patch.apply(&mut updated);
-        let after = fields(&updated);
         // Go `sameCredentialVersion` (`reflect.DeepEqual` on map reads: null is missing).
-        let same = |b: &Map<String, Value>| {
+        let same = |current: &Map<String, Value>, b: &Map<String, Value>| {
             [
                 "access_token",
                 "refresh_token",
@@ -2426,17 +2444,53 @@ fn rebase_patch(
                 "device_id",
             ]
             .iter()
-            .all(|k| user.get(*k).filter(|v| !v.is_null()) == b.get(*k).filter(|v| !v.is_null()))
+            .all(|k| current.get(*k).filter(|v| !v.is_null()) == b.get(*k).filter(|v| !v.is_null()))
         };
-        if let Some(baseline) = [&before, &after].into_iter().find(|b| same(b)) {
-            for (k, v) in &after {
-                if baseline.get(k) != Some(v) {
-                    out.set.insert(k.clone(), v.clone());
-                }
+        // The changed fields of one partition, when `current` still holds the version
+        // refreshed or its result.
+        let changes = |current: &Map<String, Value>, before: &Map<String, Value>, after: &Map<String, Value>| {
+            [before, after].into_iter().find(|b| same(current, b)).map(|baseline| {
+                after
+                    .iter()
+                    .filter(|(k, v)| baseline.get(*k) != Some(*v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Map<String, Value>>()
+            })
+        };
+        let (before, after) = (fields(base, &CODEX_OUTER), fields(&updated, &CODEX_OUTER));
+        if before != after
+            && let Some(changed) = changes(user, &before, &after)
+        {
+            partition_applies = true;
+            out.set.extend(changed);
+        }
+        // Go `codexSIWCCredentialKeys`.
+        const CODEX_SIWC: [&str; 9] = [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_id",
+            "device_id",
+            "expired",
+            "last_refresh",
+            "scope",
+            "scopes",
+        ];
+        let siwc = |m: &Map<String, Value>| m.get("siwc").and_then(Value::as_object).cloned().unwrap_or_default();
+        let (before, after) = (fields(&siwc(base), &CODEX_SIWC), fields(&siwc(&updated), &CODEX_SIWC));
+        let current = siwc(user);
+        if before != after
+            && let Some(changed) = changes(&current, &before, &after)
+        {
+            partition_applies = true;
+            if !changed.is_empty() {
+                let mut merged = current;
+                merged.extend(changed);
+                out.set.insert("siwc".into(), Value::Object(merged));
             }
         }
     }
-    out
+    (out, partition_applies)
 }
 
 /// Go `CredentialsChanged`: the tokens or API key differ.
@@ -4277,6 +4331,14 @@ mod tests {
             Value::Object(m)
         };
         let kimi = json!({"type": "kimi", "note": "a", "expired": "t0", "gone": "a"});
+        let siwc = json!({"type": "codex", "access_token": "a", "refresh_token": "r", "account_id": "acct",
+            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c", "expired": "t0", "note": "n"}});
+        let siwc_refresh = json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "n"}});
+        let siwc_edit = |k: &str, v: Value| {
+            let mut m = map(siwc.clone());
+            m["siwc"][k] = v;
+            Value::Object(m)
+        };
         for (name, provider, base, user, set, remove, want_set, want_remove) in [
             (
                 "an unchanged value keeps the edit, a changed token is applied",
@@ -4349,6 +4411,36 @@ mod tests {
                 vec![],
             ),
             (
+                "Codex SIWC: the refreshed fields land over an edit inside the partition",
+                "codex",
+                &siwc,
+                siwc_edit("note", json!("edited")),
+                siwc_refresh.clone(),
+                vec![],
+                json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "edited"}}),
+                vec![],
+            ),
+            (
+                "Codex SIWC: another client drops the partition",
+                "codex",
+                &siwc,
+                siwc_edit("client_id", json!("other")),
+                siwc_refresh.clone(),
+                vec![],
+                json!({}),
+                vec![],
+            ),
+            (
+                "Codex SIWC: an edit already holding the result keeps it",
+                "codex",
+                &siwc,
+                siwc_edit("access_token", json!("s2")),
+                json!({"siwc": {"access_token": "s2", "refresh_token": "sr", "client_id": "c", "expired": "t0", "note": "n"}}),
+                vec![],
+                json!({}),
+                vec![],
+            ),
+            (
                 "Codex: another account drops the whole partition",
                 "codex",
                 &codex,
@@ -4363,10 +4455,35 @@ mod tests {
                 set: map(set),
                 remove: remove.into_iter().map(str::to_owned).collect(),
             };
-            let out = rebase_patch(provider, &map(base.clone()), &map(user), &patch);
+            let (out, _) = rebase_patch(provider, &map(base.clone()), &map(user), &patch);
             assert_eq!(Value::Object(out.set), want_set, "{name}");
             assert_eq!(out.remove, want_remove, "{name}");
         }
+    }
+
+    /// Go `CredentialRefreshPatch.CanApplyTo`: a refreshed partition that still matches
+    /// the stored version applies even after the other partition's tokens changed.
+    #[test]
+    fn a_matching_codex_partition_applies_after_the_other_changed() {
+        use serde_json::json;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let base = json!({"type": "codex", "access_token": "a", "refresh_token": "r",
+            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c"}});
+        let patch = MetadataPatch {
+            set: map(json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c"}})),
+            remove: vec![],
+        };
+        let mut outer_changed = map(base.clone());
+        outer_changed.insert("access_token".into(), "other".into());
+        let (out, applies) = rebase_patch("codex", &map(base.clone()), &outer_changed, &patch);
+        assert!(applies);
+        assert_eq!(out.set["siwc"]["access_token"], "s2");
+        let mut siwc_changed = map(base.clone());
+        siwc_changed["siwc"]["refresh_token"] = "rotated-elsewhere".into();
+        let (out, applies) = rebase_patch("codex", &map(base.clone()), &siwc_changed, &patch);
+        assert!(!applies && out.set.is_empty());
+        // Only Codex partitions qualify.
+        assert!(!rebase_patch("claude", &map(base.clone()), &outer_changed, &patch).1);
     }
 
     /// Go `CredentialsChanged` compares the token requests use, which a `use_siwc`

@@ -707,6 +707,15 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(url.into())
 }
 
+/// `applyCodexSIWCWebsocketBodyRules` after `SanitizeCodexInputItemIDs`, in Go's order:
+/// the id pass sees the `configuration_update` items the SIWC rules then drop.
+pub(crate) fn siwc_turn_body(view: &View<'_>, req: &ExecRequest, body: String) -> String {
+    if !view.siwc {
+        return body;
+    }
+    request::siwc_request_body(request::sanitize_input_ids(body), req, Call::Websocket)
+}
+
 /// `buildCodexWebsocketRequestBody`: every turn is a `response.create`.
 fn request_frame(body: String) -> String {
     let body = request::sanitize_input_ids(body);
@@ -1234,6 +1243,7 @@ impl CodexExecutor {
         let (body, replay) = Replay::apply(&self.replay, &req, body).await;
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
+        let body = siwc_turn_body(view, &req, body);
         let native = request::is_native(&req);
         let headers = request::ws_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), native);
         let target = Target::new(view.credential, ws_url(&format!("{}/responses", view.base_url))?, cfg);

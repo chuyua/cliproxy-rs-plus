@@ -106,6 +106,7 @@ impl CodexExecutor {
         session: &ExecSession,
     ) -> Result<ExecResponse, ExecError> {
         check_response_format(&req)?;
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         if view.websockets() {
@@ -163,26 +164,35 @@ impl CodexExecutor {
         self.ws.close(id);
     }
 
-    /// Refresh due under Go's 96h Codex lead. Cheap and side-effect free.
+    /// Refresh due: the outer tokens under Go's 96h Codex lead, or the Sign in with
+    /// ChatGPT partition under its 5-minute lead (Go `shouldRefresh`). Cheap and side-effect free.
     pub fn needs_prepare(&self, credential: &Credential, cfg: &Config) -> bool {
         self.needs_prepare_at(credential, cfg, Utc::now())
     }
 
     pub fn needs_prepare_at(&self, credential: &Credential, _cfg: &Config, now: chrono::DateTime<Utc>) -> bool {
-        codex_oauth::refresh_due(credential, now)
+        codex_oauth::refresh_due(credential, now) || crate::codex_siwc::refresh_due(credential, now) == Some(true)
     }
 
-    /// Refreshes tokens. Go refreshes Codex only in the background and never blocks a
-    /// request on it, so a failed refresh while the access token is still valid keeps the
-    /// credential usable; the failure is cached for five minutes by the OAuth service.
+    /// Refreshes the due partitions. Go refreshes Codex only in the background and never
+    /// blocks a request on it, so a failed refresh while the token requests use is still
+    /// valid keeps the credential usable; the failure is cached for five minutes by the
+    /// OAuth service.
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
         let now = Utc::now();
-        if !codex_oauth::refresh_due(credential, now) {
+        let outer = codex_oauth::refresh_due(credential, now);
+        let siwc = crate::codex_siwc::refresh_due(credential, now) == Some(true);
+        if !outer && !siwc {
             return Ok(MetadataPatch::default());
         }
-        match self.refresh_now(credential, cfg).await {
+        let usable = if crate::codex_siwc::enabled(credential) {
+            crate::codex_siwc::access_usable(credential, now)
+        } else {
+            codex_oauth::access_usable(credential, now)
+        };
+        match self.refresh_partitions(credential, cfg, outer, siwc).await {
             Ok(patch) => Ok(patch),
-            Err(error) if codex_oauth::access_usable(credential, now) => {
+            Err(error) if usable => {
                 tracing::warn!(
                     credential = %credential.id,
                     status = error.status,
@@ -194,19 +204,91 @@ impl CodexExecutor {
         }
     }
 
-    /// Refreshes the outer tokens whether due or not: the runtime asks after an upstream
-    /// rejected the access token, or for a management refresh (Go `CodexOuterNeedsRefresh`
-    /// with a rejected token, and `IsForceRefreshContext`). Nothing without a refresh token.
+    /// Refreshes after an upstream rejected the token requests use (Go marks it
+    /// `RejectedAccessToken`): that partition (the Sign in with ChatGPT one when
+    /// `use_siwc` is on) and any due one. With neither able to refresh, every partition
+    /// that can (Go's explicit unscheduled refresh). Nothing without a refresh token.
     pub async fn refresh_now(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
-        let refresh_token = codex_oauth::refresh_token(credential);
-        if refresh_token.is_empty() {
+        let now = Utc::now();
+        let has_outer = !codex_oauth::refresh_token(credential).is_empty();
+        let siwc_due = crate::codex_siwc::refresh_due(credential, now);
+        let active_siwc = crate::codex_siwc::enabled(credential);
+        let mut outer = has_outer && (!active_siwc || codex_oauth::refresh_due(credential, now));
+        let mut siwc = siwc_due.is_some_and(|due| due || active_siwc);
+        if !outer && !siwc {
+            (outer, siwc) = (has_outer, siwc_due.is_some());
+        }
+        self.refresh_partitions(credential, cfg, outer, siwc).await
+    }
+
+    /// A management refresh (Go `IsForceRefreshContext`): every partition that can refresh.
+    pub async fn refresh_all(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        let has_outer = !codex_oauth::refresh_token(credential).is_empty();
+        let has_siwc = crate::codex_siwc::refresh_due(credential, Utc::now()).is_some();
+        self.refresh_partitions(credential, cfg, has_outer, has_siwc).await
+    }
+
+    /// Go `refreshLocked`: the outer tokens, then the Sign in with ChatGPT partition, one
+    /// after the other. A partition that fails while the other refreshes is logged and
+    /// the other's patch kept; with neither refreshed, the outer error comes first.
+    async fn refresh_partitions(
+        &self,
+        credential: &Credential,
+        cfg: &Config,
+        outer: bool,
+        siwc: bool,
+    ) -> Result<MetadataPatch, ExecError> {
+        if !outer && !siwc {
             return Ok(MetadataPatch::default());
         }
         // `NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)`: the credential's proxy, then the
         // global one, on Go's standard transport.
         let proxy = crate::proxy::Proxy::effective(credential, cfg);
         let oauth = self.oauth.with_client(self.transport.standard(&proxy));
-        oauth.refresh_patch(refresh_token).await
+        let outer = if outer {
+            Some(oauth.refresh_patch(codex_oauth::refresh_token(credential)).await)
+        } else {
+            None
+        };
+        let siwc = if siwc {
+            let (token, client, device) = crate::codex_siwc::refresh_inputs(credential);
+            Some(
+                oauth
+                    .refresh_siwc(token, client, device)
+                    .await
+                    .map(|tokens| crate::codex_siwc::refresh_patch(credential, &tokens)),
+            )
+        } else {
+            None
+        };
+        let mut patch = MetadataPatch::default();
+        let (mut refreshed, mut failures) = (false, Vec::new());
+        for (partition, result) in [("outer", outer), ("SIWC", siwc)] {
+            match result {
+                Some(Ok(part)) => {
+                    refreshed = true;
+                    patch.set.extend(part.set);
+                    patch.remove.extend(part.remove);
+                }
+                Some(Err(error)) => failures.push((partition, error)),
+                None => {}
+            }
+        }
+        if !refreshed {
+            return match failures.into_iter().next() {
+                Some((_, error)) => Err(error),
+                None => Ok(patch),
+            };
+        }
+        for (partition, error) in failures {
+            tracing::warn!(
+                credential = %credential.id,
+                partition,
+                status = error.status,
+                "codex token refresh failed for one partition; the other refreshed"
+            );
+        }
+        Ok(patch)
     }
 
     pub async fn execute(
@@ -219,6 +301,7 @@ impl CodexExecutor {
             return count_tokens(&req, cfg);
         }
         check_response_format(&req)?;
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         match (req.alt.as_deref(), req.stream) {
@@ -593,6 +676,8 @@ impl CodexExecutor {
         if view.api_key && !upstream_model.trim().is_empty() {
             body = rewrite_alpha_search_model(body, upstream_model.trim());
         }
+        // `PrepareRequest` (inside `NewHttpRequest`): Sign in with ChatGPT needs its token.
+        crate::codex_siwc::require_token(credential)?;
         let mut headers = HeaderMap::new();
         let mut set = |name: &'static str, value: &str| {
             if let Ok(value) = http::HeaderValue::from_str(value) {

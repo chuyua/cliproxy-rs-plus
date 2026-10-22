@@ -76,11 +76,15 @@ impl CodexExecutor {
         request_path: &str,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
+        // A Sign in with ChatGPT credential has no direct Images endpoint.
         match (direct_model(&req, &settings), direct_endpoint(path)) {
-            (Some(model), Some(endpoint)) => self.direct(&view, &settings, req, path, endpoint, &model).await,
+            (Some(model), Some(endpoint)) if !view.siwc => {
+                self.direct(&view, &settings, req, path, endpoint, &model).await
+            }
             _ => self.tool(&view, &settings, req, path).await,
         }
     }
@@ -205,7 +209,7 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let prepared = prepare(&req, path)?;
         let main_model = main_model(&settings.image_base_model);
-        let body = tool_body(&prepared.body, &req, settings, path, main_model)?;
+        let body = tool_body(&prepared.body, &req, settings, path, main_model, view.siwc)?;
         let cache = request::session_uuid(&req, None);
         let body = match &cache {
             Some(id) => set_str_if_different(body, "prompt_cache_key", id),
@@ -806,6 +810,7 @@ fn tool_body(
     settings: &Settings,
     path: &str,
     main_model: &str,
+    siwc: bool,
 ) -> Result<String, ExecError> {
     let thought = cpa_common::thinking::apply_thinking_with_source_payload(
         body.as_bytes(),
@@ -845,6 +850,9 @@ fn tool_body(
         "stream_options",
     ] {
         out = delete(&out, key);
+    }
+    if siwc {
+        return Ok(request::siwc_body(out, request::Call::Stream, false, false));
     }
     let mut bytes = out.into_bytes();
     cpa_common::codex_client::normalize_codex_instructions(&mut bytes);

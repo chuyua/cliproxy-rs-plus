@@ -66,6 +66,8 @@ pub(crate) struct Settings {
     pub response_steering: bool,
     /// `multimedia.gpt-image-2-base-model`, trimmed: the Images API's tool-call model.
     pub image_base_model: String,
+    /// `codexSIWCUserAgent`, read from the whole config (Go uses `e.cfg`, never the API-key view).
+    pub siwc_user_agent: String,
 }
 
 /// `upstream.codex.response-steering`; the older spellings are already moved there.
@@ -97,6 +99,7 @@ impl Settings {
         } else {
             Self::from(cfg)
         };
+        settings.siwc_user_agent = crate::codex_siwc::user_agent(cfg);
         // ponytail: Go's executor-side resolveCodexKeyConfig skips the prefix/proxy
         // tie-break of the shared resolver; they differ only for duplicate key+URL entries.
         settings.key_models = cpa_core::config::credentials::resolve_api_key_entry(cfg, "codex", view.credential)
@@ -182,6 +185,7 @@ impl Settings {
             home: None,
             response_steering: response_steering(cfg),
             image_base_model: text(&["multimedia", "gpt-image-2-base-model"]),
+            siwc_user_agent: crate::codex_siwc::user_agent(cfg),
         }
     }
 }
@@ -213,6 +217,8 @@ pub(crate) struct View<'a> {
     pub credential: &'a Credential,
     pub token: &'a str,
     pub api_key: bool,
+    /// `codexUseSIWC`: the credential sends its Sign in with ChatGPT token (7b0319fb).
+    pub siwc: bool,
     pub base_url: &'a str,
     /// Effective proxy (`effectiveProxyURL`): the credential's, then `requests.proxy-url`.
     pub proxy: crate::proxy::Proxy,
@@ -246,21 +252,38 @@ impl<'a> View<'a> {
     pub fn new(credential: &'a Credential) -> Self {
         let attr = |k: &str| credential.attributes.get(k).map(String::as_str).unwrap_or_default();
         let api_key = attr("api_key");
-        let token = if api_key.is_empty() {
-            credential.str("access_token").unwrap_or_default()
+        let siwc = crate::codex_siwc::enabled(credential);
+        // `codexCreds`: a Sign in with ChatGPT credential sends its nested token to the
+        // OpenAI API unless `base_url` names another endpoint.
+        let (token, base_url) = if siwc {
+            let base = attr("base_url");
+            (
+                crate::codex_siwc::access_token(credential),
+                if base.trim().is_empty() {
+                    crate::codex_siwc::RESOURCE
+                } else {
+                    base
+                },
+            )
         } else {
-            api_key
+            let token = if api_key.is_empty() {
+                credential.str("access_token").unwrap_or_default()
+            } else {
+                api_key
+            };
+            let base = match attr("base_url") {
+                "" => DEFAULT_BASE_URL,
+                url => url,
+            };
+            (token, base)
         };
         let kind = attr("auth_kind").trim().to_ascii_lowercase().replace(['_', '-'], "");
         let is_api_key = kind == "apikey" || (kind.is_empty() && !api_key.trim().is_empty());
-        let base_url = match attr("base_url") {
-            "" => DEFAULT_BASE_URL,
-            url => url,
-        };
         Self {
             credential,
             token,
             api_key: is_api_key,
+            siwc,
             base_url: base_url.trim_end_matches('/'),
             proxy: crate::proxy::Proxy::Inherit,
             session: None,
@@ -536,7 +559,12 @@ pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, cal
     if call != Call::Compact {
         body = ensure_web_search_for_history(body, &req.headers);
     }
-    if !is_native(req) {
+    if view.siwc {
+        // WebSocket turns get theirs after the prompt cache key ([`siwc_request_body`]).
+        if call != Call::Websocket {
+            body = siwc_request_body(body, req, call);
+        }
+    } else if !is_native(req) {
         let instructions = gjson::get(&body, "instructions");
         if !instructions.exists() || instructions.kind() == Kind::Null {
             body = set_str(&body, "instructions", "");
@@ -545,7 +573,7 @@ pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, cal
     if call == Call::Compact {
         body = ensure_web_search_for_history(body, &req.headers);
     }
-    if call != Call::Compact && settings.image_generation {
+    if call != Call::Compact && settings.image_generation && !view.siwc {
         body = ensure_image_tool(body, model, view, &req.headers);
     }
     body = sanitize_reasoning(body, is_compat);
@@ -573,6 +601,78 @@ pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, cal
         optimized,
         conflict,
     })
+}
+
+/// The Sign in with ChatGPT body rules for `call` (`applyCodexSIWCRequestBodyRules`,
+/// `applyCodexSIWCWebsocketBodyRules`, `applyCodexSIWCCompactBodyRules`). They replace
+/// the instructions default and the image tool; WebSocket callers apply them after the
+/// prompt cache key, as Go does. `explicit_instructions` is Go's
+/// `hasExplicitInstructions` of the client payload; `keep_effort` its
+/// `HasThinkingSuffix(req.Model)`.
+pub(crate) fn siwc_body(mut body: String, call: Call, explicit_instructions: bool, keep_effort: bool) -> String {
+    match call {
+        Call::Stream | Call::NonStream => {
+            body = set_bool_if_different(body, "store", false);
+            body = set_bool_if_different(body, "stream", true);
+        }
+        Call::Websocket => {
+            body = set_bool_if_different(body, "store", false);
+            body = delete(&body, "stream");
+            body = delete(&body, "background");
+        }
+        Call::Compact => {
+            body = delete(&body, "stream");
+            body = delete(&body, "store");
+        }
+    }
+    // stripCodexSIWCUnsupportedFields: SIWC rejects configuration_update items, so they
+    // collapse into the top-level effort unless a model suffix already set it.
+    let collapsed = cpa_common::thinking::collapse_configuration_updates(body.as_bytes(), keep_effort);
+    if collapsed != body.as_bytes() {
+        body = String::from_utf8(collapsed).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    }
+    for key in [
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "temperature",
+    ] {
+        body = delete(&body, key);
+    }
+    if !explicit_instructions {
+        let instructions = gjson::get(&body, "instructions");
+        let blank = match instructions.kind() {
+            Kind::Null => instructions.exists(),
+            Kind::String => instructions.str().trim().is_empty(),
+            _ => false,
+        };
+        if blank {
+            body = delete(&body, "instructions");
+        }
+    }
+    body
+}
+
+/// Go's `hasExplicitInstructions`: the client payload's `instructions` is present and
+/// its text is not blank.
+pub(crate) fn explicit_instructions(payload: &[u8]) -> bool {
+    let value = cpa_common::json::get(payload, "instructions");
+    match value.kind {
+        cpa_common::json::Kind::Null => false,
+        cpa_common::json::Kind::String => !value.str().trim().is_empty(),
+        _ => value.exists(),
+    }
+}
+
+/// [`siwc_body`] with the request's own instruction and suffix flags.
+pub(crate) fn siwc_request_body(body: String, req: &ExecRequest, call: Call) -> String {
+    siwc_body(
+        body,
+        call,
+        explicit_instructions(&req.body),
+        cpa_common::thinking::has_thinking_suffix(&req.model),
+    )
 }
 
 /// `ensureWebSearchToolForHistory` (e7d4c731): upstream rejects replayed
@@ -1349,6 +1449,9 @@ fn source_headers(
     cache_id: Option<&str>,
     stream: bool,
 ) -> HeaderMap {
+    if view.siwc {
+        return siwc_http_headers(view, settings, client, cache_id, stream);
+    }
     let mut h = HeaderMap::new();
     if let Some(id) = cache_id {
         set(&mut h, "session-id", id);
@@ -1386,6 +1489,42 @@ fn source_headers(
     h
 }
 
+/// The Sign in with ChatGPT branch of `applyCodexHeadersFromSources`: the session as
+/// `session_id` and the client request id, the SIWC User-Agent and operator headers; no
+/// originator, account id, client Codex headers or cloaking.
+fn siwc_http_headers(
+    view: &View<'_>,
+    settings: &Settings,
+    client: &HeaderMap,
+    cache_id: Option<&str>,
+    stream: bool,
+) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    set(&mut h, "content-type", "application/json");
+    if !view.token.trim().is_empty() {
+        set(&mut h, "authorization", &format!("Bearer {}", view.token));
+    }
+    if let Some(id) = cache_id.map(str::trim).filter(|id| !id.is_empty()) {
+        set(&mut h, "session_id", id);
+        set(&mut h, "x-client-request-id", id);
+    }
+    set(&mut h, "user-agent", &settings.siwc_user_agent);
+    set(
+        &mut h,
+        "accept",
+        if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        },
+    );
+    set(&mut h, "connection", "Keep-Alive");
+    for (name, value) in custom_headers(view, client) {
+        set(&mut h, &name, &value);
+    }
+    h
+}
+
 /// Originator, account header, operator headers and cloaking, shared by HTTP and WebSocket.
 fn apply_identity(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, client: &HeaderMap) {
     let originator = header(client, "originator").trim();
@@ -1410,7 +1549,7 @@ fn apply_identity(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, clien
 
 /// `applyCodexRoutingHint`: `model=<slug>[;tier=<service_tier>]` for OAuth credentials.
 fn routing_hint(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, body: &str, model: &str) {
-    if view.api_key {
+    if view.api_key || view.siwc {
         return;
     }
     h.remove(ROUTING_HINT);
@@ -1469,6 +1608,11 @@ pub(crate) fn ws_headers(
     }
     if !view.token.trim().is_empty() {
         set(&mut h, "authorization", &format!("Bearer {}", view.token));
+    }
+    if view.siwc {
+        siwc_ws_headers(&mut h, view, settings, client);
+        model_header_overrides(&mut h, model);
+        return h;
     }
     let (default_ua, default_beta) = if view.api_key {
         ("", "")
@@ -1547,6 +1691,42 @@ pub(crate) fn ws_headers(
     routing_hint(&mut h, view, client, body, model);
     model_header_overrides(&mut h, model);
     h
+}
+
+/// The Sign in with ChatGPT branch of `applyCodexWebsocketHeaders`: no conversation
+/// header, the session (prompt cache or client) also as the client request id, the
+/// SIWC User-Agent, the client's WebSocket beta header when it names one, then operator
+/// headers.
+fn siwc_ws_headers(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, client: &HeaderMap) {
+    h.remove("conversation_id");
+    let existing = header(h, "session_id").trim().to_owned();
+    let session = if existing.is_empty() {
+        ["session-id", "session_id"]
+            .iter()
+            .map(|n| header(client, n).trim())
+            .find(|v| !v.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        existing
+    };
+    if session.is_empty() {
+        ensure_from_client(h, client, "x-client-request-id");
+    } else {
+        set(h, "session_id", &session);
+        set(h, "x-client-request-id", &session);
+    }
+    set(h, "user-agent", &settings.siwc_user_agent);
+    let beta = header(client, "openai-beta").trim();
+    let beta = if beta.contains("responses_websockets=") {
+        beta
+    } else {
+        WS_BETA
+    };
+    set(h, "openai-beta", beta);
+    for (name, value) in custom_headers(view, client) {
+        set(h, &name, &value);
+    }
 }
 
 #[cfg(test)]

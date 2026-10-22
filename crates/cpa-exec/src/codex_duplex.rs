@@ -508,9 +508,16 @@ impl Duplex {
         }
     }
 
-    /// A steer goes upstream exactly as the client sent it: no create translation or
-    /// defaults; upstream validates unknown fields and input.
-    fn steer(&mut self, payload: String) {
+    /// A steer goes upstream as the client sent it: no create translation or defaults
+    /// (SIWC credentials lose `configuration_update` items); upstream validates unknown
+    /// fields and input.
+    fn steer(&mut self, mut payload: String) {
+        if crate::codex_siwc::enabled(&self.credential) {
+            let stripped = cpa_common::thinking::strip_configuration_update_items(payload.as_bytes());
+            if stripped != payload.as_bytes() {
+                payload = String::from_utf8_lossy(&stripped).into_owned();
+            }
+        }
         let parent = gjson::get(&payload, "previous_response_id").str().to_owned();
         if let Some(settings) = self.response_settings.get(&parent).cloned() {
             self.steering_settings.insert(parent.clone(), settings);
@@ -573,6 +580,7 @@ impl Duplex {
         // ponytail: Go starts a usage record per response; this stream reports every
         // response's events to the bootstrap attempt's record and keeps its request.
         let (body, _) = request::prompt_cache(&next, body, Some(&self.exec_session), true);
+        let body = super::siwc_turn_body(&view, &next, body);
         // Go also fails when the URL differs from the bootstrap's; it cannot here, since
         // both come from the same credential.
         let prepared = Prepared::new(

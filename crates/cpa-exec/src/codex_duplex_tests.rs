@@ -1391,3 +1391,71 @@ async fn a_progress_failure_stops_client_input_during_an_observation() {
     drop(stream);
     up.finish().await;
 }
+
+/// Sign in with ChatGPT on a steering socket (7b0319fb): creates get the SIWC WebSocket
+/// body rules, and a steer only loses its `configuration_update` items.
+#[tokio::test]
+async fn siwc_creates_and_steers_drop_configuration_updates() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        let first = c.read().await;
+        if gjson::get(&first, "temperature").exists()
+            || first.contains("configuration_update")
+            || get(&first, "store") != "false"
+            || get(&first, "reasoning.effort") != "low"
+        {
+            c.error(format!("first create kept SIWC-unsupported fields: {first}"));
+        }
+        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+            .await;
+        let steer = c.read().await;
+        if steer
+            != r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"message","role":"user","content":"steer"}]}"#
+        {
+            c.error(format!("steer: {steer}"));
+        }
+        c.write(r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+            .await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("siwc-steer");
+    let mut credential = credential(&up.url);
+    credential.metadata.insert("use_siwc".into(), true.into());
+    credential
+        .metadata
+        .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at"}));
+    let mut req = request(
+        r#"{"model":"gpt-6-astra","temperature":0.5,"input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"type":"message","role":"user","content":"hi"}]}"#,
+    );
+    (req.model, req.requested_model, req.execution_session) =
+        (MODEL.into(), MODEL.into(), Some(client.session.clone()));
+    let session = ExecSession {
+        id: client.session.clone(),
+        continuation: false,
+        lease: None,
+    };
+    let response = client
+        .executor
+        .execute_in_session(&credential, req, &Config::parse(STEERING).unwrap(), &session)
+        .await
+        .unwrap();
+    let ResponseBody::Stream(mut stream) = response.body else {
+        panic!("websocket turns stream");
+    };
+    while let Some(chunk) = next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        match get(&chunk, "type").as_str() {
+            "response.created" => {
+                client
+                    .send(r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"message","role":"user","content":"steer"}]}"#)
+                    .await
+            }
+            "response.completed" => break,
+            _ => {}
+        }
+    }
+    drop(stream);
+    up.finish().await;
+}

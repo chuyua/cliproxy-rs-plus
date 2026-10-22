@@ -166,3 +166,51 @@ async fn exchange_sends_the_issued_client_and_validates_the_grant() {
     );
     assert!(mock.take().is_empty());
 }
+
+/// Go `CodexSIWCNeedsRefresh` at two fixed clocks for every expiry shape Go reads:
+/// `time.Parse`'s grammar, `normaliseUnix`, relative expiries with Go's wrapping
+/// `Duration` product, nested token maps, the JWT `exp` and Go's zero time; see
+/// tests/reference/codex_siwc_expiry.
+#[test]
+fn refresh_due_matches_go_expiry_parsing() {
+    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_expiry_go.json")).unwrap();
+    let clocks: Vec<chrono::DateTime<chrono::Utc>> = go["clocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut wrong = vec![];
+    for case in go["cases"].as_array().unwrap() {
+        let siwc: Value = serde_json::from_str(case["siwc"].as_str().unwrap()).unwrap();
+        let credential = cpa_core::credential::Credential::from_file(
+            std::path::Path::new("/fake"),
+            std::path::Path::new("/fake/c.json"),
+            serde_json::json!({"type": "codex", "siwc": siwc})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let ours: Vec<Value> = clocks
+            .iter()
+            .map(|at| refresh_due(&credential, *at).unwrap().into())
+            .collect();
+        let mut want = case["due"].clone();
+        if case["name"] == "out-of-range float" && !cfg!(target_arch = "x86_64") {
+            // Recorded on amd64 (`math.MinInt64`, the zero time); Go on arm64 saturates to
+            // a far-future time.
+            want = serde_json::json!([false, false]);
+        }
+        if case["name"] == "float at the unit threshold" {
+            // DIFFERENCES-FROM-GO.md: serde_json rounds 1000000000000.9999 up to 1e12 + 1,
+            // read as milliseconds (2001); Go's correctly rounded float64 truncates to 1e12
+            // seconds.
+            want = serde_json::json!([true, true]);
+        }
+        if ours != want.as_array().unwrap()[..] {
+            wrong.push(format!("{}: {ours:?}, Go {want}", case["name"]));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

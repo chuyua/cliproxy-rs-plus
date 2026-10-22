@@ -2272,7 +2272,14 @@ pub(crate) async fn refresh(
             .store()
             .snapshot()
             .into_iter()
-            .filter(|c| !c.disabled && meta_str(c, "refresh_token").is_some_and(|t| !t.trim().is_empty()))
+            .filter(|c| {
+                !c.disabled
+                    && (meta_str(c, "refresh_token").is_some_and(|t| !t.trim().is_empty())
+                        // Go `authHasRefreshCredential`'s SIWC clause; Codex only until the
+                        // Claude replay, as in `Executors::has_refresh_credential`.
+                        || c.provider == "codex"
+                            && cpa_exec::codex_siwc::refresh_due(c, chrono::Utc::now()).is_some())
+            })
             .collect();
         let mut results = Vec::with_capacity(targets.len());
         for c in targets {

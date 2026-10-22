@@ -329,6 +329,7 @@ async fn until_drained_dial(
         biased;
         _ = drained => Err(DialError {
             response: None,
+            status: None,
             message: "context canceled".into(),
         }),
         dialed = dial => dialed,
@@ -362,13 +363,13 @@ fn report_dial_unauthorized(
     error: &DialError,
     session: (String, String),
 ) {
-    let Some(handshake) = error.response.as_ref().filter(|h| h.status == 401) else {
+    // An upstream 401, or Go's local 401 before dialling (`HTTPStatusFromErrorOr`).
+    if error.response.as_ref().map_or(error.status, |h| Some(h.status)) != Some(401) {
         return;
-    };
-    let body = if handshake.body.is_empty() {
-        error.message.as_bytes()
-    } else {
-        &handshake.body
+    }
+    let body = match error.response.as_ref().filter(|h| !h.body.is_empty()) {
+        Some(handshake) => &handshake.body[..],
+        None => error.message.as_bytes(),
     };
     super::report_unauthorized(rt, principal, home_key, credential, model, body, session);
 }
@@ -524,7 +525,8 @@ async fn direct(inbound: Inbound, model: String) -> Response {
 fn dial_failed(error: DialError, other: impl FnOnce(u16) -> Response) -> Response {
     let Some(handshake) = error.response else {
         tracing::debug!(error = %error.message, "codex live upstream dial failed");
-        return other(502);
+        // Go `HTTPStatusFromErrorOr(errDial, 502)`: a local refusal keeps its status.
+        return other(error.status.unwrap_or(502));
     };
     let mut response = if handshake.status == 401 {
         let mut headers = HeaderMap::new();

@@ -1622,3 +1622,288 @@ async fn replayed_web_search_history_matches_go() {
         assert_eq!(sent, case["sent"].as_str().unwrap(), "{name}");
     }
 }
+
+/// Sign in with ChatGPT (7b0319fb): Go v8.0.35's upstream body and headers for a
+/// `use_siwc` credential on every call, and its missing-token error; see
+/// tests/reference/codex_siwc.
+#[tokio::test]
+async fn siwc_requests_match_go() {
+    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_go.json")).unwrap();
+    let executor = executor();
+    for case in go["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let call = case["call"].as_str().unwrap();
+        let mut metadata = case["metadata"].clone();
+        metadata["type"] = "codex".into();
+        let synthetic = serde_json::json!({
+            "source": "openai-response",
+            "model": case["model"],
+            "payload": case["payload"],
+            "stream": call == "stream" || call == "websocket",
+            "alt": if call == "compact" { Value::from("responses/compact") } else { Value::Null },
+            "headers": case["headers"],
+            "attributes": case["attributes"],
+            "metadata": metadata,
+        });
+        let cfg = Config::parse(case["config"].as_str().unwrap_or("{}")).unwrap();
+        let mock = Mock::start().await;
+        let credential = credential(&synthetic, &mock.url);
+        // The recorder ran on linux/amd64; the User-Agent names the host's Go platform.
+        let mut sent_headers = case["sent_headers"].clone();
+        if let Some(ua) = sent_headers.get_mut("user-agent") {
+            let host = format!("({}; {})", crate::kimi_http::go_os(), crate::kimi_http::go_arch());
+            ua[0] = ua[0].as_str().unwrap().replace("(linux; amd64)", &host).into();
+        }
+        let go_upstream = serde_json::json!({
+            "path": case["path"],
+            "body": case["body"],
+            "headers": sent_headers,
+        });
+        if call == "websocket" {
+            let req = request(&synthetic);
+            let view = View::new(&credential);
+            let settings = Settings::scoped(&cfg, &view);
+            let shaped = request::shape(&req, &view, &settings, Call::Websocket).unwrap();
+            let (body, cache) = request::prompt_cache(&req, shaped.body, Some("exec-session"), true);
+            let body = crate::codex_ws::siwc_turn_body(&view, &req, body);
+            assert_eq!(body, case["body"].as_str().unwrap(), "{name}: body");
+            let headers = request::ws_headers(
+                &view,
+                &settings,
+                &req.headers,
+                &body,
+                &request::base_model(&req.model),
+                cache.as_deref(),
+                false,
+            );
+            let mut actual: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                .collect();
+            actual.sort();
+            let mut expected: Vec<(String, String)> = go_upstream["headers"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v[0].as_str().unwrap().to_owned()))
+                .collect();
+            expected.sort();
+            assert_eq!(actual, expected, "{name}: headers");
+            continue;
+        }
+        if call == "image" {
+            let sse = concat!(
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+            );
+            mock.script(
+                "/responses",
+                vec![Reply {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    body: sse.into(),
+                }],
+            );
+            let path = "/v1/images/generations";
+            let mut req = request(&synthetic);
+            (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
+            executor.images(&credential, req, path, &cfg).await.unwrap();
+            assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            continue;
+        }
+        let (path, content_type, reply) = if call == "compact" {
+            (
+                "/responses/compact",
+                "application/json",
+                r#"{"id":"resp_compact_1","object":"response.compaction","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
+            )
+        } else {
+            (
+                "/responses",
+                "text/event-stream",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n",
+            )
+        };
+        mock.script(
+            path,
+            vec![Reply {
+                status: 200,
+                headers: vec![("content-type".into(), content_type.into())],
+                body: reply.into(),
+            }],
+        );
+        match executor.execute(&credential, request(&synthetic), &cfg).await {
+            Ok(res) => {
+                if let ResponseBody::Stream(mut stream) = res.body {
+                    while stream.next().await.is_some() {}
+                }
+                assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            }
+            Err(error) => {
+                assert_eq!(error.status as i64, case["status"].as_i64().unwrap(), "{name}: status");
+                assert_eq!(
+                    String::from_utf8_lossy(&error.body),
+                    case["error"].as_str().unwrap(),
+                    "{name}: error"
+                );
+                assert!(mock.take().is_empty(), "{name}: nothing may reach upstream");
+            }
+        }
+    }
+    // Without a `base_url` (the cases above dial a mock): Go's `defaultOpenAISIWCBaseURL`.
+    let production = Credential::from_file(
+        Path::new("/fake"),
+        Path::new("/fake/c.json"),
+        serde_json::json!({"type": "codex", "use_siwc": true, "access_token": "outer-at",
+                           "siwc": {"access_token": "siwc-at"}})
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+    .unwrap();
+    let view = View::new(&production);
+    assert_eq!((view.base_url, view.token), ("https://api.openai.com/v1", "siwc-at"));
+}
+
+/// Sign in with ChatGPT refresh (Go `refreshLocked`): the `siwc` partition refreshes on
+/// its own 5-minute lead, a rejected token refreshes the partition requests use, a
+/// management refresh both, and one partition failing keeps the other's result.
+#[tokio::test]
+async fn siwc_partition_refreshes_like_go() {
+    use crate::codex_testkit::json;
+    const OUTER: &str = "/oauth/token";
+    const SIWC: &str = "/api/accounts/oauth/token";
+    let mock = Mock::start().await;
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &format!("{}{OUTER}", mock.url), "", "")
+        .with_siwc_token_url(&format!("{}{SIWC}", mock.url))
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    let executor = CodexExecutor::with_client(wreq::Client::new(), oauth);
+    let cfg = Config::default();
+    let at = |minutes: i64| (Utc::now() + chrono::TimeDelta::minutes(minutes)).to_rfc3339();
+    // Unique refresh tokens per case: results are single-flighted and retained.
+    let cred = |id: &str, use_siwc: bool, siwc_expires: &str| {
+        Credential::from_file(
+            Path::new("/fake"),
+            Path::new("/fake/c.json"),
+            serde_json::json!({
+                "type": "codex", "use_siwc": use_siwc,
+                "access_token": "outer-at", "refresh_token": format!("outer-{id}"), "expired": at(5 * 24 * 60),
+                "siwc": {"access_token": "siwc-at", "refresh_token": format!("siwc-{id}"), "client_id": "client-1",
+                         "device_id": "dev-1", "expired": siwc_expires, "custom": "kept"},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap()
+    };
+    let outer_ok = || {
+        json(
+            200,
+            r#"{"access_token":"outer-new","refresh_token":"outer-rt-new","id_token":"","expires_in":3600}"#,
+        )
+    };
+    let siwc_ok = || {
+        json(
+            200,
+            r#"{"access_token":"siwc-new","refresh_token":"siwc-rt-new","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#,
+        )
+    };
+    let paths = |sent: Vec<Captured>| sent.into_iter().map(|c| c.path).collect::<Vec<_>>();
+
+    // The 5-minute lead: due at four minutes left, not at six.
+    assert!(!executor.needs_prepare(&cred("a", true, &at(6)), &cfg));
+    let due = cred("b", true, &at(4));
+    assert!(executor.needs_prepare(&due, &cfg));
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.prepare(&due, &cfg).await.unwrap();
+    let sent = mock.take();
+    assert_eq!(paths(sent.clone()), [SIWC], "only the due partition refreshes");
+    assert_eq!(
+        String::from_utf8_lossy(&sent[0].body),
+        "client_id=client-1&grant_type=refresh_token&refresh_token=siwc-b&resource=https%3A%2F%2Fapi.openai.com%2Fv1"
+    );
+    assert_eq!(patch.set.keys().collect::<Vec<_>>(), ["siwc"]);
+    let siwc = &patch.set["siwc"];
+    assert_eq!(
+        (&siwc["access_token"], &siwc["refresh_token"], &siwc["client_id"]),
+        (&"siwc-new".into(), &"siwc-rt-new".into(), &"client-1".into())
+    );
+    assert_eq!((&siwc["device_id"], &siwc["custom"]), (&"dev-1".into(), &"kept".into()));
+
+    // A rejected token: the partition requests use, whichever is due otherwise.
+    mock.script(SIWC, vec![siwc_ok()]);
+    executor.refresh_now(&cred("c", true, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [SIWC]);
+    mock.script(OUTER, vec![outer_ok()]);
+    let patch = executor.refresh_now(&cred("d", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [OUTER]);
+    assert!(!patch.set.contains_key("siwc"));
+
+    // A management refresh: both, outer first.
+    mock.script(OUTER, vec![outer_ok()]);
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("e", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [OUTER, SIWC]);
+    assert_eq!(
+        (&patch.set["access_token"], &patch.set["siwc"]["access_token"]),
+        (&"outer-new".into(), &"siwc-new".into())
+    );
+
+    // One partition failing keeps the other's refresh; both failing returns the outer error.
+    mock.script(OUTER, vec![json(500, "{}"); 3]);
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("f", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(patch.set.keys().collect::<Vec<_>>(), ["siwc"]);
+    mock.take();
+    mock.script(OUTER, vec![outer_ok()]);
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    let patch = executor.refresh_all(&cred("k", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(patch.set["access_token"], "outer-new");
+    assert!(!patch.set.contains_key("siwc"));
+    assert_eq!(mock.take().len(), 4);
+    // A retry right after: the outer success is retained, the SIWC failure is not (Go's
+    // singleflight forgets it), so only the SIWC endpoint is called again.
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("k", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [SIWC]);
+    assert_eq!(patch.set["siwc"]["access_token"], "siwc-new");
+    mock.script(OUTER, vec![json(500, "{}"); 3]);
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    let error = executor
+        .refresh_all(&cred("g", false, &at(60)), &cfg)
+        .await
+        .unwrap_err();
+    assert!(
+        String::from_utf8_lossy(&error.body).starts_with("token refresh failed after 3 attempts"),
+        "{error:?}"
+    );
+    assert_eq!(mock.take().len(), 6);
+
+    // refresh_token_reused stops the retries, and only the OAuth code is kept.
+    mock.script(
+        SIWC,
+        vec![json(400, r#"{"error":"refresh_token_reused","echo":"secret"}"#)],
+    );
+    let error = executor.refresh_now(&cred("h", true, &at(60)), &cfg).await.unwrap_err();
+    assert_eq!(mock.take().len(), 1);
+    assert_eq!((error.status, error.scope), (401, FailureScope::Credential));
+    assert_eq!(
+        String::from_utf8_lossy(&error.body),
+        "OpenAI OAuth token request failed (400): refresh_token_reused"
+    );
+
+    // A failed scheduled refresh keeps a still-valid SIWC token in use.
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    assert!(
+        executor
+            .prepare(&cred("i", true, &at(4)), &cfg)
+            .await
+            .unwrap()
+            .set
+            .is_empty()
+    );
+    mock.take();
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    assert!(executor.prepare(&cred("j", true, &at(-1)), &cfg).await.is_err());
+}

@@ -184,10 +184,64 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-type RefreshResult = Shared<BoxFuture<'static, Result<Tokens, ExecError>>>;
+type RefreshResult<T> = Shared<BoxFuture<'static, Result<T, ExecError>>>;
 /// Completed refresh results kept for deduplication and failure backoff.
 const MAX_RETAINED_REFRESHES: usize = 64;
-type Refreshes = Arc<Mutex<HashMap<[u8; 32], (Instant, RefreshResult)>>>;
+type Table<T> = Arc<Mutex<HashMap<[u8; 32], (Instant, RefreshResult<T>)>>>;
+
+/// The outer and Sign in with ChatGPT refresh tables, shared by clones.
+#[derive(Clone, Default)]
+struct Refreshes {
+    outer: Table<Tokens>,
+    siwc: Table<crate::codex_siwc::Tokens>,
+}
+
+/// Single-flights `run` per `key` on `table`, detached from the caller so a cancelled
+/// request cannot strand a rotated token. A success is retained for 5 minutes, so a stale
+/// snapshot cannot send the rotated refresh token again; a failure only when
+/// `retain_failures` (the outer tokens' backoff).
+fn single_flight<T: Clone + Send + Sync + 'static>(
+    table: &Table<T>,
+    key: [u8; 32],
+    run: BoxFuture<'static, Result<T, ExecError>>,
+    retain_failures: bool,
+) -> RefreshResult<T> {
+    let mut locked = table.lock().expect("refresh table");
+    locked.retain(|_, (until, _)| *until > Instant::now());
+    if let Some((_, result)) = locked.get(&key) {
+        return result.clone();
+    }
+    // Retained results are a cache, not an admission limit: evict the oldest completed
+    // ones. In-flight entries are bounded by the credential count.
+    while locked.len() >= MAX_RETAINED_REFRESHES {
+        let oldest = locked
+            .iter()
+            .filter(|(_, (_, result))| result.peek().is_some())
+            .min_by_key(|(_, (until, _))| *until)
+            .map(|(k, _)| *k);
+        match oldest {
+            Some(k) => locked.remove(&k),
+            None => break,
+        };
+    }
+    let retained = table.clone();
+    let task = tokio::spawn(async move {
+        let result = run.await;
+        let mut table = retained.lock().expect("refresh table");
+        if result.is_err() && !retain_failures {
+            table.remove(&key);
+        } else if let Some((until, _)) = table.get_mut(&key) {
+            *until = Instant::now() + Duration::from_secs(300);
+        }
+        drop(table);
+        result
+    });
+    let shared = async move { task.await.map_err(|_| oauth_error(500, "codex refresh task failed"))? }
+        .boxed()
+        .shared();
+    locked.insert(key, (Instant::now() + Duration::from_secs(300), shared.clone()));
+    shared
+}
 
 /// Codex OAuth endpoints and refresh coordination. Clones share the singleflight table.
 #[derive(Clone)]
@@ -214,7 +268,7 @@ impl CodexOAuth {
             device_usercode_url: usercode.into(),
             device_token_url: device_token.into(),
             siwc_token_url: crate::codex_siwc::TOKEN_URL.into(),
-            refreshes: Arc::default(),
+            refreshes: Refreshes::default(),
             retry_delay: Duration::from_secs(1),
         }
     }
@@ -331,44 +385,79 @@ impl CodexOAuth {
             return Err(oauth_error(400, "refresh token is required"));
         }
         let key: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
-        let shared = {
-            let mut table = self.refreshes.lock().expect("refresh table");
-            table.retain(|_, (until, _)| *until > Instant::now());
-            if let Some((_, result)) = table.get(&key) {
-                result.clone()
-            } else {
-                // Retained results are a cache, not an admission limit: evict the oldest
-                // completed ones. In-flight entries are bounded by the credential count.
-                while table.len() >= MAX_RETAINED_REFRESHES {
-                    let oldest = table
-                        .iter()
-                        .filter(|(_, (_, result))| result.peek().is_some())
-                        .min_by_key(|(_, (until, _))| *until)
-                        .map(|(k, _)| *k);
-                    match oldest {
-                        Some(k) => table.remove(&k),
-                        None => break,
-                    };
-                }
-                let oauth = self.clone();
-                let token = refresh_token.to_owned();
-                let task = tokio::spawn(async move {
-                    let result = oauth.refresh_with_retry(&token).await;
-                    // ponytail: results are retained for 5 minutes, matching Go's refresh
-                    // failure backoff; success retention absorbs stale duplicate snapshots.
-                    if let Some((until, _)) = oauth.refreshes.lock().expect("refresh table").get_mut(&key) {
-                        *until = Instant::now() + Duration::from_secs(300);
-                    }
-                    result
-                });
-                let shared = async move { task.await.map_err(|_| oauth_error(500, "codex refresh task failed"))? }
-                    .boxed()
-                    .shared();
-                table.insert(key, (Instant::now() + Duration::from_secs(300), shared.clone()));
-                shared
+        let oauth = self.clone();
+        let token = refresh_token.to_owned();
+        let run = async move { oauth.refresh_with_retry(&token).await }.boxed();
+        single_flight(&self.refreshes.outer, key, run, true).await
+    }
+
+    /// `RefreshSIWCTokensWithRetry(ctx, token, client, device, 3)`: the `siwc`
+    /// partition's refresh grant, single-flighted per client ID and refresh token.
+    pub async fn refresh_siwc(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+        let (refresh_token, client_id) = (refresh_token.trim(), client_id.trim());
+        if refresh_token.is_empty() {
+            return Err(oauth_error(400, "SIWC refresh token is required"));
+        }
+        if client_id.is_empty() {
+            return Err(oauth_error(
+                400,
+                "Stored OpenAI OAuth credential does not contain an issued client ID; reconnect ChatGPT",
+            ));
+        }
+        let key: [u8; 32] = Sha256::digest(format!("{client_id}:{refresh_token}").as_bytes()).into();
+        let oauth = self.clone();
+        let (token, client, device) = (refresh_token.to_owned(), client_id.to_owned(), device_id.to_owned());
+        let run = async move { oauth.refresh_siwc_with_retry(&token, &client, &device).await }.boxed();
+        single_flight(&self.refreshes.siwc, key, run, false).await
+    }
+
+    async fn refresh_siwc_with_retry(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+        let mut last = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_delay * attempt).await;
             }
-        };
-        shared.await
+            let once = tokio::time::timeout(
+                Duration::from_secs(30),
+                self.siwc_token_request(
+                    &[
+                        ("client_id", client_id),
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh_token),
+                        ("resource", crate::codex_siwc::RESOURCE),
+                    ],
+                    client_id,
+                    device_id,
+                    false,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out")));
+            match once {
+                Ok(tokens) => return Ok(tokens),
+                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
+                    return Err(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        let mut error = last.expect("three attempts ran");
+        error.body = format!(
+            "SIWC token refresh failed after 3 attempts: {}",
+            String::from_utf8_lossy(&error.body)
+        )
+        .into();
+        Err(error)
     }
 
     async fn refresh_with_retry(&self, refresh_token: &str) -> Result<Tokens, ExecError> {
@@ -551,7 +640,25 @@ fn oauth_error(status: u16, message: &str) -> ExecError {
 /// kept: token endpoints may echo request material, and refresh backoff keys on
 /// `invalid_grant` / `refresh_token_reused`.
 fn token_error(status: u16, body: &[u8]) -> ExecError {
-    let code = serde_json::from_slice::<Value>(body)
+    refresh_error(
+        status,
+        &format!("token refresh failed with status {status}: {}", oauth_code(body)),
+    )
+}
+
+/// A rejected grant makes the credential unusable (401, cooled and failed over); server
+/// and rate-limit faults are transport-like and must not poison the credential.
+pub(crate) fn refresh_error(status: u16, message: &str) -> ExecError {
+    let (status_out, scope) = match status {
+        400..=403 => (401, FailureScope::Credential),
+        _ => (502, FailureScope::Transport),
+    };
+    ExecError::local(status_out, scope, message)
+}
+
+/// The OAuth error code of a token endpoint's error body, or "".
+pub(crate) fn oauth_code(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| match &v["error"] {
             Value::String(s) => Some(s.clone()),
@@ -559,18 +666,7 @@ fn token_error(status: u16, body: &[u8]) -> ExecError {
             _ => None,
         })
         .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
-        .unwrap_or_default();
-    // A rejected grant makes the credential unusable (401, cooled and failed over); server
-    // and rate-limit faults are transport-like and must not poison the credential.
-    let (status_out, scope) = match status {
-        400..=403 => (401, FailureScope::Credential),
-        _ => (502, FailureScope::Transport),
-    };
-    ExecError::local(
-        status_out,
-        scope,
-        format!("token refresh failed with status {status}: {code}"),
-    )
+        .unwrap_or_default()
 }
 
 /// Refresh token from metadata (`Refresh` reads only `refresh_token`).
@@ -588,7 +684,7 @@ pub(crate) fn expiry(credential: &Credential) -> Option<DateTime<Utc>> {
         .find_map(|k| credential.metadata.get(*k).and_then(parse_time))
 }
 
-fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
     match value {
         Value::String(s) if s.trim().parse::<i64>().is_ok() => {
             parse_time(&Value::Number(s.trim().parse::<i64>().ok()?.into()))

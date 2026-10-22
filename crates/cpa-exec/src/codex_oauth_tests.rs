@@ -424,7 +424,7 @@ async fn retained_results_never_block_a_new_refresh() {
         .await
         .expect("a 65th distinct token still reaches OAuth");
     assert_eq!(mock.take().len(), MAX_RETAINED_REFRESHES + 1);
-    assert!(oauth.refreshes.lock().unwrap().len() <= MAX_RETAINED_REFRESHES);
+    assert!(oauth.refreshes.outer.lock().unwrap().len() <= MAX_RETAINED_REFRESHES);
     // The newest result is still deduplicated.
     oauth.refresh("rt-extra").await.unwrap();
     assert!(mock.take().is_empty());

@@ -859,6 +859,59 @@ async fn expired_token_is_used_then_refreshed_once_after_401() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A `siwc` map does not give a Claude credential a refresh path: a 401 on a Claude token
+/// with no refresh token is answered once, with no prepare, credential write or retry.
+#[tokio::test]
+async fn a_siwc_map_never_refreshes_a_claude_credential_after_401() {
+    let mock = Arc::new(OAuthMock::default());
+    let upstream_url = serve(axum::Router::new().fallback(oauth_upstream).with_state(mock.clone())).await;
+    let dir = std::env::temp_dir().join(format!("cpa-routes-siwc-401-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("claude.json");
+    let metadata = serde_json::json!({"type":"claude","access_token":"sk-ant-oat-old-fake",
+        "account_uuid":"acct-fake","email":"a@example.invalid","claude_device_ids":["b".repeat(64)],
+        "siwc":{"access_token":"siwc-at","refresh_token":"siwc-rt","client_id":"client-1"}});
+    std::fs::write(&path, metadata.to_string()).unwrap();
+    let mut credential = Credential::from_file(&dir, &path, metadata.as_object().unwrap().clone()).unwrap();
+    credential.attributes.insert("base_url".into(), upstream_url.clone());
+    let oauth = cpa_exec::oauth::OAuth::with_endpoints(
+        wreq::Client::new(),
+        &format!("{upstream_url}/token"),
+        &format!("{upstream_url}/profile"),
+        &format!("{upstream_url}/roles"),
+    );
+    let executors = Executors {
+        claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
+    let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
+    let revision = rt.store().get("claude.json").unwrap().revision;
+    let url = serve(router(rt.clone())).await;
+    let (status, _, text) = post(
+        &url,
+        "/v1/messages",
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[]}}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "{text}");
+    let calls = mock.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().map(|c| c.split(' ').next().unwrap()).collect::<Vec<_>>(),
+        ["/v1/messages"],
+        "{calls:?}"
+    );
+    assert_eq!(
+        rt.store().get("claude.json").unwrap().revision,
+        revision,
+        "no credential write"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 type Reply = Box<dyn Fn() -> Response + Send + Sync>;
 
 /// Replies in order, one per upstream call; the last repeats.

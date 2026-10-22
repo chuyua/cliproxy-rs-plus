@@ -32,11 +32,11 @@ Audit of 2026-10-20 (v0.2.6, d1261f2) against CLIProxyAPI v8.0.35 (`ae3ee3be`).
 |---|---:|---:|---:|---:|
 | M1 | 151 | 66 | 73 | 12 |
 | M2 | 189 | 71 | 114 | 4 |
-| M3 | 424 | 200 | 206 | 18 |
+| M3 | 424 | 201 | 206 | 17 |
 | M4 | 589 | 256 | 323 | 10 |
-| M5 | 331 | 221 | 107 | 3 |
+| M5 | 331 | 222 | 106 | 3 |
 | M6 | 267 | 144 | 113 | 10 |
-| All | 1951 | 958 | 936 | 57 |
+| All | 1951 | 960 | 935 | 56 |
 <!-- parity-summary:end -->
 
 An item is covered when it is implemented and a Rust test or a fixture recorded from the Go server checks it. Partial means it works but not every case is pinned by a test, or only part of it is implemented; most partial items are Go test files whose behaviour other tests cover without porting each case. Missing means it is not implemented. A deliberate difference from Go, listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md), counts as covered.
@@ -52,7 +52,7 @@ An item is covered when it is implemented and a Rust test or a fixture recorded 
 | M5 | The Management API, WebSockets, realtime and live voice, and access control |
 | M6 | Plugins, the terminal UI, LAN discovery and Home (cluster) mode |
 
-Missing items now also include requests through Sign in with ChatGPT (SIWC) tokens, tool search, model catalog sources, new configuration and plugin contracts. Most v8.0.35 Management API changes are in: ETag and If-Match on v8 config, auth indexes in v8 api-keys, model definitions by channel, credential patches applied to the current record and the stale-reload guard. So are `GET /v1/models/{model}` and the watcher's handling of half-written credential files. So is binding SIWC tokens to a Codex credential from the v8 Management API, including Go's post-binding 401 recovery but without its registration-epoch check; the Codex executor does not use the bound tokens yet. So are the historical v8 config aliases and Go v8.0.35's direct v8 config save, which keeps an explicit `null` and the values as written. So are Go's background refresh after a Codex 401 (which replaces a rejected token that is not yet due), the clearing of unauthorized cooldowns after a refresh that keeps live quota blocks, and the 96-hour Codex refresh lead. Not yet: the background refresh after other providers' 401s, and keeping requests off a rejected or expired token while its refresh is pending. Plugin runtime integration and parts of Home remain incomplete. The plugin store and terminal UI exist, though some Go cases remain unported.
+Missing items now also include the `--siwc-bind` command, tool search, model catalog sources, new configuration and plugin contracts. Most v8.0.35 Management API changes are in: ETag and If-Match on v8 config, auth indexes in v8 api-keys, model definitions by channel, credential patches applied to the current record and the stale-reload guard. So are `GET /v1/models/{model}` and the watcher's handling of half-written credential files. So is binding SIWC tokens to a Codex credential from the v8 Management API, including Go's post-binding 401 recovery but without its registration-epoch check. So are requests through the bound tokens (`use_siwc`) and their refresh on a five-minute lead, beside the outer tokens; not yet Home-mode SIWC refresh or Go's re-read of a credential file another process rotated during a refresh. So are the historical v8 config aliases and Go v8.0.35's direct v8 config save, which keeps an explicit `null` and the values as written. So are Go's background refresh after a Codex 401 (which replaces a rejected token that is not yet due), the clearing of unauthorized cooldowns after a refresh that keeps live quota blocks, and the 96-hour Codex refresh lead. Not yet: the background refresh after other providers' 401s, and keeping requests off a rejected or expired token while its refresh is pending. Plugin runtime integration and parts of Home remain incomplete. The plugin store and terminal UI exist, though some Go cases remain unported.
 
 Antigravity (M3) is implemented: sign-in from the command line, the dashboard and the Management API, the executor, AI credits, connection pool settings, reasoning replay and the web-search capability probe. The executor features have Go-recorded tests with local mock upstreams; sign-in is tested against local mock endpoints. Selected v8.0.27 changes add Claude 5.5 models, CAQS thinking signatures and backend errors inside streams. This is not full v8.0.35 parity: model entitlements, session continuation, newer schema and usage fixes, and several suites remain unported. [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#antigravity) and the upstream inventory list them. No live Antigravity account has been used in these tests.
 

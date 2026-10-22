@@ -132,6 +132,14 @@ impl Fixture {
     }
     /// A fixture whose runtime holds the credentials `yaml` synthesizes.
     fn from_yaml(name: &str, yaml: impl Fn(&std::path::Path, &str) -> String) -> Self {
+        Self::from_yaml_with(name, yaml, Default::default())
+    }
+    /// [`Self::from_yaml`] with its Codex executor.
+    fn from_yaml_with(
+        name: &str,
+        yaml: impl Fn(&std::path::Path, &str) -> String,
+        codex: cpa_exec::codex::CodexExecutor,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("manage-{name}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("auth")).unwrap();
         let path = dir.join("config.yaml");
@@ -143,7 +151,7 @@ impl Fixture {
             cpa_core::config::credentials::load(&cfg),
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-                codex: Default::default(),
+                codex,
                 devices: Default::default(),
                 openai: Default::default(),
                 google: Default::default(),
@@ -5184,4 +5192,118 @@ async fn plugin_virtual_credentials_change_only_through_their_source_file() {
     assert_eq!(call(wreq::Method::DELETE, "?name=acme.json", None).await.0, 200);
     assert!(!source.exists());
     server.abort();
+}
+
+/// Go `ForceRefreshAuth` and `ForceRefreshAll` (`authHasRefreshCredential`): a Codex
+/// credential whose only refresh credential is its Sign in with ChatGPT partition
+/// refreshes by name and in bulk.
+#[tokio::test]
+async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
+    let forms = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = axum::Router::new().route(
+        "/api/accounts/oauth/token",
+        axum::routing::post({
+            let forms = forms.clone();
+            move |body: String| async move {
+                forms.lock().unwrap().push(body);
+                r#"{"access_token":"siwc-new","refresh_token":"siwc-rt-new","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_url = format!("http://{}/api/accounts/oauth/token", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let oauth = cpa_exec::codex_oauth::CodexOAuth::with_endpoints(wreq::Client::new(), "http://127.0.0.1:1", "", "")
+        .with_siwc_token_url(&token_url)
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    let codex = cpa_exec::codex::CodexExecutor::with_client(wreq::Client::new(), oauth);
+    let f = Fixture::from_yaml_with(
+        "siwc-refresh",
+        |auth, hash| {
+            let siwc = |rt: &str, active: bool| {
+                // A loopback base URL lets the test runtime's guard reach the token mock.
+                json!({"type": "codex", "use_siwc": active, "access_token": "outer-at", "base_url": "http://127.0.0.1:1",
+                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1"}})
+                .to_string()
+            };
+            std::fs::write(auth.join("active.json"), siwc("siwc-rt-1", true)).unwrap();
+            std::fs::write(auth.join("bound.json"), siwc("siwc-rt-2", false)).unwrap();
+            std::fs::write(auth.join("plain.json"), r#"{"type":"codex","access_token":"a"}"#).unwrap();
+            format!(
+                "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+                auth.display()
+            )
+        },
+        codex,
+    );
+    let (base, server) = f.server().await;
+    let refresh = |body: &'static str| {
+        let request = wreq::Client::new()
+            .post(format!("{base}/v8/management/credentials/refresh"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/json")
+            .body(body);
+        async move {
+            let response = request.send().await.unwrap();
+            (response.status().as_u16(), response.json::<Value>().await.unwrap())
+        }
+    };
+    let token = |name: &str| {
+        let c =
+            f.rt.store()
+                .snapshot()
+                .into_iter()
+                .find(|c| c.id.ends_with(name))
+                .unwrap();
+        c.metadata["siwc"]["access_token"].as_str().unwrap().to_owned()
+    };
+    let refreshed_with = |forms: &[String]| {
+        let mut tokens: Vec<String> = forms
+            .iter()
+            .map(|f| {
+                url::form_urlencoded::parse(f.as_bytes())
+                    .find(|(k, _)| k == "refresh_token")
+                    .unwrap()
+                    .1
+                    .into_owned()
+            })
+            .collect();
+        tokens.sort();
+        tokens
+    };
+
+    let (status, body) = refresh(r#"{"name":"active.json"}"#).await;
+    assert_eq!((status, body["ok"].clone()), (200, json!(true)), "{body}");
+    assert_eq!(token("active.json"), "siwc-new");
+    assert_eq!(
+        refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
+        ["siwc-rt-1"]
+    );
+
+    let (status, body) = refresh(r#"{"all":true}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut results: Vec<(String, bool)> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().rsplit('/').next().unwrap().to_owned(),
+                r["success"] == true,
+            )
+        })
+        .collect();
+    results.sort();
+    assert_eq!(
+        results,
+        [("active.json".to_owned(), true), ("bound.json".to_owned(), true)],
+        "plain.json has nothing to refresh"
+    );
+    assert_eq!(token("bound.json"), "siwc-new");
+    assert_eq!(
+        refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
+        ["siwc-rt-2", "siwc-rt-new"]
+    );
+    server.abort();
+    upstream.abort();
 }
