@@ -75,4 +75,4 @@ picks U+0020 or U+00A0 per binary so nothing depends on it.
 gjson reads) for `src/json.rs`, checked by `src/json_go_vectors.rs`. Run
 `go run . > ../../fixtures/sjson_go.json` in a module requiring
 `github.com/tidwall/sjson v1.2.5` and `github.com/tidwall/gjson v1.18.0`. `../unicode/main.go`
-generates `src/gostr_tables.rs` from Go 1.26's `unicode` and `strconv` tables.
+generates `crates/cpa-core/src/gostr_tables.rs` from Go 1.26's `unicode` and `strconv` tables.

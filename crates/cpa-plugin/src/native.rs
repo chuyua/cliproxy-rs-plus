@@ -10,9 +10,11 @@
 //! Memory ownership matches Go: the host owns request buffers for the duration of a
 //! call; a response buffer belongs to whoever allocated it and is released through that
 //! side's `free_buffer`. Host callback responses are `malloc`ed and freed with `free`.
-//! The host API table and the `host_ctx` slot are `malloc`ed, stay valid until shutdown
+//! The host API table and the `host_ctx` slot are `malloc`ed, stay valid after shutdown
 //! (plugins keep the pointer), and `host_ctx` holds a numeric ID resolved through a
-//! global table, so a stale context can never reach a dropped host.
+//! global table, so a stale context can never reach a dropped host. As in Go v8.0.35,
+//! loaded images and their C callback tables stay resident even after failed init;
+//! shutdown removes their callback registrations, not the memory a runtime may retain.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -146,20 +148,18 @@ unsafe extern "C" fn host_free(ptr: *mut c_void, _len: usize) {
 
 /// A loaded plugin library speaking ABI 1.
 pub struct NativeClient {
-    handle: *mut c_void,
     host_api: *mut HostApi,
-    host_ctx: *mut usize,
     api: PluginApi,
     callback_id: usize,
     instance: Arc<CallbackInstance>,
     /// `true` once shut down. Calls hold it shared for their whole duration (including
     /// the response copy and `free_buffer`); shutdown takes it exclusively, so the
-    /// library and host tables can never be freed under a running call.
+    /// plugin's shutdown entry point cannot run under an in-flight call.
     gate: RwLock<bool>,
 }
 
-// SAFETY: the raw pointers are owned by this client and only freed in `shutdown`, which
-// the guarded client runs after every call has returned. Plugin entry points are
+// SAFETY: the raw pointers remain resident, and shutdown runs after every call has
+// returned. Plugin entry points are
 // required to be thread-safe by the ABI (Go calls them from any goroutine).
 unsafe impl Send for NativeClient {}
 unsafe impl Sync for NativeClient {}
@@ -173,30 +173,38 @@ impl NativeClient {
         handler: Arc<dyn CallbackHandler>,
         instance: Arc<CallbackInstance>,
     ) -> Result<Self, String> {
-        let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        let load_path = crate::shadow::copy(path, plugin_id)?;
+        let c_path = CString::new(load_path.as_os_str().as_encoded_bytes())
             .map_err(|_| format!("dlopen {}: path contains NUL", path.display()))?;
         // SAFETY: dlopen with a valid C string.
         let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
-            return Err(format!("dlopen {}: {}", path.display(), dlerror()));
+            let error = dlerror();
+            // The shadow stays: another open may have just reused it, and unlinking here
+            // would bypass shadow publication. Stale cleanup removes it with this process.
+            // The shadow path shows where a noexec TMPDIR refused the mapping.
+            return Err(format!(
+                "dlopen {} (shadow copy {}): {error}",
+                path.display(),
+                load_path.display()
+            ));
         }
+        // Go loader_unix.go: dlopen can start a Go c-shared runtime before init.
+        // Never dlclose a mapped image, including on all subsequent failure paths.
         // SAFETY: handle is live; symbol name is a valid C string.
         let init = unsafe { libc::dlsym(handle, c"cliproxy_plugin_init".as_ptr()) };
         if init.is_null() {
             let err = dlerror();
-            // SAFETY: handle came from dlopen.
-            unsafe { libc::dlclose(handle) };
             return Err(format!("missing cliproxy_plugin_init: {err}"));
         }
         // SAFETY: malloc'd tables, initialised before use.
         let host_api = unsafe { libc::malloc(std::mem::size_of::<HostApi>()) }.cast::<HostApi>();
         let host_ctx = unsafe { libc::malloc(std::mem::size_of::<usize>()) }.cast::<usize>();
         if host_api.is_null() || host_ctx.is_null() {
-            // SAFETY: free(NULL) is a no-op; handle came from dlopen.
+            // SAFETY: init has not seen these allocations; free(NULL) is a no-op.
             unsafe {
                 libc::free(host_api.cast());
                 libc::free(host_ctx.cast());
-                libc::dlclose(handle);
             }
             return Err("allocate host api".into());
         }
@@ -220,9 +228,7 @@ impl NativeClient {
             });
         }
         let mut client = NativeClient {
-            handle,
             host_api,
-            host_ctx,
             api: PluginApi::default(),
             callback_id,
             instance,
@@ -298,8 +304,8 @@ impl NativeClient {
         Ok(out)
     }
 
-    /// Go `dynamicLibraryClient.Shutdown`: `shutdown()`, drop the callback entry, free the
-    /// host tables, `dlclose`. Idempotent.
+    /// Go `dynamicLibraryClient.Shutdown`: logically close the instance and drop the
+    /// callback entry. Images and C callback tables stay mapped. Idempotent.
     pub fn shutdown(&self) {
         let mut shut = self.gate.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if *shut {
@@ -312,12 +318,9 @@ impl NativeClient {
             unsafe { shutdown() };
         }
         lock(callbacks()).remove(&self.callback_id);
-        // SAFETY: allocated in `open`, freed exactly once here.
-        unsafe {
-            libc::free(self.host_ctx.cast());
-            libc::free(self.host_api.cast());
-            libc::dlclose(self.handle);
-        }
+        // The resident runtime may still call host_call with the old context. Keep
+        // both allocations valid; its numeric ID now fails lookup without pinning
+        // the callback handler or accessing a dropped Host.
     }
 }
 

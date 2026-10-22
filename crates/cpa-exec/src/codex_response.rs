@@ -2,6 +2,7 @@
 //! (codex_executor_terminal.go, codex_websockets_errors.go), per-event SSE processing,
 //! bootstrap buffering, and buffered (non-streaming) assembly.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -248,6 +249,7 @@ pub(crate) fn status_error_raw(code: u16, message: &str, headers: HeaderMap, mod
         headers: Box::new(headers),
         retry_after,
         direct: false,
+        addon: None,
     }
 }
 
@@ -644,14 +646,32 @@ impl OutputItems {
     }
 }
 
+/// Go's 50 MB scanner line limit on the streaming path.
+const SCANNER_MAX_LINE: usize = 52_428_800;
+
+/// Processed lines as one SSE frame; `None` for no lines.
+fn framed(lines: &[String]) -> Option<Bytes> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = lines.join("\n");
+    out.push_str("\n\n");
+    Some(Bytes::from(out))
+}
+
 /// What one upstream event means for the stream.
 pub(crate) enum Step {
     /// Forward this (normalised) event.
     Event(Bytes),
     /// Forward this event; it ends the response.
     Terminal(Bytes),
-    /// The upstream rejected or broke the response; nothing more is forwarded.
-    Fail { error: ExecError, body: Option<String> },
+    /// The upstream rejected or broke the response; nothing more is forwarded after
+    /// `before`, the event's lines that preceded the failure (Go sends each line as read).
+    Fail {
+        error: ExecError,
+        body: Option<String>,
+        before: Option<Bytes>,
+    },
 }
 
 /// Per-response SSE processing shared by streaming and buffered paths.
@@ -660,8 +680,6 @@ pub(crate) struct Processor {
     saw_delta: bool,
     preserve_native: bool,
     model_level_cooling: bool,
-    /// Whether every data payload in the last event was bootstrap-bufferable.
-    pub last_bufferable: bool,
     /// The last completed payload (response.completed/incomplete), for buffered callers.
     pub completed: Option<String>,
     /// The request renamed the `collaboration` namespace (multi-agent v2).
@@ -675,6 +693,8 @@ pub(crate) struct Processor {
     grok_keepalive: bool,
     /// The attempt's wire capture: every scanned line and each stream failure.
     wire: crate::codex_capture::Wire,
+    /// Joins an event's data split across `data:` lines (`CodexSSEScanner`, 50 MB lines).
+    sse: crate::codex_sse::DataLines,
 }
 
 impl Processor {
@@ -684,13 +704,13 @@ impl Processor {
             saw_delta: false,
             preserve_native,
             model_level_cooling,
-            last_bufferable: true,
             completed: None,
             restore: false,
             replay: None,
             usage: Default::default(),
             grok_keepalive: false,
             wire: Default::default(),
+            sse: crate::codex_sse::DataLines::new(SCANNER_MAX_LINE),
         }
     }
 
@@ -754,127 +774,180 @@ impl Processor {
     /// One framed SSE event in. Go scans lines: `data:` payloads are trimmed and
     /// re-prefixed with `data: `, other lines pass through, CR is dropped.
     pub fn event(&mut self, event: &[u8]) -> Step {
-        let step = self.event_step(event);
+        self.event_with(event, None)
+    }
+
+    fn event_with(&mut self, event: &[u8], gate: Option<&mut Gate>) -> Step {
+        let step = self.event_step(event, gate);
         if let Step::Fail { error, .. } = &step {
             self.record(error);
         }
         step
     }
 
-    fn event_step(&mut self, event: &[u8]) -> Step {
+    /// Processes `event` line by line, in Go's order. While `gate` holds the stream, each
+    /// delivered line spends its budgets before the next is read, and the gate releases
+    /// at the line that passes them; the rest of the event is processed as streamed.
+    fn event_step(&mut self, event: &[u8], mut gate: Option<&mut Gate>) -> Step {
         let mut lines = Vec::new();
         let mut terminal = false;
         // Go writes each keepalive comment as its own SSE frame.
         let mut after_comment = false;
-        self.last_bufferable = true;
-        for raw in event.split(|b| *b == b'\n') {
-            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-            // Go records each scanned line before reading it, and none after a terminal.
-            self.wire.chunk(raw);
-            let line = String::from_utf8_lossy(raw);
-            let line = line.as_ref();
-            if line.is_empty() {
-                continue;
-            }
-            if after_comment {
-                lines.push(String::new());
-            }
-            after_comment = self.grok_keepalive && is_keepalive_line(line);
-            if after_comment {
-                lines.push(": keepalive".to_owned());
-                continue;
-            }
-            let Some(data) = line.strip_prefix("data:") else {
-                lines.push(line.to_owned());
-                continue;
-            };
-            let payload = restore(data.trim(), self.restore);
-            let payload = payload.as_ref();
-            if self.usage.enabled() {
-                self.usage
-                    .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
-            }
-            if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
-                self.replay_failure(error.status, &body);
-                return Step::Fail {
-                    error,
-                    body: Some(body),
-                };
-            }
-            if meaningful_delta(payload) {
-                self.saw_delta = true;
-            }
-            if empty_incomplete(payload, self.items.len(), self.saw_delta) {
-                return Step::Fail {
-                    error: request_scoped(502, EMPTY_INCOMPLETE_MESSAGE),
-                    body: None,
-                };
-            }
-            self.last_bufferable &= bufferable(payload);
-            let mut payload = payload.to_owned();
-            match gjson::get(&payload, "type").str() {
-                "response.output_item.done" => self.items.collect(&payload),
-                kind @ ("response.completed" | "response.incomplete" | "response.done") => {
-                    let incomplete = kind == "response.incomplete";
-                    terminal = true;
-                    payload = normalize_completion(payload);
-                    if !self.preserve_native {
-                        payload = self.items.patch(payload);
+        let mut physical = event.split(|b| *b == b'\n');
+        let mut scanned = Vec::new();
+        let mut read_all = false;
+        'read: while !read_all {
+            match physical.next() {
+                Some(raw) => {
+                    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+                    // Go records each physical line as read, and none after a terminal.
+                    self.wire.chunk(raw);
+                    self.sse.push(raw, &mut scanned);
+                    let held = self.sse.holding();
+                    if held.0 > 0 && raw.starts_with(b"data:") {
+                        // Go's budget check inside the scanner, on a data line it holds.
+                        if let Some(gate) = gate.as_deref_mut() {
+                            gate.assembling(held);
+                        }
                     }
-                    if !incomplete {
-                        self.replay_completed(&payload);
-                    }
-                    self.completed = Some(payload.clone());
                 }
-                _ => {}
+                None => {
+                    self.sse.finish(&mut scanned);
+                    read_all = true;
+                }
             }
-            lines.push(format!("data: {payload}"));
-            if terminal {
-                break;
+            let held = self.sse.holding();
+            for item in scanned.drain(..) {
+                let line = String::from_utf8_lossy(&item.line);
+                let line = line.as_ref();
+                if line.is_empty() {
+                    continue;
+                }
+                let before = lines.len();
+                if after_comment {
+                    lines.push(String::new());
+                }
+                after_comment = self.grok_keepalive && is_keepalive_line(line);
+                let handshake = if after_comment {
+                    lines.push(": keepalive".to_owned());
+                    true
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    let payload = restore(data.trim(), self.restore);
+                    let payload = payload.as_ref();
+                    if self.usage.enabled() {
+                        self.usage
+                            .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
+                    }
+                    if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
+                        self.replay_failure(error.status, &body);
+                        return Step::Fail {
+                            error,
+                            body: Some(body),
+                            before: framed(&lines),
+                        };
+                    }
+                    if meaningful_delta(payload) {
+                        self.saw_delta = true;
+                    }
+                    if empty_incomplete(payload, self.items.len(), self.saw_delta) {
+                        return Step::Fail {
+                            error: request_scoped(502, EMPTY_INCOMPLETE_MESSAGE),
+                            body: None,
+                            before: framed(&lines),
+                        };
+                    }
+                    let handshake = bufferable(payload);
+                    let mut payload = payload.to_owned();
+                    match gjson::get(&payload, "type").str() {
+                        "response.output_item.done" => self.items.collect(&payload),
+                        kind @ ("response.completed" | "response.incomplete" | "response.done") => {
+                            let incomplete = kind == "response.incomplete";
+                            terminal = true;
+                            payload = normalize_completion(payload);
+                            if !self.preserve_native {
+                                payload = self.items.patch(payload);
+                            }
+                            if !incomplete {
+                                self.replay_completed(&payload);
+                            }
+                            self.completed = Some(payload.clone());
+                        }
+                        _ => {}
+                    }
+                    lines.push(format!("data: {payload}"));
+                    if terminal {
+                        break 'read;
+                    }
+                    handshake
+                } else {
+                    lines.push(line.to_owned());
+                    true
+                };
+                if let Some(gate) = gate.as_deref_mut() {
+                    let translated = lines[before..].iter().map(String::len).sum();
+                    gate.line(handshake, held, (item.raw_lines, item.raw_bytes), translated);
+                }
             }
         }
-        let mut out = lines.join("\n");
-        out.push_str("\n\n");
+        if !terminal && let Some(gate) = gate {
+            // The blank line that ends the event (Go delivers it as a line too).
+            gate.line(true, (0, 0), (1, 0), 0);
+        }
+        let out = framed(&lines).unwrap_or_else(|| Bytes::from_static(b"\n\n"));
         if terminal {
-            Step::Terminal(Bytes::from(out))
+            Step::Terminal(out)
         } else {
-            Step::Event(Bytes::from(out))
+            Step::Event(out)
         }
     }
 
     /// Buffered (`Execute`) handling of one event's data payloads: always patches output.
     pub fn buffered(&mut self, event: &[u8]) -> Result<Option<String>, ExecError> {
-        let text = String::from_utf8_lossy(event);
-        for line in text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let payload = restore(data.trim(), self.restore);
-            let payload = payload.as_ref();
-            if self.usage.enabled() {
-                self.usage
-                    .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
-            }
-            if meaningful_delta(payload) {
-                self.saw_delta = true;
-            }
-            if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
-                self.replay_failure(error.status, &body);
-                return Err(error);
-            }
-            match gjson::get(payload, "type").str() {
-                "response.output_item.done" => self.items.collect(payload),
-                kind @ ("response.completed" | "response.incomplete") => {
-                    if empty_incomplete(payload, self.items.len(), self.saw_delta) {
-                        return Err(request_scoped(502, EMPTY_INCOMPLETE_MESSAGE));
-                    }
-                    let completed = self.items.patch(payload.to_owned());
-                    if kind == "response.completed" {
-                        self.replay_completed(&completed);
-                    }
-                    return Ok(Some(completed));
+        // Go scans the whole body with a line limit one past its length.
+        let mut sse = crate::codex_sse::DataLines::new(event.len() + 1);
+        let mut physical = event.split(|b| *b == b'\n');
+        let mut scanned = Vec::new();
+        let mut read_all = false;
+        while !read_all {
+            match physical.next() {
+                Some(raw) => sse.push(raw.strip_suffix(b"\r").unwrap_or(raw), &mut scanned),
+                None => {
+                    sse.finish(&mut scanned);
+                    read_all = true;
                 }
-                _ => {}
+            }
+            for line in scanned.drain(..) {
+                let line = String::from_utf8_lossy(&line.line);
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = restore(data.trim(), self.restore);
+                let payload = payload.as_ref();
+                if self.usage.enabled() {
+                    self.usage
+                        .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
+                }
+                if meaningful_delta(payload) {
+                    self.saw_delta = true;
+                }
+                if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
+                    self.replay_failure(error.status, &body);
+                    return Err(error);
+                }
+                match gjson::get(payload, "type").str() {
+                    "response.output_item.done" => self.items.collect(payload),
+                    kind @ ("response.completed" | "response.incomplete") => {
+                        if empty_incomplete(payload, self.items.len(), self.saw_delta) {
+                            return Err(request_scoped(502, EMPTY_INCOMPLETE_MESSAGE));
+                        }
+                        let completed = self.items.patch(payload.to_owned());
+                        if kind == "response.completed" {
+                            self.replay_completed(&completed);
+                        }
+                        return Ok(Some(completed));
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(None)
@@ -884,7 +957,7 @@ impl Processor {
 /// `grokbuild.IsGrokClientHeaders`: any `User-Agent` value naming Grok Pager or Shell.
 pub(crate) fn is_grok_client(headers: &http::HeaderMap) -> bool {
     headers.get_all(http::header::USER_AGENT).iter().any(|v| {
-        let ua = String::from_utf8_lossy(v.as_bytes()).to_lowercase();
+        let ua = String::from_utf8_lossy(v.as_bytes()).go_lower();
         ua.contains("grok-pager") || ua.contains("grok-shell")
     })
 }
@@ -920,6 +993,8 @@ pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usi
         processor: Processor,
         emitted: usize,
         done: bool,
+        /// A failure to deliver after the lines that preceded it in its event.
+        failed: Option<ExecError>,
     }
     futures_util::stream::unfold(
         State {
@@ -927,8 +1002,13 @@ pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usi
             processor,
             emitted,
             done: false,
+            failed: None,
         },
         |mut st| async move {
+            if let Some(error) = st.failed.take() {
+                st.done = true;
+                return Some((Err(error), st));
+            }
             if st.done {
                 return None;
             }
@@ -941,6 +1021,15 @@ pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usi
                     Step::Terminal(out) => {
                         st.done = true;
                         Ok(out)
+                    }
+                    Step::Fail {
+                        error,
+                        before: Some(before),
+                        ..
+                    } => {
+                        st.emitted += 1;
+                        st.failed = Some(error);
+                        Ok(before)
                     }
                     Step::Fail { error, .. } => {
                         st.done = true;
@@ -989,6 +1078,65 @@ pub(crate) enum Bootstrap {
     Stream(ExecStream),
 }
 
+/// Go's bootstrap budgets (codex_executor_stream.go): the lines held so far, their raw
+/// and translated bytes, and whether the stream has been released.
+pub(crate) struct Gate {
+    frames: usize,
+    bytes: usize,
+    timeout: Option<Duration>,
+    started: Instant,
+    released: bool,
+}
+
+impl Gate {
+    fn new(timeout: Option<Duration>, started: Instant) -> Self {
+        Self {
+            frames: 0,
+            bytes: 0,
+            timeout,
+            started,
+            released: false,
+        }
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timeout.is_some_and(|t| self.started.elapsed() >= t)
+    }
+
+    /// The scanner's budget check while it holds `held` (lines, bytes) of an unfinished
+    /// event: the stream is released at the limit itself.
+    fn assembling(&mut self, held: (usize, usize)) {
+        if !self.released
+            && (self.timed_out()
+                || self.frames + held.0 >= BOOTSTRAP_MAX_FRAMES
+                || self.bytes + held.1 >= BOOTSTRAP_MAX_BYTES)
+        {
+            self.released = true;
+        }
+    }
+
+    /// One delivered line read from `raw` (lines, bytes) and `translated` bytes out, with
+    /// `held` (lines, bytes) still collected: a handshake within the budgets, which it may
+    /// fill exactly, stays held; anything else releases the stream.
+    // ponytail: `translated` is the Codex-format line: Go's translator output for a Codex
+    // client and for Responses events it leaves alone (it inserts a missing
+    // `response.model`); Claude and Chat sizes differ. That matters only when a total
+    // straddles 1 MiB. Exact needs client translation inside bootstrap.
+    fn line(&mut self, handshake: bool, held: (usize, usize), raw: (usize, usize), translated: usize) {
+        if self.released {
+            return;
+        }
+        let frames = self.frames + held.0 + raw.0;
+        let bytes = self.bytes + held.1 + raw.1 + translated;
+        if handshake && !self.timed_out() && frames <= BOOTSTRAP_MAX_FRAMES && bytes <= BOOTSTRAP_MAX_BYTES {
+            self.frames += raw.0;
+            self.bytes += raw.1 + translated;
+        } else {
+            self.released = true;
+        }
+    }
+}
+
 /// Codex stream bootstrap buffering (`codex.stream-bootstrap-buffering`, M5-0025): hold
 /// handshake frames (created, rate limits, empty `*.added`, heartbeats) up to 48 frames,
 /// 1 MiB and the optional timeout, so an overload/rate-limit rejection smuggled into a 200
@@ -1000,9 +1148,8 @@ pub(crate) async fn bootstrap(
     started: Instant,
 ) -> Bootstrap {
     let mut held: VecDeque<Result<Bytes, ExecError>> = VecDeque::new();
-    let (mut frames, mut bytes) = (0usize, 0usize);
+    let mut gate = Gate::new(timeout, started);
     loop {
-        let timed_out = || timeout.is_some_and(|t| started.elapsed() >= t);
         let event = match upstream.next().await {
             Some(Ok(event)) => event,
             Some(Err(error)) => {
@@ -1020,16 +1167,13 @@ pub(crate) async fn bootstrap(
                 return Bootstrap::Reject(error);
             }
         };
-        let lines = String::from_utf8_lossy(&event)
-            .split('\n')
-            .filter(|l| !l.trim_end_matches('\r').is_empty())
-            .count()
-            + 1;
-        match processor.event(&event) {
-            Step::Fail { error, body } => {
-                if body.as_deref().is_some_and(is_overload) && !timed_out() {
+        match processor.event_with(&event, Some(&mut gate)) {
+            Step::Fail { error, body, before } => {
+                // Once a line has released the stream, the overload is delivered in-stream.
+                if !gate.released && !gate.timed_out() && body.as_deref().is_some_and(is_overload) {
                     return Bootstrap::Reject(bootstrap_overload(body.as_deref().unwrap_or_default()));
                 }
+                held.extend(before.map(Ok));
                 held.push_back(Err(error));
                 return Bootstrap::Stream(futures_util::stream::iter(held).boxed());
             }
@@ -1038,21 +1182,12 @@ pub(crate) async fn bootstrap(
                 return Bootstrap::Stream(futures_util::stream::iter(held).boxed());
             }
             Step::Event(out) => {
-                let size = event.len() + out.len();
-                if processor.last_bufferable
-                    && !timed_out()
-                    && frames + lines <= BOOTSTRAP_MAX_FRAMES
-                    && bytes + size <= BOOTSTRAP_MAX_BYTES
-                {
-                    frames += lines;
-                    bytes += size;
-                    held.push_back(Ok(out));
-                    continue;
-                }
                 held.push_back(Ok(out));
-                let emitted = held.len();
-                let rest = processed(upstream, processor, emitted);
-                return Bootstrap::Stream(futures_util::stream::iter(held).chain(rest).boxed());
+                if gate.released {
+                    let emitted = held.len();
+                    let rest = processed(upstream, processor, emitted);
+                    return Bootstrap::Stream(futures_util::stream::iter(held).chain(rest).boxed());
+                }
             }
         }
     }

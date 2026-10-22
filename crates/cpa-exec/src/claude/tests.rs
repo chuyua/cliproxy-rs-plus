@@ -1,5 +1,6 @@
 use super::*;
 use cpa_core::exec::Caller;
+use cpa_core::gostr::GoStr;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -86,6 +87,7 @@ fn request(case: &Value) -> ExecRequest {
         },
         source_format: Format::Claude,
         response_format: Format::Claude,
+        stream_payloads: false,
         requested_model: "claude-sonnet-4-6".into(),
         model: "claude-sonnet-4-6".into(),
         original_body: body.clone(),
@@ -102,6 +104,7 @@ fn request(case: &Value) -> ExecRequest {
         caller: Caller {
             principal: "fixture-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -177,6 +180,7 @@ async fn custom_origin_counts_locally_without_sending_credentials() {
         operation: Operation::CountTokens,
         source_format: Format::Claude,
         response_format: Format::Claude,
+        stream_payloads: false,
         requested_model: "claude".into(),
         model: "claude".into(),
         original_body: body.clone(),
@@ -193,6 +197,7 @@ async fn custom_origin_counts_locally_without_sending_credentials() {
         caller: Caller {
             principal: "fake-client".into(),
             source: "x-api-key",
+            provider: String::new(),
         },
     };
     let response = tokio::time::timeout(
@@ -270,6 +275,7 @@ async fn messages_responses_record_the_quota_snapshot() {
             operation,
             source_format: Format::Claude,
             response_format: Format::Claude,
+            stream_payloads: false,
             requested_model: "m".into(),
             model: "m".into(),
             original_body: body.clone(),
@@ -286,6 +292,7 @@ async fn messages_responses_record_the_quota_snapshot() {
             caller: Caller {
                 principal: "fake-client".into(),
                 source: "x-api-key",
+                provider: String::new(),
             },
         }
     };
@@ -603,7 +610,11 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             .unwrap()
             .replace("AUTH_DIR", dir.join("auth").to_str().unwrap());
         if let Some(auth) = scenario["auth_file"].as_str().filter(|s| !s.is_empty()) {
-            std::fs::write(dir.join("auth").join("fixture.json"), auth).unwrap();
+            // The file name is the credential ID that keys the process-wide continuity
+            // store. One name per run keeps a run's date pins and prompt IDs to itself:
+            // the 6fecc6e and v8.0.27 fixtures send the same requests on different
+            // dates, and whichever ran first used to pin its date for the other.
+            std::fs::write(dir.join("auth").join(format!("fixture-{run}.json")), auth).unwrap();
         }
         let cfg = Config::parse(&text).unwrap();
         let credential = cpa_core::config::credentials::load(&cfg)
@@ -637,6 +648,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             },
             source_format: source,
             response_format: source,
+            stream_payloads: false,
             requested_model: scenario["requested_model"]
                 .as_str()
                 .or(scenario["model"].as_str())
@@ -657,6 +669,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             caller: Caller {
                 principal: scenario["client_key"].as_str().unwrap().into(),
                 source: "authorization",
+                provider: String::new(),
             },
         };
         let req = enrich(req);
@@ -846,6 +859,7 @@ fn client_request(body: String, headers: http::HeaderMap) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::Claude,
         response_format: Format::Claude,
+        stream_payloads: false,
         requested_model: model.clone(),
         model,
         original_body: body.clone(),
@@ -862,6 +876,7 @@ fn client_request(body: String, headers: http::HeaderMap) -> ExecRequest {
         caller: Caller {
             principal: "agent-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     })
 }
@@ -1154,6 +1169,7 @@ async fn unrestorable_tool_alias_publishes_no_tokens() {
         operation: Operation::Generate,
         source_format: Format::Claude,
         response_format: Format::Claude,
+        stream_payloads: false,
         requested_model: "claude-sonnet-4-6".into(),
         model: "claude-sonnet-4-6".into(),
         original_body: body.clone(),
@@ -1170,6 +1186,7 @@ async fn unrestorable_tool_alias_publishes_no_tokens() {
         caller: Caller {
             principal: "fake-client".into(),
             source: "authorization",
+            provider: String::new(),
         },
     });
     let cfg = Config::parse("").unwrap();
@@ -1194,8 +1211,8 @@ async fn unrestorable_tool_alias_publishes_no_tokens() {
 /// Go's reporter calls on each Claude path (claude_executor_execute.go and
 /// claude_executor_stream.go): native Execute publishes, translated Execute and
 /// ExecuteStream require usage (no EnsurePublished), the TTFT marks bracket the round
-/// trip, a renamed upstream model is reported, and `responses/compact` returns before
-/// any reporter exists.
+/// trip, a renamed upstream model is reported, and `responses/compact` reports only its
+/// summary turn, a native non-stream Execute (v8.0.35 2bc236d2).
 #[tokio::test]
 async fn usage_reports_follow_go_reporter_calls() {
     use axum::response::IntoResponse;
@@ -1243,6 +1260,7 @@ async fn usage_reports_follow_go_reporter_calls() {
             operation: Operation::Generate,
             source_format: source,
             response_format: source,
+            stream_payloads: false,
             requested_model: "claude-sonnet-4-6".into(),
             model: "claude-sonnet-4-6".into(),
             original_body: body.clone(),
@@ -1259,6 +1277,7 @@ async fn usage_reports_follow_go_reporter_calls() {
             caller: Caller {
                 principal: "fake-client".into(),
                 source: "x-api-key",
+                provider: String::new(),
             },
         };
         let (executor, credential, cfg) = (&executor, &credential, &cfg);
@@ -1305,7 +1324,8 @@ async fn usage_reports_follow_go_reporter_calls() {
     let usage = run(Format::Claude, false, None, renamed).await;
     assert_eq!(usage.kinds()[0], "upstream_model");
     assert_eq!(usage.0.lock().unwrap()[0].2, "claude-sonnet-4-6-upstream");
-    // responses/compact: Go returns before NewExecutorUsageReporter.
+    // responses/compact: executeClaudeCompaction returns before its own reporter and
+    // the summary turn publishes like a native Execute.
     let usage = run(
         Format::OpenAIResponse,
         false,
@@ -1313,7 +1333,10 @@ async fn usage_reports_follow_go_reporter_calls() {
         Delegation::default(),
     )
     .await;
-    assert_eq!(usage.kinds(), ["discard"]);
+    assert_eq!(
+        usage.kinds(),
+        ["request", "round_trip_started", "first_byte", "body", "publish"]
+    );
 }
 
 /// Owned copies of the capture events an executor records.
@@ -1414,6 +1437,7 @@ async fn request_logs_follow_go_capture_sites() {
             operation,
             source_format: Format::Claude,
             response_format: Format::Claude,
+            stream_payloads: false,
             requested_model: "claude-sonnet-4-6".into(),
             model: "claude-sonnet-4-6".into(),
             original_body: body.clone(),
@@ -1431,6 +1455,7 @@ async fn request_logs_follow_go_capture_sites() {
             caller: Caller {
                 principal: "fake-client".into(),
                 source: "x-api-key",
+                provider: String::new(),
             },
         };
         let (executor, cfg) = (&executor, &cfg);
@@ -1459,7 +1484,7 @@ async fn request_logs_follow_go_capture_sites() {
             .unwrap()
             .1
             .split(',')
-            .map(str::to_lowercase)
+            .map(GoStr::go_lower)
             .collect();
         let mut sent: Vec<String> = wire
             .lock()
@@ -1610,6 +1635,7 @@ async fn compat_replay_sequence_matches_go() {
             operation: Operation::Generate,
             source_format: Format::Claude,
             response_format: Format::Claude,
+            stream_payloads: false,
             requested_model: scenario["requested_model"].as_str().unwrap().into(),
             model: scenario["model"].as_str().unwrap().into(),
             original_body: body.clone(),
@@ -1626,6 +1652,7 @@ async fn compat_replay_sequence_matches_go() {
             caller: Caller {
                 principal: scenario["client_key"].as_str().unwrap().into(),
                 source: "authorization",
+                provider: String::new(),
             },
         });
         usage.0.lock().unwrap().clear();
@@ -1753,6 +1780,7 @@ async fn refused_versions_log_only_when_the_identity_is_replaced() {
             operation: Operation::Generate,
             source_format: Format::Claude,
             response_format: Format::Claude,
+            stream_payloads: false,
             requested_model: "m".into(),
             model: "m".into(),
             original_body: body.clone(),
@@ -1769,6 +1797,7 @@ async fn refused_versions_log_only_when_the_identity_is_replaced() {
             caller: Caller {
                 principal: "fake-client".into(),
                 source: "x-api-key",
+                provider: String::new(),
             },
         }
     };
@@ -1791,4 +1820,431 @@ async fn refused_versions_log_only_when_the_identity_is_replaced() {
         profile::refused_logged(&oauth.id),
         "the baseline identity went upstream"
     );
+}
+
+/// `upstream.claude.model-level-cooling` (Go 52d5507d) in every spelling, seen through
+/// the API-key view: off, a shared-window 429 cools the credential; on, the model.
+#[test]
+fn shared_window_429_follows_model_level_cooling() {
+    for (yaml, scope) in [
+        ("{}\n", FailureScope::Credential),
+        (
+            "upstream: {claude: {model-level-cooling: false}}\n",
+            FailureScope::Credential,
+        ),
+        ("upstream: {claude: {model-level-cooling: true}}\n", FailureScope::Model),
+        (
+            "oauth: {providers: {claude: {model-level-cooling: true}}}\n",
+            FailureScope::Model,
+        ),
+        ("claude: {model-level-cooling: true}\n", FailureScope::Model),
+    ] {
+        let cfg = Config::parse(yaml).unwrap();
+        let settings = settings::Settings::from_config(&cfg.for_api_key());
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-ratelimit-unified-5h-status", "rejected".parse().unwrap());
+        let error = upstream_error(
+            429,
+            headers,
+            Bytes::from_static(b"{}"),
+            false,
+            settings.model_level_cooling,
+        );
+        assert_eq!(error.scope, scope, "{yaml}");
+    }
+}
+
+/// `tests/fixtures/claude_ratelimit_go.json`, recorded from v8.0.35 by
+/// `tests/reference/claude_ratelimit`: the per-minute 429 cooldown (db1bab01), the
+/// header-only cooldown it replaces, and the scope and retry of a classified and a fast
+/// direct 429.
+#[test]
+fn claude_rate_limit_cooldown_and_scope_match_go() {
+    let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/claude_ratelimit_go.json")).unwrap();
+    let fixed = std::time::UNIX_EPOCH + Duration::from_secs(fixture["now_unix"].as_u64().unwrap());
+    let headers = |case: &Value, now: std::time::SystemTime| -> http::HeaderMap {
+        let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let expand = |raw: &str| {
+            let Some((kind, rest)) = raw.strip_prefix('{').and_then(|r| r.split_once('+')) else {
+                return raw.to_owned();
+            };
+            let offset: u64 = rest.trim_end_matches('}').parse().unwrap();
+            match kind {
+                "now" => (unix + offset).to_string(),
+                _ => httpdate::fmt_http_date(now + Duration::from_secs(offset)),
+            }
+        };
+        let mut map = http::HeaderMap::new();
+        for pair in case["headers"].as_array().unwrap() {
+            let name = http::HeaderName::from_bytes(pair[0].as_str().unwrap().as_bytes()).unwrap();
+            map.append(name, expand(pair[1].as_str().unwrap()).parse().unwrap());
+        }
+        map
+    };
+    let millis = |d: Option<Duration>| d.map(|d| d.as_millis() as u64);
+    let scope = |scope: FailureScope| match scope {
+        FailureScope::Credential => "credential",
+        FailureScope::Model => "model",
+        FailureScope::Request => "request",
+        other => panic!("unexpected scope {other:?}"),
+    };
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let body = Bytes::from(case["body"].as_str().unwrap().to_owned());
+        let at_fixed = headers(case, fixed);
+        // DIFFERENCES-FROM-GO.md: of two byte-identical keys only the last counts, so a
+        // later `"error":null` hides the per-minute error and the header-only result stays.
+        let reset_ms = if name == "later null keeps the error" {
+            case["header_only_ms"].as_u64()
+        } else {
+            case["reset_ms"].as_u64()
+        };
+        assert_eq!(
+            millis(crate::quota::reset_for_error(&at_fixed, &body, fixed, Duration::ZERO)),
+            reset_ms,
+            "{name}: cooldown"
+        );
+        assert_eq!(
+            millis(crate::quota::reset(&at_fixed, fixed, Duration::ZERO)),
+            case["header_only_ms"].as_u64(),
+            "{name}: header-only cooldown"
+        );
+        assert_eq!(
+            crate::quota::shared_rejection(&at_fixed),
+            case["shared"].as_bool().unwrap(),
+            "{name}"
+        );
+        let live = headers(case, std::time::SystemTime::now());
+        let classified = upstream_error(429, live.clone(), body.clone(), false, false);
+        assert_eq!(scope(classified.scope), case["scope"], "{name}: scope");
+        assert_eq!(
+            classified.retry_after.is_some(),
+            case["classify_retry"],
+            "{name}: retry"
+        );
+        let fast = upstream_error(429, live, body, true, false);
+        assert_eq!(scope(fast.scope), case["fast_scope"], "{name}: fast scope");
+        assert_eq!(fast.retry_after.is_some(), case["fast_retry"], "{name}: fast retry");
+        // Live cooldowns carry the 1-30 s fuzz on top of the fixed-clock base; the
+        // offsets are whole seconds from a clock that has a fraction.
+        for (path, retry) in [("classified", classified.retry_after), ("fast", fast.retry_after)] {
+            if let (Some(retry), Some(base)) = (retry, reset_ms) {
+                let ms = retry.as_millis() as u64;
+                assert!(
+                    ms > base.saturating_sub(2000) && ms <= base + 30_000,
+                    "{name}: {path} live cooldown {ms} vs {base}"
+                );
+            }
+        }
+    }
+}
+
+/// The cases of v8.0.35's claude_executor_compaction_test.go (2bc236d2): a compaction
+/// trigger or `responses/compact` becomes one non-stream Claude summary turn sealed into
+/// a single compaction item; replayed CPA capsules expand, foreign ones are dropped and
+/// broken ones fail with 400 before any upstream call.
+#[tokio::test]
+async fn responses_compaction_matches_go() {
+    use axum::response::IntoResponse;
+    const PROMPT: &str = "Please provide a concise and comprehensive summary";
+    const SUMMARY: &str = "Sealed summary of the build.";
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reply = Arc::new(std::sync::Mutex::new(String::new()));
+    let router = {
+        let (seen, reply) = (seen.clone(), reply.clone());
+        axum::Router::new().fallback(move |body: String| {
+            let (seen, reply) = (seen.clone(), reply.clone());
+            async move {
+                let stream = gjson::get(&body, "stream").bool();
+                seen.lock().unwrap().push(body);
+                if stream {
+                    let events = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\",\"content\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n\
+                                  event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+                                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+                    return ([(http::header::CONTENT_TYPE, "text/event-stream")], events).into_response();
+                }
+                let usage = reply.lock().unwrap().clone();
+                // "empty": a 200 without any text block.
+                let content = if usage == "empty" { String::new() } else { format!(r#"{{"type":"text","text":"{SUMMARY}"}}"#) };
+                let usage = if usage.is_empty() || usage == "empty" { r#"{"input_tokens":11,"output_tokens":7}"#.to_owned() } else { usage };
+                let body = format!(
+                    r#"{{"id":"msg_compact","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{content}],"stop_reason":"end_turn","usage":{usage}}}"#
+                );
+                ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
+            }
+        })
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let mut credential = Credential::from_file(
+        Path::new("/fake"),
+        Path::new("/fake/claude.json"),
+        serde_json::json!({"type":"claude"}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    credential.attributes.insert("api_key".into(), "key-compaction".into());
+    credential.attributes.insert("base_url".into(), base);
+    let run = |payload: String, original: Option<&str>, stream: bool, alt: Option<&str>, cfg: Config| {
+        let body = Bytes::from(payload);
+        let usage = Arc::new(Usage::default());
+        let req = ExecRequest {
+            operation: Operation::Generate,
+            source_format: Format::OpenAIResponse,
+            response_format: Format::OpenAIResponse,
+            stream_payloads: false,
+            requested_model: "claude-haiku-4-5-20251001".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            original_body: original.map_or_else(|| body.clone(), |o| Bytes::from(o.to_owned())),
+            body,
+            stream,
+            alt: alt.map(str::to_owned),
+            session: None,
+            execution_session: None,
+            derived_session: None,
+            resolved_model: None,
+            usage: cpa_core::exec::UsageSink::new(usage.clone()),
+            request_path: String::new(),
+            headers: Default::default(),
+            caller: Caller {
+                principal: "fake-client".into(),
+                source: "x-api-key",
+                provider: String::new(),
+            },
+        };
+        seen.lock().unwrap().clear();
+        let (executor, credential, seen) = (&executor, &credential, seen.clone());
+        async move {
+            let result = executor.execute(credential, req, &cfg).await;
+            let body = match result {
+                Ok(ExecResponse {
+                    body: ResponseBody::Buffered(b),
+                    ..
+                }) => Ok(String::from_utf8(b.to_vec()).unwrap()),
+                Ok(ExecResponse {
+                    body: ResponseBody::Stream(events),
+                    ..
+                }) => {
+                    let chunks: Vec<_> = events.collect().await;
+                    Ok(chunks
+                        .into_iter()
+                        .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
+                        .collect())
+                }
+                Err(e) => Err(e),
+            };
+            let upstream = seen.lock().unwrap().clone();
+            (body, upstream, usage.kinds())
+        }
+    };
+    let none = || Config::parse("").unwrap();
+    let input = |items: &str, extra: &str| {
+        format!(r#"{{"model":"claude-haiku-4-5-20251001","stream":false{extra},"input":[{items}]}}"#)
+    };
+    let user = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Check the build next."}]}"#;
+    let assistant = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK, I will check the build."}]}"#;
+    let tools = r#","tools":[{"type":"function","name":"check_build","description":"Check the build","parameters":{"type":"object","properties":{}}}]"#;
+    let calls = r#"{"type":"function_call","call_id":"call_1","name":"check_build","arguments":"{\"target\":\"api\"}"},{"type":"function_call_output","call_id":"call_1","output":"build ok"}"#;
+    let trigger = r#"{"type":"compaction_trigger"}"#;
+    let capsule = |summary: &str| {
+        let sealed = crate::antigravity_compaction::seal(summary, "claude-haiku-4-5-20251001").unwrap();
+        format!(r#"{{"type":"compaction","encrypted_content":"{sealed}"}}"#)
+    };
+    // The single compaction item, its capsule and the usage of the answer.
+    let compaction = |payload: &str, usage: (i64, i64, i64, i64)| {
+        let item = gjson::get(payload, "output");
+        let items = item.array();
+        assert_eq!(items.len(), 1, "{payload}");
+        assert_eq!(items[0].get("type").str(), "compaction");
+        let sealed = items[0].get("encrypted_content").str().to_owned();
+        assert_eq!(crate::antigravity_compaction::unseal(&sealed).unwrap(), SUMMARY);
+        let got = gjson::get(payload, "usage");
+        assert_eq!(
+            (
+                got.get("input_tokens").i64(),
+                got.get("output_tokens").i64(),
+                got.get("total_tokens").i64(),
+                got.get("input_tokens_details.cached_tokens").i64()
+            ),
+            usage,
+            "{payload}"
+        );
+    };
+    let summary_request = |upstream: &[String]| -> String {
+        assert_eq!(upstream.len(), 1, "one summary turn");
+        let body = upstream[0].clone();
+        assert!(body.contains(PROMPT), "{body}");
+        assert!(!body.contains("compaction_trigger"), "{body}");
+        assert!(!gjson::get(&body, "stream").bool(), "{body}");
+        body
+    };
+
+    // CompactionTriggerReturnsSingleCompactionItem, and the responses/compact alt.
+    for alt in [None, Some("responses/compact")] {
+        let items = if alt.is_some() {
+            format!("{user},{assistant}")
+        } else {
+            format!("{user},{assistant},{trigger}")
+        };
+        let (body, upstream, _) = run(input(&items, ""), None, false, alt, none()).await;
+        compaction(&body.unwrap(), (11, 7, 18, 0));
+        summary_request(&upstream);
+    }
+    // CompactionTriggerStreamReturnsSingleCompactionItem: the summary turn stays
+    // non-stream; the client gets the five Responses events.
+    let (body, upstream, _) = run(
+        input(&format!("{user},{assistant},{trigger}"), ""),
+        None,
+        true,
+        None,
+        none(),
+    )
+    .await;
+    let body = body.unwrap();
+    assert_eq!(body.matches("event: ").count(), 5, "{body}");
+    let completed = body
+        .split("\n\n")
+        .find(|f| f.starts_with("event: response.completed"))
+        .unwrap();
+    compaction(
+        gjson::get(completed.split_once("data: ").unwrap().1, "response").json(),
+        (11, 7, 18, 0),
+    );
+    summary_request(&upstream);
+    // ReplayedCompactionCapsuleIsExpanded: an ordinary turn, with the summary as context.
+    let continue_ = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}"#;
+    let (body, upstream, _) = run(
+        input(&format!("{},{continue_}", capsule(SUMMARY)), ""),
+        None,
+        false,
+        None,
+        none(),
+    )
+    .await;
+    assert!(body.is_ok());
+    assert!(
+        upstream[0].contains(SUMMARY) && !upstream[0].contains(r#""type":"compaction""#),
+        "{}",
+        upstream[0]
+    );
+    assert!(!upstream[0].contains(PROMPT));
+    // CompactionTriggerKeepsToolsForToolHistory.
+    let (body, upstream, _) = run(
+        input(&format!("{user},{calls},{trigger}"), tools),
+        None,
+        false,
+        None,
+        none(),
+    )
+    .await;
+    compaction(&body.unwrap(), (11, 7, 18, 0));
+    let sent = summary_request(&upstream);
+    assert!(
+        sent.contains("check_build")
+            && sent.contains(r#""type":"tool_use""#)
+            && sent.contains(r#""type":"tool_result""#),
+        "{sent}"
+    );
+    assert_eq!(gjson::get(&sent, "tool_choice.type").str(), "none", "{sent}");
+    // CompactionTriggerFlattensToolHistoryWithoutTools.
+    let (_, upstream, _) = run(
+        input(&format!("{user},{calls},{trigger}"), ""),
+        None,
+        false,
+        None,
+        none(),
+    )
+    .await;
+    let sent = summary_request(&upstream);
+    assert!(
+        !sent.contains(r#""type":"tool_use""#) && !sent.contains(r#""type":"tool_result""#),
+        "{sent}"
+    );
+    assert!(
+        sent.contains(r#"Tool call check_build (call_1): {\"target\":\"api\"}"#),
+        "{sent}"
+    );
+    assert!(sent.contains("Tool result call_1: build ok"), "{sent}");
+    assert!(!rawjson::get(&sent, "tool_choice").exists(), "{sent}");
+    // CompactionSummaryPayloadRuleIsLast: payload rules see the finalized body.
+    let ruled = Config::parse(
+        "payload:\n  override:\n    - models: [{name: claude-haiku-4-5-20251001}]\n      params: {max_tokens: 1234, tool_choice: {type: auto}}\n",
+    )
+    .unwrap();
+    let (_, upstream, _) = run(
+        input(&format!("{user},{calls},{trigger}"), tools),
+        None,
+        false,
+        None,
+        ruled,
+    )
+    .await;
+    let sent = summary_request(&upstream);
+    assert_eq!(gjson::get(&sent, "max_tokens").i64(), 1234, "{sent}");
+    assert_eq!(gjson::get(&sent, "tool_choice.type").str(), "auto", "{sent}");
+    // CompactionTriggerIncludesPreviousCapsule.
+    let earlier = capsule("Earlier sealed summary.");
+    let (body, upstream, _) = run(
+        input(&format!("{earlier},{continue_},{assistant},{trigger}"), ""),
+        None,
+        false,
+        None,
+        none(),
+    )
+    .await;
+    compaction(&body.unwrap(), (11, 7, 18, 0));
+    assert!(summary_request(&upstream).contains("Earlier sealed summary."));
+    // ForeignCompactionCapsuleIsDropped.
+    let foreign = r#"{"type":"compaction","encrypted_content":"gAAAAA-openai-native"}"#;
+    let (body, upstream, _) = run(
+        input(&format!("{foreign},{continue_},{trigger}"), ""),
+        None,
+        false,
+        None,
+        none(),
+    )
+    .await;
+    compaction(&body.unwrap(), (11, 7, 18, 0));
+    assert!(!summary_request(&upstream).contains("gAAAAA-openai-native"));
+    // CompactionUsageMatchesResponsesAccounting: cache writes and reads count as input.
+    *reply.lock().unwrap() =
+        r#"{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":100}"#.into();
+    let (body, _, _) = run(input(&format!("{user},{trigger}"), ""), None, false, None, none()).await;
+    compaction(&body.unwrap(), (114, 7, 121, 100));
+    reply.lock().unwrap().clear();
+    // InvalidCompactionCapsuleReturns400, before any upstream call.
+    let broken = r#"{"type":"compaction","encrypted_content":"cpa-ag-compact-v1:not-valid-base64"}"#;
+    // Go rejects it before its usage reporter exists, so no record is published, also
+    // when only the original request carries the capsule.
+    let plain = input(continue_, "");
+    let broken = input(&format!("{broken},{continue_}"), "");
+    for (body, original) in [(broken.clone(), None), (plain, Some(broken.as_str()))] {
+        let (body, upstream, usage) = run(body, original, false, None, none()).await;
+        let error = body.unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(String::from_utf8_lossy(&error.body).starts_with("invalid compaction capsule: "));
+        assert!(upstream.is_empty());
+        assert_eq!(usage, ["discard"]);
+    }
+    // A summary answer without text fails like Go's fmt.Errorf: no status and no
+    // transport fault, so it cools the model on the trigger path and is neutral on the
+    // compact alt, without a retry round (cpa-server classify tests); the summary turn
+    // itself published its usage.
+    *reply.lock().unwrap() = "empty".into();
+    for (items, alt) in [
+        (format!("{user},{trigger}"), None),
+        (user.to_owned(), Some("responses/compact")),
+    ] {
+        let (body, upstream, usage) = run(input(&items, ""), None, false, alt, none()).await;
+        let error = body.unwrap_err();
+        assert_eq!((error.status, error.scope), (0, FailureScope::Model), "{alt:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&error.body),
+            "extract summary: no summary text found in upstream response"
+        );
+        summary_request(&upstream);
+        assert!(usage.contains(&"publish"), "{usage:?}");
+    }
+    reply.lock().unwrap().clear();
 }

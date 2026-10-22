@@ -37,20 +37,19 @@ async fn group_proxy_fail_closed_for_prepare_generate_stream_and_count() {
     )
     .unwrap();
     let assert_rejected = |result: Result<wreq::Client, ExecError>| {
-        let error = result.err().expect("group without bound proxy must fail closed");
+        let error = match result {
+            Ok(_) => panic!("group without bound proxy must fail closed"),
+            Err(error) => error,
+        };
         assert_eq!(error.status, 503);
         assert_eq!(error.scope, FailureScope::Credential);
     };
     assert_rejected(executor.client(&group, &cfg));
-    assert_eq!(
-        executor
-            .prepare(&group, &cfg)
-            .await
-            .err()
-            .expect("prepare must reject group")
-            .status,
-        503
-    );
+    let error = match executor.prepare(&group, &cfg).await {
+        Ok(_) => panic!("prepare must reject group"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status, 503);
     let source = &scenarios()[0];
     for operation in [Operation::Generate, Operation::CountTokens] {
         let mut req = request(source);
@@ -156,6 +155,7 @@ fn request(s: &Value) -> ExecRequest {
         },
         source_format: source,
         response_format: response,
+        stream_payloads: false,
         requested_model: model.clone(),
         model,
         original_body: original,
@@ -172,6 +172,7 @@ fn request(s: &Value) -> ExecRequest {
         caller: Caller {
             principal: "fake-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }

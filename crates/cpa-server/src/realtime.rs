@@ -180,14 +180,22 @@ async fn authenticate(
         match access {
             // No provider registered: Go sets nothing.
             Ok(crate::plugins::Access::Open) => Principal::default(),
-            Ok(crate::plugins::Access::Granted { caller, provider }) => Principal {
+            Ok(crate::plugins::Access::Granted(caller)) => Principal {
                 key: caller.principal,
-                provider,
+                provider: caller.provider,
                 secret: None,
             },
             Err(denied) if matches!(mode, Mode::Ordinary) => {
                 let body = crate::gojson::Obj::new().str("error", denied.message).finish();
                 return crate::respond::gin_json(denied.status, body);
+            }
+            Err(denied) if denied.status == 413 => {
+                return realtime_error(
+                    denied.status,
+                    denied.message,
+                    "invalid_request_error",
+                    "request_body_too_large",
+                );
             }
             Err(denied) if denied.status >= 500 => {
                 return realtime_error(
@@ -259,7 +267,8 @@ impl Rejection {
 /// `selectOAuth`: `SelectAuthByKind(codex, "", oauth)`, optionally pinned to one
 /// credential (`PinnedAuthMetadataKey`). Session affinity follows the request's session
 /// identity. The lease records no outcome (Go marks none for live traffic). In Home mode
-/// it is `SelectHomeAuthByKind(codex, model, oauth)`, a pick of the given `kind`.
+/// it is `SelectHomeAuthByKind(codex, model, oauth)`, a pick of the given `kind`, and
+/// also yields the client key Home authenticated (empty locally).
 #[allow(clippy::too_many_arguments)]
 async fn select_oauth(
     rt: &Arc<Runtime>,
@@ -270,7 +279,7 @@ async fn select_oauth(
     execution_session: Option<&str>,
     model: &str,
     kind: &'static str,
-) -> Result<Lease, Rejection> {
+) -> Result<(Lease, String), Rejection> {
     if let Some(remote) = rt.remote_dispatch() {
         let (primary, parent, fork) = session_hierarchy(headers, body, execution_session);
         let bound = |s: String| (!s.is_empty()).then(|| cpa_common::session::bound_session_identity(&s));
@@ -324,6 +333,18 @@ async fn select_oauth(
         session_parent: bound(parent),
         session_fork: fork,
         exclude,
+        // Go selects with an empty model; an existing call's selection names its
+        // credential and call (sideband.go:381-388, capabilities.go:80-87).
+        scheduler: crate::plugins::provider_scheduler_context(
+            rt,
+            "codex",
+            headers,
+            "",
+            &[("pinned_auth_id", pinned), ("execution_session_id", execution_session)]
+                .into_iter()
+                .filter_map(|(k, v)| Some((k, v?)))
+                .collect::<Vec<_>>(),
+        ),
         ..Selection::default()
     };
     rt.acquire(selection, cfg, policy, &rt.registry())
@@ -378,13 +399,35 @@ async fn select_oauth(
                 text: String::from_utf8_lossy(&error.body).into_owned(),
                 retry_after: None,
             },
+            // A plugin scheduler's answer: Go returns the error as is, and a statusless one
+            // answers 503 (`writeSelectionError`).
+            AcquireError::Rejected { code, message } => Rejection {
+                status: 503,
+                text: format!("{code}: {message}"),
+                retry_after: None,
+            },
+            AcquireError::Scheduler(error) => Rejection {
+                status: if error.status > 0 { error.status } else { 503 },
+                text: crate::classify::error_text(&error),
+                retry_after: None,
+            },
         })
+        .map(|lease| (lease, String::new()))
 }
 
 /// Go `ReportHomeUnauthorized(ctx, selected, "codex", model, body)` from a live handler,
-/// whose context holds only the request ID and the session hierarchy (Home's canonical
-/// session replaces it on the record).
-fn report_unauthorized(rt: &Runtime, credential: &Credential, model: &str, body: &[u8], session: (String, String)) {
+/// whose context holds the request ID, the session hierarchy (Home's canonical session
+/// replaces it on the record), the authenticated principal and the client key this
+/// request's own Home pick returned (`home_key`; empty when it made none).
+fn report_unauthorized(
+    rt: &Runtime,
+    principal: &Principal,
+    home_key: &str,
+    credential: &Credential,
+    model: &str,
+    body: &[u8],
+    session: (String, String),
+) {
     let (session_id, parent_session_id) = session;
     let facts = crate::usage_record::Facts {
         client: crate::usage_record::Client {
@@ -395,6 +438,8 @@ fn report_unauthorized(rt: &Runtime, credential: &Credential, model: &str, body:
             },
             session_id,
             request_id: crate::observability::current_request_id().unwrap_or_default(),
+            api_key: crate::usage_record::home_unauthorized_key(&principal.key, home_key),
+            access_provider: principal.provider.clone(),
             ..Default::default()
         },
         format: cpa_core::format::Format::OpenAIResponse,

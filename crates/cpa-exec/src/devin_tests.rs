@@ -99,6 +99,20 @@ fn model_uids_match_go() {
     }
 }
 
+/// The catalog's keys and the resolver's lookup are both Go `strings.ToLower` (U+0130
+/// becomes a plain `i`): a catalog model `MİNİ` reached as `devin/MİNİ` resolves to its
+/// effort variant, as Go's `ResolveDevinChatModelUID` returns `mini-low`.
+#[test]
+fn model_uid_lookup_lowercases_like_go() {
+    let catalog = cpa_core::registry::devin::Store::empty();
+    let raw = r#"{"devin":[{"id":"MİNİ","thinking":{"levels":["low","high"]}}]}"#;
+    assert_eq!(catalog.load(raw.as_bytes(), "test"), Ok(true));
+    assert_eq!(
+        crate::devin_models::resolve_in(&catalog, "devin/MİNİ", "low", 0),
+        "mini-low"
+    );
+}
+
 #[test]
 fn trailers_match_go() {
     for case in vectors()["trailers"].as_array().unwrap() {

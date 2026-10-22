@@ -23,6 +23,7 @@ fn request(v: &Value) -> ExecRequest {
         operation: Operation::CountTokens,
         source_format: source,
         response_format: Format::parse(v["response"].as_str().unwrap()).unwrap(),
+        stream_payloads: false,
         requested_model: v["model"].as_str().unwrap().into(),
         model: v["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -39,6 +40,7 @@ fn request(v: &Value) -> ExecRequest {
         caller: Caller {
             principal: "client-key-FAKE".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }

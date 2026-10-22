@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use cpa_common::json::{self as gj, Kind, Res};
 
-use crate::common::{align_claude_tool_results, claude_message_system_reminder_text, go_lower, now_nanos, trim_space};
+use crate::common::{
+    UserTurnDrops, align_claude_tool_results, claude_message_system_reminder_text, go_lower, now_nanos, trim_space,
+};
 use crate::gemini_interactions::first_existing;
 use crate::openai_interactions::first_nonblank;
 use crate::stream::GoStream;
@@ -14,7 +16,7 @@ use crate::{Error, Registered, RequestCtx, ResponseCtx};
 
 pub static PAIR: Registered = registered!(
     Claude -> Interactions,
-    request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream, false)),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: None,
@@ -22,7 +24,7 @@ pub static PAIR: Registered = registered!(
 
 /// ConvertClaudeRequestToInteractionsWithCompat: empty thinking blocks are kept.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, ctx.stream, true))
+    convert(ctx.model, body, ctx.stream, true)
 }
 
 fn string(res: &Res<'_>) -> Vec<u8> {
@@ -32,8 +34,9 @@ fn string(res: &Res<'_>) -> Vec<u8> {
 // ---------------------------------------------------------------------------------------
 // Request
 
-/// convertClaudeRequestToInteractions.
-fn convert(model: &str, raw: &[u8], stream: bool, preserve_empty_thinking: bool) -> Vec<u8> {
+/// convertClaudeRequestToInteractions. A user turn left empty because its only
+/// attachment cannot be sent is refused.
+fn convert(model: &str, raw: &[u8], stream: bool, preserve_empty_thinking: bool) -> Result<Vec<u8>, Error> {
     let root = gj::parse(raw);
     let mut out = br#"{"model":"","input":[]}"#.to_vec();
     gj::set_str(
@@ -64,9 +67,10 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_empty_thinking: bool)
     }
     copy_thinking(&mut out, &root);
     copy_tool_choice(&mut out, &root.get("tool_choice"));
-    append_messages(&mut out, &root.get("messages"), preserve_empty_thinking);
+    let dropped = append_messages(&mut out, &root.get("messages"), preserve_empty_thinking);
     copy_tools(&mut out, &root);
-    out
+    dropped?;
+    Ok(out)
 }
 
 /// copyClaudeThinkingToInteractions.
@@ -136,6 +140,7 @@ struct Input {
     pending_reminders: Vec<Vec<u8>>,
     names: HashMap<Vec<u8>, Vec<u8>>,
     preserve_empty_thinking: bool,
+    drops: UserTurnDrops,
 }
 
 impl Input {
@@ -143,8 +148,10 @@ impl Input {
         self.items.append(&mut self.pending_reminders);
     }
 
-    /// appendClaudeMessageToInteractions.
-    fn message(&mut self, role: &[u8], content: &Res<'_>, parts: Option<Vec<Res<'_>>>) {
+    /// appendClaudeMessageToInteractions: returns how many parts the turn itself sends,
+    /// not counting reminders flushed beside it. Whitespace-only text never keeps an
+    /// emptied turn alive.
+    fn message(&mut self, role: &[u8], content: &Res<'_>, parts: Option<Vec<Res<'_>>>) -> usize {
         let step_type = if role == b"assistant" {
             "model_output"
         } else {
@@ -156,11 +163,12 @@ impl Input {
             gj::set_str(&mut step, "type", step_type);
             gj::set_str(&mut step, "content.0.text", content.bytes());
             self.items.push(step);
-            return;
+            return 1;
         }
         let Some(parts) = parts else {
-            return;
+            return 0;
         };
+        let mut sendable = 0;
         let mut pending: Vec<Vec<u8>> = vec![];
         let flush = |items: &mut Vec<Vec<u8>>, pending: &mut Vec<Vec<u8>>| {
             if pending.is_empty() {
@@ -185,6 +193,7 @@ impl Input {
                         let mut item = br#"{"type":"text","text":""}"#.to_vec();
                         gj::set_str(&mut item, "text", &text);
                         pending.push(item);
+                        sendable += usize::from(!trim_space(&text).is_empty());
                     }
                 }
                 b"thinking" => {
@@ -194,15 +203,19 @@ impl Input {
                         let mut step = br#"{"type":"thought","content":[{"type":"text","text":""}]}"#.to_vec();
                         gj::set_str(&mut step, "content.0.text", &text);
                         self.items.push(step);
+                        sendable += 1;
                     }
                 }
-                b"image" | b"document" => {
+                b"image" | b"document" | b"container_upload" => {
                     if let Some(media) = media_part(part, &kind) {
                         if !self.pending_reminders.is_empty() {
                             flush(&mut self.items, &mut pending);
                             self.release_reminders();
                         }
                         pending.push(media);
+                        sendable += 1;
+                    } else if role == b"user" {
+                        self.drops.drop_part(&String::from_utf8_lossy(&kind));
                     }
                 }
                 b"tool_use" => {
@@ -226,23 +239,26 @@ impl Input {
                         gj::set_raw(&mut step, "arguments", &input.raw);
                     }
                     self.items.push(step);
+                    sendable += 1;
                 }
                 b"tool_result" => {
                     flush(&mut self.items, &mut pending);
                     let step = tool_result(part, &self.names);
                     self.items.push(step);
+                    sendable += 1;
                 }
                 _ => {}
             }
         }
         flush(&mut self.items, &mut pending);
+        sendable
     }
 }
 
 /// appendClaudeMessagesToInteractions.
-fn append_messages(out: &mut Vec<u8>, messages: &Res<'_>, preserve_empty_thinking: bool) {
+fn append_messages(out: &mut Vec<u8>, messages: &Res<'_>, preserve_empty_thinking: bool) -> Result<(), Error> {
     if !messages.is_array() {
-        return;
+        return Ok(());
     }
     let mut input = Input {
         preserve_empty_thinking,
@@ -272,12 +288,16 @@ fn append_messages(out: &mut Vec<u8>, messages: &Res<'_>, preserve_empty_thinkin
             }
         });
         input.pending_tool_uses.clear();
-        input.message(&role, &content, parts);
+        let sendable = input.message(&role, &content, parts);
+        if role == b"user" {
+            input.drops.end_turn(sendable);
+        }
         input.release_reminders();
         true
     });
     input.release_reminders();
     gj::set_items(out, "input", &input.items);
+    input.drops.result()
 }
 
 /// claudeMediaPartToInteractions.
@@ -346,7 +366,7 @@ fn tool_result(part: &Res<'_>, names: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
                         items.push(raw);
                     }
                 }
-                b"image" | b"document" => match media_part(&item, &kind) {
+                b"image" | b"document" | b"container_upload" => match media_part(&item, &kind) {
                     Some(media) => items.push(media),
                     None if !raw.is_empty() => items.push(raw),
                     None => {}

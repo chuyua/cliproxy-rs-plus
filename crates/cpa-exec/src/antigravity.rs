@@ -512,7 +512,9 @@ impl AntigravityExecutor {
         if req.operation == Operation::CountTokens {
             return self.count_tokens(credential, req, cfg).await;
         }
+        // Go rejects both of these before it creates the usage reporter.
         if req.stream && req.alt.as_deref() == Some(gemini::COMPACT_ALT) {
+            req.usage.discard();
             return Err(gemini::status_err(
                 400,
                 "streaming not supported for /responses/compact",
@@ -520,7 +522,13 @@ impl AntigravityExecutor {
         }
         let mut req = req;
         if compaction::has_item(&req.body) {
-            let expanded = compaction::expand(&req.body).map_err(|e| gemini::status_err(400, e))?;
+            let expanded = match compaction::expand(&req.body) {
+                Ok(expanded) => expanded,
+                Err(e) => {
+                    req.usage.discard();
+                    return Err(gemini::status_err(400, e));
+                }
+            };
             if !req.original_body.is_empty() {
                 req.original_body =
                     Bytes::from(compaction::expand(&req.original_body).unwrap_or_else(|_| expanded.clone()));
@@ -871,20 +879,10 @@ impl AntigravityExecutor {
         let ResponseBody::Buffered(payload) = answer.body else {
             return Err(gemini::bad_gateway());
         };
-        let text = compaction::summary_text(&payload).map_err(|e| {
-            ExecError::local(
-                500,
-                cpa_core::exec::FailureScope::Request,
-                format!("extract summary: {e}"),
-            )
-        })?;
-        let capsule = compaction::seal(&text, &model).map_err(|e| {
-            ExecError::local(
-                500,
-                cpa_core::exec::FailureScope::Request,
-                format!("seal compaction capsule: {e}"),
-            )
-        })?;
+        let text =
+            compaction::summary_text(&payload).map_err(|e| compaction::statusless(format!("extract summary: {e}")))?;
+        let capsule = compaction::seal(&text, &model)
+            .map_err(|e| compaction::statusless(format!("seal compaction capsule: {e}")))?;
         let usage = compaction::summary_usage(&payload);
         let mut headers = answer.headers;
         if !stream {

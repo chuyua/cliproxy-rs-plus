@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::handler::Handler;
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
 use axum::{Router, middleware};
+use cpa_common::gostr::GoStr;
 use cpa_core::config::{Config, ConfigDocument, archive_comments, credentials, is_bcrypt};
 use cpa_core::credential::{Credential, Source};
 use serde_json::{Value, json};
@@ -22,18 +24,20 @@ use crate::scheduler::{ErrorRule, Policy};
 mod access;
 mod api_call;
 mod auth_files;
+mod auth_index;
 mod iso_currency;
 pub(crate) mod legacy;
 mod logs;
-mod multipart;
+pub(crate) mod multipart;
 mod oauth;
 pub mod observability;
 mod plugin_auth;
 mod plugin_oauth;
 mod plugin_store;
 mod plugins;
-mod quota;
+pub(crate) mod quota;
 mod quota_probe;
+mod siwc;
 pub use access::cors;
 pub(crate) use access::{Cors, cors_headers};
 pub(crate) use plugins::go_query;
@@ -65,6 +69,8 @@ pub struct Management {
     /// Callback forwarders by port (Go `callbackForwarders`).
     pub(crate) forwarders: Mutex<std::collections::HashMap<u16, oauth::Forwarder>>,
     pub(crate) login_base: Option<String>,
+    /// Told the state of every management login that has finished (tests only).
+    pub(crate) login_settled: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Go `Handler.logDir`: resolved once at startup.
     pub(crate) log_dir: PathBuf,
     /// The remote store mirroring config and auth files, when one is configured.
@@ -94,6 +100,9 @@ pub struct Options {
     pub update_check_disabled: Option<bool>,
     /// One local base URL for every provider's login endpoints (tests only).
     pub login_base: Option<String>,
+    /// Receives the state of every management login once its worker has finished,
+    /// saved, failed or cancelled (tests only).
+    pub login_settled: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Overrides the log directory Go resolves at startup (tests only).
     pub log_dir: Option<PathBuf>,
     /// A Postgres, git or object store mirroring config and auth files (Go's
@@ -155,6 +164,7 @@ impl Management {
         let mut options = options;
         let store = options.store.take();
         let auth_dir = options.auth_dir.take();
+        let login_settled = options.login_settled.take();
         let log_zone = options.log_zone;
         let plugin_store = plugin_store::StoreState::new(
             options.plugin_store_registry_url.take(),
@@ -178,6 +188,7 @@ impl Management {
             oauth: oauth::Sessions::default(),
             forwarders: Mutex::default(),
             login_base,
+            login_settled,
             log_dir,
             store,
             auth_dir,
@@ -210,30 +221,67 @@ impl Management {
         store.delete_auth(path).map_err(|e| format!("{e:#}"))
     }
 
+    /// Go `Store.Save`: `write` through the configured store, which has the file when
+    /// this returns (git syncs first and holds its lock across the write); without a
+    /// store, just `write`. Blocking: call from a blocking thread holding `disk`.
+    pub(crate) fn store_write(&self, write: crate::persist::SaveFn<'_>) -> Result<Option<PathBuf>, String> {
+        match &self.store {
+            Some(store) => store.save_auth(write),
+            None => write(),
+        }
+        .map_err(|e| format!("{e:#}"))
+    }
+
     /// Publishes a config and everything Go derives from it on reload: scheduler
     /// policy, management availability, and the credential set (auth-dir files plus
     /// config API keys). `files` replaces the auth-dir scan when the caller already
-    /// has a reconciled list. Callers hold `disk`. Infallible on purpose: access
-    /// settings of a valid config (a rotated or removed secret) always take effect.
-    pub(crate) fn publish(&self, cfg: Config, files: Option<Vec<Credential>>) {
+    /// has one; its file hashes keep a stale scan from undoing a later write (Go
+    /// c4c1d43e). Callers hold `disk`. Infallible on purpose: access settings of a
+    /// valid config (a rotated or removed secret) always take effect.
+    pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) {
+        self.publish_upload(cfg, files, None);
+    }
+
+    /// [`Self::publish`] after an upload wrote `upload`'s file. While plugin auth
+    /// providers have not parsed the new bytes, the uploaded credential is registered as
+    /// built, as Go's upload registers it (`buildAuthFromFileData`, no plugin parser),
+    /// replacing one with the same ID; the watcher's next reload asks the plugins.
+    /// `upload` carries the SHA-256 of the bytes written: a write committed since (a
+    /// token refresh) changed the file, and the current credential is kept.
+    pub(crate) fn publish_upload(
+        &self,
+        cfg: Config,
+        files: Option<credentials::AuthScan>,
+        upload: Option<(Credential, [u8; 32])>,
+    ) {
         let mut cfg = cfg;
         self.lock_auth_dir(&mut cfg);
-        let mut all = files.unwrap_or_else(|| credentials::from_auth_dir(&cfg));
+        use sha2::{Digest, Sha256};
+        let scan = files.unwrap_or_else(|| credentials::scan_auth_dir(&cfg));
+        let mut all = scan.credentials;
+        let mut read = scan.read;
+        // Uploads record absolute paths; a relative auth-dir scans relative ones.
+        let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
         // Fallbacks follow their file: gone with it, replaced once a synthesizer
         // claims it, otherwise rebuilt from its current content.
+        let mut claimed = Vec::new();
         let mut fallbacks = self.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         fallbacks.retain(|path| {
             let Ok(data) = std::fs::read(path) else { return false };
-            // Uploads record absolute paths; a relative auth-dir scans relative ones.
-            let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
             if all
                 .iter()
                 .any(|c| matches!(&c.source, Source::File(p) if absolute(p) == absolute(path)))
             {
+                claimed.push(path.clone());
                 return false;
             }
             match credentials::upload_fallback(&cfg.auth_dir, path, &data) {
                 Some(c) => {
+                    // Bound to the bytes it was built from, under its own path, so the
+                    // freshness check compares this read, not the scan's.
+                    if let Source::File(p) = &c.source {
+                        read.insert(p.clone(), Sha256::digest(&data).into());
+                    }
                     all.push(c);
                     true
                 }
@@ -241,13 +289,56 @@ impl Management {
             }
         });
         drop(fallbacks);
+        #[cfg(test)]
+        {
+            let mut hooks = BEFORE_RECONCILE.lock().unwrap();
+            let hook = hooks
+                .iter()
+                .position(|(dir, _)| *dir == cfg.auth_dir)
+                .map(|i| hooks.remove(i).1);
+            drop(hooks);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         all.extend(credentials::from_config(&cfg));
         self.access.config_published(&cfg);
         crate::logging::configure(&cfg);
         self.rt.usage_queue().configure(self.access.available(), &cfg);
         let policy = policy(&cfg);
         self.rt.publish_config_and_policy(cfg, policy);
-        self.rt.store().reconcile(all);
+        let upload = upload.filter(|(c, _)| {
+            matches!(&c.source, Source::File(path) if scan.deferred.iter().any(|p| absolute(p) == absolute(path)))
+        });
+        if let Some((
+            Credential {
+                source: Source::File(path),
+                ..
+            },
+            written,
+        )) = &upload
+        {
+            read.insert(path.clone(), *written);
+        }
+        let rejected = self.rt.store().reconcile_scanned_with(all, &read, |current, all| {
+            crate::plugins::keep_deferred(current, all, &scan.deferred);
+            if let Some((upload, _)) = upload {
+                all.retain(|c| c.id != upload.id);
+                all.push(upload);
+            }
+        });
+        // A synthesizer claimed the file but its credential was rejected as stale, so the
+        // fallback stays live: keep tracking it, or the next reload would drop it.
+        let kept: Vec<PathBuf> = claimed
+            .into_iter()
+            .filter(|path| rejected.iter().any(|r| absolute(r) == absolute(path)))
+            .collect();
+        if !kept.is_empty() {
+            self.fallbacks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(kept);
+        }
         // Go's watcher calls redisqueue.NotifyUsageRefresh after every client reload.
         self.rt.usage_queue().notify_usage_refresh();
     }
@@ -263,7 +354,7 @@ pub fn policy(cfg: &Config) -> Policy {
         .and_then(|o| o.get("request-scoped-errors"))
         .and_then(serde_yaml_ng::Value::as_mapping);
     for (channel, list) in rules.into_iter().flatten() {
-        let channel = channel.as_str().unwrap_or_default().trim().to_lowercase();
+        let channel = channel.as_str().unwrap_or_default().trim().go_lower();
         let clean: Vec<ErrorRule> = list
             .as_sequence()
             .into_iter()
@@ -287,7 +378,7 @@ pub fn policy(cfg: &Config) -> Policy {
                         .and_then(serde_yaml_ng::Value::as_str)
                         .unwrap_or_default()
                         .trim()
-                        .to_lowercase(),
+                        .go_lower(),
                 };
                 (rule.status > 0
                     && !(rule.r#match.is_empty() && rule.match_regex.is_empty())
@@ -375,6 +466,22 @@ fn json_body(status: StatusCode, body: String) -> Response {
 
 pub(crate) fn json_error(status: StatusCode, message: &str) -> Response {
     json(status, &json!({"error": message}))
+}
+
+/// Go `HTTPStatusFromErrorOr(err, 400)` for a failed body read in the handlers
+/// dd7b4334 changed: 413 at `server.max-request-body-bytes` (and at a route's own
+/// `DefaultBodyLimit`), else 400.
+pub(crate) fn read_status(rejection: &BytesRejection) -> StatusCode {
+    if crate::body_limit::is_too_large(rejection) || rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+/// The text of a failed body read: Go's `err.Error()` at the limit.
+pub(crate) fn read_reason(rejection: &BytesRejection) -> String {
+    crate::claude::read_error(rejection).1
 }
 
 fn error(code: u16, message: &str) -> Response {
@@ -499,6 +606,7 @@ pub fn router(state: Arc<Management>) -> Router {
         ("oauth/status", methods().get(guarded!(s, oauth::status))),
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),
         ("oauth/import", methods().post(guarded!(s, oauth::import))),
+        ("oauth/siwc/bind", methods().post(guarded!(s, siwc::bind))),
         (
             "observability/logs",
             methods()
@@ -687,11 +795,44 @@ pub(crate) async fn config(
     State(state): State<Arc<Management>>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    body: Bytes,
+    headers: HeaderMap,
+    body: axum::body::Body,
 ) -> Response {
     // gin's *path parameter is the decoded path.
     let path = percent_decode(uri.path());
-    tokio::task::spawn_blocking(move || config_sync(&state, &path, method, &body))
+    let if_match: Vec<_> = headers
+        .get_all(header::IF_MATCH)
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    // Go reads the body only for writes other than DELETE, under its lock, after the file
+    // read, the If-Match check and the stored config's parse. Those run here under the
+    // disk lock, which is released while the body arrives, and again under it before
+    // the write.
+    let body = if matches!(method, Method::GET | Method::DELETE) {
+        Ok(Bytes::new())
+    } else {
+        let check = {
+            let (state, method, if_match) = (state.clone(), method.clone(), if_match.clone());
+            tokio::task::spawn_blocking(move || {
+                let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+                stored(&state, &method, &if_match).err()
+            })
+        };
+        match check.await {
+            Ok(Some(response)) => return *response,
+            Ok(None) => {}
+            Err(_) => return error(500, "internal_error"),
+        }
+        axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
+            if crate::body_limit::is_too_large(&e) {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        })
+    };
+    tokio::task::spawn_blocking(move || config_sync(&state, &path, method, &if_match, body.as_deref().map_err(|s| *s)))
         .await
         .unwrap_or_else(|_| error(500, "internal_error"))
 }
@@ -736,18 +877,74 @@ fn invalid_config(status: StatusCode, err: impl std::fmt::Display) -> Response {
     json(status, &json!({"error": "invalid_config", "message": err.to_string()}))
 }
 
+/// Stores the bcrypt hash of a plaintext management key at `path`. `decoded` is the
+/// key as the config decodes it, so a number or bool written there (`123`) is hashed as
+/// its string, as Go's `ParseConfigBytes` does before publishing.
+fn hash_secret(doc: &mut ConfigDocument, path: &[&str], decoded: &str) -> Option<Response> {
+    if decoded.is_empty() || is_bcrypt(decoded) {
+        return None;
+    }
+    match bcrypt::hash(decoded, bcrypt::DEFAULT_COST) {
+        Err(e) => Some(invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e)),
+        Ok(hash) => doc
+            .update(path, hash.into(), false)
+            .err()
+            .map(|_| error(422, "invalid_config")),
+    }
+}
+
 /// Go `Handler.ConfigV8`: every call reads the file and migrates it in memory (legacy
 /// layout to v8, unknown sections archived as comments); only successful mutations
 /// persist. The write keeps untouched text byte-stable instead of Go's re-encoding.
-pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: &[u8]) -> Response {
+///
+/// Reads carry an `ETag` with the SHA-256 of the file bytes; a write with `If-Match`
+/// lines that do not name the current version fails with 412 (v8.0.35 `fa68946a`).
+pub(crate) fn config_sync(
+    state: &Management,
+    path: &str,
+    method: Method,
+    if_match: &[String],
+    body: Result<&[u8], StatusCode>,
+) -> Response {
     let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-    let original = match std::fs::read_to_string(&state.path) {
+    config_sync_locked(state, path, method, if_match, body, false)
+}
+
+/// The stored config as Go's `ConfigV8` prepares it before reading a body: the file
+/// bytes and their `ETag`, the `If-Match` check for writes, then the parsed document.
+/// Errors are Go's answers. Call it holding `state.disk`.
+fn stored(
+    state: &Management,
+    method: &Method,
+    if_match: &[String],
+) -> Result<(String, HeaderValue, ConfigDocument), Box<Response>> {
+    let raw = std::fs::read(&state.path).map_err(|_| Box::new(error(500, "read_failed")))?;
+    let etag = config_etag(&raw);
+    if method != Method::GET && !if_match_satisfied(if_match, &etag) {
+        let mut response = error(412, "precondition_failed");
+        response.headers_mut().insert(header::ETAG, etag);
+        return Err(Box::new(response));
+    }
+    let invalid = |e: &dyn std::fmt::Display| Box::new(invalid_config(StatusCode::INTERNAL_SERVER_ERROR, e));
+    let original = String::from_utf8(raw).map_err(|_| invalid(&"yaml: invalid leading UTF-8 octet"))?;
+    let doc = ConfigDocument::parse(&original).map_err(|e| invalid(&e))?;
+    Ok((original, etag, doc))
+}
+
+/// [`config_sync`] for a caller already holding `state.disk`. `typed` saves the written
+/// values as Go's typed v0 saver does (`SaveConfigPreserveComments`); a v8 write saves
+/// the validated tree as written (Go v8.0.35).
+fn config_sync_locked(
+    state: &Management,
+    path: &str,
+    method: Method,
+    if_match: &[String],
+    body: Result<&[u8], StatusCode>,
+    typed: bool,
+) -> Response {
+    let (original, etag, mut doc) = match stored(state, &method, if_match) {
         Ok(v) => v,
-        Err(_) => return error(500, "read_failed"),
-    };
-    let mut doc = match ConfigDocument::parse(&original) {
-        Ok(v) => v,
-        Err(e) => return invalid_config(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(response) => return *response,
     };
     let basis = doc.migrated_text(&original).unwrap_or_else(|| original.clone());
     let archived = doc.archive_unknown();
@@ -763,12 +960,19 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
         suffix.split('/').collect()
     };
     if method == Method::GET {
+        // Go v8.0.35 (3be5fa44): a historical path reads the canonical values.
+        let mut view = doc.clone();
+        view.project_aliases(&parts);
         if yaml {
             return match doc.render_preserving(&basis) {
                 Ok(text) => (
                     [
-                        (header::CONTENT_TYPE, "application/yaml; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-store"),
+                        (
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/yaml; charset=utf-8"),
+                        ),
+                        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                        (header::ETAG, etag),
                     ],
                     text + &archive_comments(&archived),
                 )
@@ -776,10 +980,14 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
                 Err(_) => error(500, "decode_failed"),
             };
         }
-        let mut result = match serde_json::to_value(doc.value()) {
+        let mut result = match serde_json::to_value(view.value()) {
             Ok(v) => v,
             Err(_) => return error(500, "decode_failed"),
         };
+        // Go parses the stored document for this, falling back to the live config.
+        let cfg = doc.yaml().ok().and_then(|text| Config::parse(&text).ok());
+        let cfg = cfg.map_or_else(|| state.rt.config(), Arc::new);
+        auth_index::inject(&mut result, &cfg, &live_auth_indexes(state));
         // TURN passwords are omitted from JSON reads, never from YAML downloads.
         if let Some(servers) = result
             .pointer_mut("/oauth/providers/codex/live-media-relay/ice-servers")
@@ -800,12 +1008,14 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
             selected = next;
         }
         let mut response = json(StatusCode::OK, selected);
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        let headers = response.headers_mut();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(header::ETAG, etag);
         return response;
     }
     let before = doc.clone();
+    // A write to a historical path replaces or deletes the canonical values there.
+    doc.project_aliases(&parts);
     let mut written = None;
     if method == Method::DELETE {
         if parts.is_empty() {
@@ -815,6 +1025,10 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
             return error(404, "not_found");
         }
     } else {
+        let body = match body {
+            Ok(body) => body,
+            Err(status) => return error(status.as_u16(), "invalid_body"),
+        };
         if !yaml && serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
             return error(400, "invalid_json");
         }
@@ -828,12 +1042,19 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
             Ok(v) if has_document => v,
             _ => return error(400, "invalid_body"),
         };
-        // Go's typed saver flattens merges in an upload; a scalar merge fails to decode.
-        if let Err(e) = cpa_core::config::expand_merges(&mut value) {
-            return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e);
-        }
         if parts.is_empty() && !value.is_mapping() {
             return error(400, "config_must_be_object");
+        }
+        // A YAML upload is alias-normalized first, where a scalar merge fails (Go
+        // `NormalizeV8ConfigAliases`, 400). JSON keys are quoted, so Go keeps `<<` as a
+        // plain key through the update and expands it only when it parses its own save,
+        // which writes it plain: below.
+        if yaml && let Err(e) = cpa_core::config::expand_merges(&mut value) {
+            return invalid_config(StatusCode::BAD_REQUEST, e);
+        }
+        auth_index::strip_update(&parts, &mut value);
+        if parts.is_empty() {
+            ConfigDocument::normalize_aliases(&mut value);
         }
         if doc.update(&parts, value.clone(), method == Method::PATCH).is_err() {
             return error(400, "invalid_path");
@@ -842,7 +1063,21 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
             doc.preserve_turn_secrets(&before);
         }
         written = Some(value);
+        // The completed candidate, as Go reparses it: keys already there win over merged
+        // ones, and a scalar merge is an invalid config (422).
+        if !yaml && let Err(e) = cpa_core::config::expand_merges(doc.value_mut()) {
+            return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e);
+        }
     }
+    ConfigDocument::normalize_aliases(doc.value_mut());
+    // Go saves every v8 write as `NormalizeConfigLayout` output, which declares the
+    // version even when a whole-config PUT omitted it.
+    if let Some(root) = doc.value_mut().as_mapping_mut()
+        && !root.contains_key("config-version")
+    {
+        root.insert("config-version".into(), 8.into());
+    }
+    auth_index::strip_root(doc.value_mut());
     for field in [
         "credentials/concurrency/lifecycle-config-revision",
         "credentials/concurrency/observation-barrier-revision",
@@ -860,47 +1095,23 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
         Ok(v) => v,
         Err(e) => return invalid_config(StatusCode::BAD_REQUEST, e),
     };
-    if let Err(e) = Config::parse(&text) {
-        return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e);
-    }
+    let parsed = match Config::parse(&text) {
+        Ok(v) => v,
+        Err(e) => return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
     if let Err(e) = cpa_core::config::validate_config_fields(doc.value(), true) {
         return invalid_config(StatusCode::BAD_REQUEST, e);
     }
-    // Go's typed saver re-encodes a JSON string in a bool field (accepted above as
-    // a YAML 1.1 spelling) as `!!str <bool>` and fails to decode its own output; the
-    // file is left unchanged. ponytail: YAML uploads are not checked, since quoted
-    // and plain scalars are indistinguishable here and Go only fails on quoted ones.
-    if !yaml
-        && let Some(value) = written
-            .as_ref()
-            .and_then(|w| cpa_core::config::written_bool_spelling(&parts, w))
-    {
-        return json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": "write_failed", "message": format!("decode migrated config: yaml: unmarshal errors:\n  cannot unmarshal !!str `{value}` into bool")}),
-        );
-    }
-    // Go validates the raw candidate, then its saver persists typed values; projecting
-    // only after validation keeps malformed input from being sanitized into success.
-    if let Some(written) = &written {
+    // Go's v0 saver persists typed values; projecting only after validation keeps
+    // malformed input from being sanitized into success.
+    if typed && let Some(written) = &written {
         doc.typed_projection(&parts, written, method == Method::PATCH);
     }
-    if let Some(secret) = doc
-        .get(&["management", "secret-key"])
-        .and_then(serde_yaml_ng::Value::as_str)
-        && !secret.is_empty()
-        && !is_bcrypt(secret)
-    {
-        let hash = match bcrypt::hash(secret, bcrypt::DEFAULT_COST) {
-            Ok(v) => v,
-            Err(e) => return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e),
-        };
-        if doc.update(&["management", "secret-key"], hash.into(), false).is_err() {
-            return error(422, "invalid_config");
-        }
+    if let Some(response) = hash_secret(&mut doc, &["management", "secret-key"], &parsed.management.secret_key) {
+        return response;
     }
     let basis = if yaml {
-        match std::str::from_utf8(body) {
+        match std::str::from_utf8(body.unwrap_or_default()) {
             Ok(v) => v.to_owned(),
             Err(_) => return error(400, "invalid_body"),
         }
@@ -928,7 +1139,177 @@ pub(crate) fn config_sync(state: &Management, path: &str, method: Method, body: 
         );
     }
     state.publish(cfg, None);
-    json(StatusCode::OK, &json!({"config-version": 8, "status": "ok"}))
+    let mut response = json(StatusCode::OK, &json!({"config-version": 8, "status": "ok"}));
+    // The version actually on disk; none when it cannot be read back.
+    if let Ok(saved) = std::fs::read(&state.path) {
+        response.headers_mut().insert(header::ETAG, config_etag(&saved));
+    }
+    response
+}
+
+/// What a v0 save does at its legacy path.
+pub(crate) enum LegacyEdit {
+    Set(serde_json::Value),
+    Delete,
+    /// Rewrite unchanged, as Go saves after a handler that changed nothing.
+    Keep,
+}
+
+/// A v0 save at the v8 path: `Some(value)` replaces it, `None` deletes it.
+pub(crate) struct V8Edit<'a> {
+    pub path: &'a str,
+    pub value: Option<Value>,
+}
+
+/// Test hook run once by the next [`Management::publish`] for the auth folder it names,
+/// after it has built its fallback credentials and before it reconciles them.
+#[cfg(test)]
+pub(crate) static BEFORE_RECONCILE: Mutex<Vec<(PathBuf, LayoutHook)>> = Mutex::new(Vec::new());
+
+/// Test hook run once, for the config file it names, when [`v0_save`] has chosen the v8
+/// writer and not yet written: the boundary where an unlocked save would let another
+/// writer in.
+#[cfg(test)]
+pub(crate) static AFTER_LAYOUT: Mutex<Option<(PathBuf, LayoutHook)>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) type LayoutHook = Box<dyn FnOnce() + Send>;
+
+/// Go v8.0.35 `SaveConfigPreserveComments`: a v0 save keeps a file without v8 sections
+/// in its legacy layout, so legacy settings keep their scope (a legacy
+/// `codex-header-defaults` still applies to API keys); a v8 file saves through the v8
+/// writer. The caller holds the `disk` lock across the layout check and the chosen
+/// write, so an upload cannot change the layout in between, and across reading the
+/// value it changes, so a concurrent save cannot be lost (Go 1631875b).
+/// ponytail: the legacy branch changes only the edited key; Go also merges its whole
+/// typed legacy render into the file and drops removed integration keys. Port
+/// `mergeMappingPreserve` here if a difference in the saved file matters.
+pub(crate) fn v0_save(
+    state: &Management,
+    _disk: &std::sync::MutexGuard<'_, ()>,
+    legacy: &[&str],
+    edit: LegacyEdit,
+    v8: V8Edit,
+) -> Response {
+    let original = match std::fs::read_to_string(&state.path) {
+        Ok(v) => v,
+        Err(_) => return error(500, "read_failed"),
+    };
+    // Go's saver works on the alias- and merge-expanded root mapping (`flattenV8`).
+    let mut root: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&original) {
+        Ok(v) => v,
+        Err(e) => return invalid_config(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    if let Err(e) = cpa_core::config::expand_merges(&mut root) {
+        return invalid_config(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if !root.is_mapping() {
+        return invalid_config(StatusCode::INTERNAL_SERVER_ERROR, "expected root mapping node");
+    }
+    if cpa_core::config::is_v8_layout(&root) {
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut slot = AFTER_LAYOUT.lock().unwrap_or_else(PoisonError::into_inner);
+                match slot.as_ref() {
+                    Some((path, _)) if *path == state.path => slot.take(),
+                    _ => None,
+                }
+            };
+            if let Some((_, hook)) = hook {
+                hook();
+            }
+        }
+        return match v8.value {
+            Some(value) => config_sync_locked(state, v8.path, Method::PUT, &[], Ok(value.to_string().as_bytes()), true),
+            None => config_sync_locked(state, v8.path, Method::DELETE, &[], Ok(b""), true),
+        };
+    }
+    let mut doc = ConfigDocument::unmigrated(root);
+    match edit {
+        LegacyEdit::Set(value) => {
+            let value = match serde_yaml_ng::to_value(value) {
+                Ok(v) => v,
+                Err(e) => return invalid_config(StatusCode::BAD_REQUEST, e),
+            };
+            if doc.update(legacy, value, false).is_err() {
+                return error(400, "invalid_path");
+            }
+        }
+        LegacyEdit::Delete => {
+            doc.delete(legacy);
+        }
+        LegacyEdit::Keep => {}
+    }
+    // Go saves its in-memory config, whose key is hashed on load; a plaintext key
+    // edited into the file since must not be published.
+    let parsed = match doc.yaml().and_then(|t| Config::parse(&t)) {
+        Ok(v) => v,
+        Err(e) => return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
+    if let Some(response) = hash_secret(
+        &mut doc,
+        &["remote-management", "secret-key"],
+        &parsed.management.secret_key,
+    ) {
+        return response;
+    }
+    let text = match doc.render_preserving(&original) {
+        Ok(v) => v,
+        Err(e) => return invalid_config(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let cfg = match Config::parse(&text) {
+        Ok(v) => v,
+        Err(e) => return invalid_config(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
+    if let Err(e) = ConfigDocument::write(&state.path, &text) {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "write_failed", "message": e.to_string()}),
+        );
+    }
+    state.publish(cfg, None);
+    json(StatusCode::OK, &json!({"status": "ok"}))
+}
+
+/// Go `liveAuthIndexFromManager`: the index each config-backed credential carries.
+fn live_auth_indexes(state: &Management) -> std::collections::HashMap<String, String> {
+    state
+        .rt
+        .store()
+        .snapshot()
+        .iter()
+        .filter(|c| matches!(c.source, Source::Config { .. }))
+        .map(|c| (c.id.clone(), credentials::auth_index(c)))
+        .collect()
+}
+
+/// Go `configV8ETag(ComputeSourceHash(raw))`: a strong tag of the file's SHA-256.
+fn config_etag(raw: &[u8]) -> HeaderValue {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(raw).iter().map(|b| format!("{b:02x}")).collect();
+    HeaderValue::try_from(format!("\"{hex}\"")).expect("hex is a valid header value")
+}
+
+/// Go `ifMatchSatisfied`: RFC 9110 strong comparison over every `If-Match` line as one
+/// list. Absent passes, blank fails, a whole-field `*` matches any version, and weak
+/// or malformed tags never match. A comma inside a quoted tag is not a separator.
+fn if_match_satisfied(values: &[String], etag: &HeaderValue) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    // `strings.TrimSpace`: Unicode white space too.
+    let trim = |s: &[u8]| cpa_common::gostr::trim_space(s).to_vec();
+    let field = trim(values.join(",").as_bytes());
+    if field == b"*" {
+        return true;
+    }
+    let mut quoted = false;
+    field
+        .split(|&c| {
+            quoted ^= c == b'"';
+            c == b',' && !quoted
+        })
+        .any(|tag| trim(tag) == etag.as_bytes())
 }
 
 async fn legacy_yaml(State(state): State<Arc<Management>>) -> Response {

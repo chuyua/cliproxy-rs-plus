@@ -7,6 +7,7 @@
 //! clients send binary parts. Field and file order follow first appearance, one of the
 //! orders Go's map iteration can produce.
 
+use cpa_common::gostr::quote;
 use std::collections::BTreeMap;
 
 /// One parsed form part.
@@ -146,8 +147,8 @@ fn decode_2231(v: &str) -> Option<Vec<u8>> {
 /// Outcome of `mime.ParseMediaType`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaType {
-    /// No usable media type.
-    Invalid,
+    /// No usable media type, with Go's error text.
+    Invalid(&'static str),
     /// The media type parsed but its parameters did not (Go returns the type and an error).
     BadParams(String),
     Ok(String, BTreeMap<String, String>),
@@ -156,15 +157,22 @@ pub enum MediaType {
 pub fn parse_media_type(v: &str) -> MediaType {
     let base = v.split(';').next().unwrap_or_default();
     let media = base.to_ascii_lowercase().trim().to_owned();
+    // Go `checkMediaTypeDisposition`.
     let (main, rest) = consume_token(&media);
-    let valid_type = !main.is_empty()
-        && (rest.is_empty()
-            || rest.strip_prefix('/').is_some_and(|r| {
-                let (sub, tail) = consume_token(r);
-                !sub.is_empty() && tail.is_empty()
-            }));
-    if !valid_type {
-        return MediaType::Invalid;
+    if main.is_empty() {
+        return MediaType::Invalid("mime: no media type");
+    }
+    if !rest.is_empty() {
+        let Some(rest) = rest.strip_prefix('/') else {
+            return MediaType::Invalid("mime: expected slash after first token");
+        };
+        let (sub, tail) = consume_token(rest);
+        if sub.is_empty() {
+            return MediaType::Invalid("mime: expected token after slash");
+        }
+        if !tail.is_empty() {
+            return MediaType::Invalid("mime: unexpected content after media subtype");
+        }
     }
     let mut params = BTreeMap::new();
     let mut continuation: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -185,7 +193,7 @@ pub fn parse_media_type(v: &str) -> MediaType {
             None => &mut params,
         };
         if map.get(&key).is_some_and(|existing| *existing != value) {
-            return MediaType::Invalid;
+            return MediaType::Invalid("mime: duplicate parameter name");
         }
         map.insert(key, value);
         v = rest;
@@ -333,10 +341,7 @@ impl Reader<'_> {
                 return Ok(None);
             }
             if expect_new {
-                return Err(format!(
-                    "multipart: expecting a new Part; got line {:?}",
-                    String::from_utf8_lossy(&line)
-                ));
+                return Err(format!("multipart: expecting a new Part; got line {}", quote(&line)));
             }
             if self.parts_read == 0 {
                 continue;
@@ -345,16 +350,14 @@ impl Reader<'_> {
                 expect_new = true;
                 continue;
             }
-            return Err(format!(
-                "multipart: unexpected line in Next(): {:?}",
-                String::from_utf8_lossy(&line)
-            ));
+            return Err(format!("multipart: unexpected line in Next(): {}", quote(&line)));
         }
     }
 
     /// `textproto.ReadMIMEHeader`, then the body up to the next boundary.
     fn part(&mut self) -> Result<Part, String> {
-        let malformed = |line: &[u8]| format!("malformed MIME header line: {}", String::from_utf8_lossy(line));
+        // Go 1.26.4, v8.0.35's release toolchain, quotes these lines with %q.
+        let malformed = |line: &[u8]| format!("malformed MIME header line: {}", quote(line));
         let mut headers: Vec<(String, String)> = Vec::new();
         let mut first = true;
         loop {
@@ -362,10 +365,7 @@ impl Reader<'_> {
             let line = raw.strip_suffix(b"\n").unwrap_or(&raw);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if first && matches!(line.first(), Some(b' ' | b'\t')) {
-                return Err(format!(
-                    "malformed MIME header initial line: {}",
-                    String::from_utf8_lossy(line)
-                ));
+                return Err(format!("malformed MIME header initial line: {}", quote(line)));
             }
             first = false;
             if line.is_empty() {
@@ -387,7 +387,7 @@ impl Reader<'_> {
                 }
             }
             let Some(colon) = trimmed.iter().position(|b| *b == b':') else {
-                return Err(malformed(trimmed));
+                return Err(format!("malformed MIME header: missing colon: {}", quote(line)));
             };
             let (key, value) = (&trimmed[..colon], &trimmed[colon + 1..]);
             // canonicalMIMEHeaderKey: token bytes are canonicalized; keys with spaces are
@@ -421,7 +421,7 @@ impl Reader<'_> {
         let (kind, params) = match parse_media_type(disposition) {
             MediaType::Ok(kind, params) => (kind, params),
             MediaType::BadParams(kind) => (kind, BTreeMap::new()),
-            MediaType::Invalid => (String::new(), BTreeMap::new()),
+            MediaType::Invalid(_) => (String::new(), BTreeMap::new()),
         };
         let name = if kind == "form-data" {
             params.get("name").cloned().unwrap_or_default()
@@ -668,6 +668,41 @@ mod tests {
         assert!(form(bad).is_err());
         let split = b"--b\r\nContent-Disposition: form-data; name=\"image\"; filename*0*=utf-8''%C3; filename*1*=%A9.png\r\n\r\nx\r\n--b--\r\n";
         assert_eq!(form(split).unwrap().files("image")[0].filename, "\u{e9}.png");
+    }
+
+    /// Go 1.26.4 `ReadForm` errors (v8.0.35's release toolchain quotes header lines).
+    #[test]
+    fn header_errors_read_as_go_prints_them() {
+        let cases: [(&[u8], &str); 5] = [
+            (
+                b"--b\r\n X: y\r\n\r\nv\r\n--b--\r\n",
+                r#"malformed MIME header initial line: " X: y""#,
+            ),
+            (
+                b"--b\r\nNoColon\r\n\r\nv\r\n--b--\r\n",
+                r#"malformed MIME header: missing colon: "NoColon""#,
+            ),
+            (
+                b"--b\r\nX: a\x01\xff\xc3\xa9\r\n\r\nv\r\n--b--\r\n",
+                "malformed MIME header line: \"X: a\\x01\\xff\u{e9}\"",
+            ),
+            (
+                b"--b\r\nBad(Key): x\r\n\r\nv\r\n--b--\r\n",
+                r#"malformed MIME header line: "Bad(Key): x""#,
+            ),
+            (
+                b"--b\r\n\r\nv\r\n--b\r\njunk\r\n",
+                r#"malformed MIME header: missing colon: "junk""#,
+            ),
+        ];
+        for (body, want) in cases {
+            assert_eq!(
+                form(body).err().as_deref(),
+                Some(want),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

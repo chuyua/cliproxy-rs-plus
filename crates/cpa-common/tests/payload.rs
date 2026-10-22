@@ -98,3 +98,30 @@ fn custom_headers_match_go() {
         assert_eq!(got, expected, "{name}");
     }
 }
+
+/// Go `payloadModelCandidates` dedups by `strings.ToLower`, and model patterns match
+/// case-sensitively: final sigma stays a separate candidate, while İ lowers to i.
+#[test]
+fn model_candidates_dedup_on_go_lowercase() {
+    let cfg = Config::parse(
+        "payload:\n  override:\n    - models: [{name: \"ς\"}, {name: \"i\"}]\n      params: {hit: true}\n",
+    )
+    .unwrap();
+    let rules = payload::Rules::of(&cfg);
+    let run = |model: &str, requested: &str| {
+        let req = payload::Request {
+            target_executor: "openai-compatibility",
+            model,
+            requested_model: requested,
+            protocol: "openai",
+            from_protocol: "openai",
+            root: "",
+            original: b"",
+            request_path: "/v1/chat/completions",
+            headers: None,
+        };
+        String::from_utf8(payload::apply(&rules, &req, b"{}".to_vec())).unwrap()
+    };
+    assert_eq!(run("σ", "ς"), r#"{"hit":true}"#, "σ and ς are distinct candidates");
+    assert_eq!(run("İ", "i"), "{}", "i collapses into İ");
+}

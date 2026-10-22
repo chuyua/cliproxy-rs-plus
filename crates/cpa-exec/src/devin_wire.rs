@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use bytes::{Bytes, BytesMut};
 use cpa_core::exec::ExecError;
+use cpa_core::gostr::GoStr;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
@@ -595,7 +596,6 @@ pub(crate) fn replace_all(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 }
 
 fn eq_fold(a: &[u8], b: &str) -> bool {
-    use cpa_common::gostr::GoStr;
     String::from_utf8_lossy(a).go_eq_fold(b)
 }
 
@@ -627,7 +627,9 @@ pub(crate) fn sanitize_tool_description(name: &[u8], description: &[u8]) -> Vec<
     if description.is_empty() {
         return Vec::new();
     }
-    let lower = String::from_utf8_lossy(cpa_common::gostr::trim_space(name)).to_lowercase();
+    let lower = String::from_utf8_lossy(cpa_common::gostr::trim_space(name))
+        .as_ref()
+        .go_lower();
     let mut desc = description.to_vec();
     if lower == "exec_command" || lower.ends_with("__exec_command") {
         desc = if contains(&desc, EXEC_OBFUSCATED) {
@@ -1124,7 +1126,7 @@ pub(crate) fn parse_dimension_groups(groups: &[Vec<u8>]) -> Option<(i64, i64, i6
             }
             _ => {}
         });
-        if String::from_utf8_lossy(title).to_lowercase() == "token usage" {
+        if String::from_utf8_lossy(title).go_eq_fold("Token Usage") {
             for (key, value) in &metrics {
                 match key.as_slice() {
                     b"input_tokens" => {
@@ -1160,7 +1162,6 @@ fn go_json_string(value: &cpa_common::json::Res<'_>) -> String {
 /// field names match case-insensitively (Go's fold), duplicates decode in order into the
 /// same struct, and any type mismatch makes the whole decode an error (`None`).
 fn decode_trailer(payload: &[u8]) -> Option<(String, String)> {
-    use cpa_common::gostr::GoStr;
     use cpa_common::json::{self as gj, Kind};
     if !gj::std_valid(payload) {
         return None;
@@ -1211,7 +1212,6 @@ fn decode_trailer(payload: &[u8]) -> Option<(String, String)> {
 /// `ParseDevinTrailerError`: the HTTP status and message of an EOS trailer error;
 /// `None` for a clean end.
 pub(crate) fn parse_trailer_error(payload: &[u8]) -> Option<(u16, String)> {
-    use cpa_common::gostr::GoStr;
     let trimmed = cpa_common::gostr::trim_space(payload);
     if trimmed.is_empty() || trimmed == b"{}" {
         return None;

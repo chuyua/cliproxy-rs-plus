@@ -84,10 +84,10 @@
   "status": 404
  },
  "DELETE /v0/management/plugins/:id/quota": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0099",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "DELETE /v0/management/proxy-url": {
   "body": "{\"status\":\"ok\"}",
@@ -138,10 +138,10 @@
   "status": 404
  },
  "DELETE /v8/management/plugins/:id/quota": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0082",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "GET /": {
   "body": "{\"endpoints\":[\"POST /v1/chat/completions\",\"POST /v1/completions\",\"GET /v1/models",
@@ -210,16 +210,16 @@
   "status": 401
  },
  "GET /v0/management/anthropic-auth-url": {
-  "body": "{\"state\":\"a04d2cf1d9fff502fef5bde8fa3ece3e\",\"status\":\"ok\",\"url\":\"https://claude.",
+  "body": "{\"state\":\"e5e1c3b5d36a45dbaa19af896bd8c33e\",\"status\":\"ok\",\"url\":\"https://claude.",
   "id": "M5-0217",
   "routed": true,
   "status": 200
  },
  "GET /v0/management/antigravity-auth-url": {
-  "body": "{\"error\":\"provider_not_found\"}",
+  "body": "{\"state\":\"79f8ff93d66f9ecb5d542c815b26d876\",\"status\":\"ok\",\"url\":\"https://account",
   "id": "M5-0219",
   "routed": true,
-  "status": 404
+  "status": 200
  },
  "GET /v0/management/api-key-usage": {
   "body": "{}",
@@ -234,7 +234,7 @@
   "status": 200
  },
  "GET /v0/management/auth-files": {
-  "body": "{\"files\":[],\"observed_at\":\"2026-10-03T16:49:45.97729455Z\"}",
+  "body": "{\"files\":[],\"observed_at\":\"2026-10-20T23:58:10.535294495Z\"}",
   "id": "M5-0207",
   "routed": true,
   "status": 200
@@ -264,7 +264,7 @@
   "status": 200
  },
  "GET /v0/management/codex-auth-url": {
-  "body": "{\"state\":\"9eafd43880c88e2758112ce6f294dbcc\",\"status\":\"ok\",\"url\":\"https://auth.op",
+  "body": "{\"state\":\"087b107dac8e3692e6d325ae08363fc4\",\"status\":\"ok\",\"url\":\"https://auth.op",
   "id": "M5-0218",
   "routed": true,
   "status": 200
@@ -276,7 +276,7 @@
   "status": 200
  },
  "GET /v0/management/config.yaml": {
-  "body": "host: 127.0.0.1\nport: 58747\nauth-dir: /tmp/parity-probe-tdem9u9k/auth\napi-keys:\n",
+  "body": "host: 127.0.0.1\nport: 49771\nauth-dir: /tmp/parity-probe-lei_krql/auth\napi-keys:\n",
   "id": "M5-0086",
   "routed": true,
   "status": 200
@@ -288,7 +288,7 @@
   "status": 200
  },
  "GET /v0/management/devin-auth-url": {
-  "body": "{\"state\":\"3fdf9510933ef442ed2e78fd9d99a175\",\"status\":\"ok\",\"url\":\"https://app.dev",
+  "body": "{\"state\":\"f1c52b84a89e9fd4d69fc0f304b75bc6\",\"status\":\"ok\",\"url\":\"https://app.dev",
   "id": "M5-0223",
   "routed": true,
   "status": 200
@@ -336,7 +336,7 @@
   "status": 500
  },
  "GET /v0/management/latest-version": {
-  "body": "{\"error\":\"request_failed\",\"message\":\"no release repository is configured\"}",
+  "body": "{\"error\":\"request_failed\",\"message\":\"Could not check the latest release.\"}",
   "id": "M5-0088",
   "routed": true,
   "status": 502
@@ -420,10 +420,10 @@
   "status": 200
  },
  "GET /v0/management/plugin-store": {
-  "body": "",
+  "body": "{\"error\":\"plugin_store_registry_failed\",\"message\":\"request https://raw.githubuse",
   "id": "M5-0090",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 502
  },
  "GET /v0/management/plugins": {
   "body": "{\"plugins_enabled\":false,\"plugins_dir\":\"plugins\",\"plugins\":[]}",
@@ -438,10 +438,10 @@
   "status": 404
  },
  "GET /v0/management/plugins/:id/quota": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0097",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "GET /v0/management/proxy-url": {
   "body": "{\"proxy-url\":\"\"}",
@@ -462,13 +462,13 @@
   "status": 200
  },
  "GET /v0/management/quota/providers": {
-  "body": "",
+  "body": "{\"providers\":[]}",
   "id": "M5-0128",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 200
  },
  "GET /v0/management/request-error-logs": {
-  "body": "{\"files\":[{\"name\":\"error-backend-api-codex-alpha-search-2026-10-03T164929-468b7f",
+  "body": "{\"files\":[{\"name\":\"error-backend-api-codex-alpha-search-2026-10-20T235754-67baac",
   "id": "M5-0147",
   "routed": true,
   "status": 200
@@ -551,6 +551,12 @@
   "routed": true,
   "status": 401
  },
+ "GET /v1/models/*model": {
+  "body": "",
+  "id": "M1-0128",
+  "routed": false,
+  "status": 404
+ },
  "GET /v1/realtime": {
   "body": "{\"error\":{\"code\":\"invalid_api_key\",\"message\":\"Invalid API key\",\"param\":null,\"typ",
   "id": "M5-0005",
@@ -600,7 +606,7 @@
   "status": 200
  },
  "GET /v8/management/config.yaml": {
-  "body": "access:\n  api-keys:\n    - probe-client-key\nserver:\n  host: 127.0.0.1\n  port: 587",
+  "body": "access:\n  api-keys:\n    - probe-client-key\nserver:\n  host: 127.0.0.1\n  port: 497",
   "id": "M5-0047",
   "routed": true,
   "status": 200
@@ -612,7 +618,7 @@
   "status": 404
  },
  "GET /v8/management/credentials": {
-  "body": "{\"files\":[],\"observed_at\":\"2026-10-03T16:49:33.175309994Z\"}",
+  "body": "{\"files\":[],\"observed_at\":\"2026-10-20T23:57:57.858930408Z\"}",
   "id": "M5-0064",
   "routed": true,
   "status": 200
@@ -654,7 +660,7 @@
   "status": 400
  },
  "GET /v8/management/observability/logs/errors": {
-  "body": "{\"files\":[{\"name\":\"error-backend-api-codex-alpha-search-2026-10-03T164929-468b7f",
+  "body": "{\"files\":[{\"name\":\"error-backend-api-codex-alpha-search-2026-10-20T235754-67baac",
   "id": "M5-0059",
   "routed": true,
   "status": 200
@@ -690,16 +696,16 @@
   "status": 200
  },
  "GET /v8/management/plugins/:id/quota": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0080",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "GET /v8/management/plugins/store": {
-  "body": "",
+  "body": "{\"error\":\"plugin_store_registry_failed\",\"message\":\"request https://raw.githubuse",
   "id": "M5-0078",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 502
  },
  "GET /v8/management/routing/model-definitions/:channel": {
   "body": "{\"channel\":\"probe\",\"error\":\"unknown channel\"}",
@@ -708,7 +714,7 @@
   "status": 400
  },
  "GET /v8/management/server/latest-version": {
-  "body": "{\"error\":\"request_failed\",\"message\":\"no release repository is configured\"}",
+  "body": "{\"error\":\"request_failed\",\"message\":\"Could not check the latest release.\"}",
   "id": "M5-0053",
   "routed": true,
   "status": 502
@@ -978,34 +984,34 @@
   "status": 400
  },
  "POST /v0/management/plugin-store/:id/install": {
-  "body": "",
+  "body": "{\"error\":\"plugin_store_registry_failed\",\"message\":\"request https://raw.githubuse",
   "id": "M5-0091",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 502
  },
  "POST /v0/management/plugins/:id/quota": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0098",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "POST /v0/management/plugins/:id/quota/reset": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0100",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "POST /v0/management/quota/fetch": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0129",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "POST /v0/management/quota/reset": {
-  "body": "",
+  "body": "{\"error\":\"auth_index is required\"}",
   "id": "M5-0130",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 400
  },
  "POST /v0/management/reset-quota": {
   "body": "{\"error\":\"auth_index is required\"}",
@@ -1014,14 +1020,20 @@
   "status": 400
  },
  "POST /v0/management/vertex/import": {
-  "body": "{\"error\":\"provider_not_found\"}",
+  "body": "{\"error\":\"file required\"}",
   "id": "M5-0216",
   "routed": true,
-  "status": 404
+  "status": 400
  },
  "POST /v1/alpha/search": {
   "body": "{\"error\":\"Invalid API key\"}",
   "id": "M3-0008",
+  "routed": true,
+  "status": 401
+ },
+ "POST /v1/audio/speech": {
+  "body": "{\"error\":\"Invalid API key\"}",
+  "id": "M3-0365",
   "routed": true,
   "status": 401
  },
@@ -1145,6 +1157,12 @@
   "routed": true,
   "status": 401
  },
+ "POST /v1/tts": {
+  "body": "{\"error\":\"Invalid API key\"}",
+  "id": "M3-0366",
+  "routed": true,
+  "status": 401
+ },
  "POST /v1/videos": {
   "body": "{\"error\":\"Invalid API key\"}",
   "id": "M3-0003",
@@ -1205,17 +1223,23 @@
   "routed": true,
   "status": 400
  },
- "POST /v8/management/plugins/:id/quota": {
+ "POST /v8/management/oauth/siwc/bind": {
   "body": "",
-  "id": "M5-0081",
+  "id": "M5-0304",
   "routed": false,
   "status": 404
  },
+ "POST /v8/management/plugins/:id/quota": {
+  "body": "{\"error\":\"auth_index is required\"}",
+  "id": "M5-0081",
+  "routed": true,
+  "status": 400
+ },
  "POST /v8/management/plugins/store/:id/install": {
-  "body": "",
+  "body": "{\"error\":\"plugin_store_registry_failed\",\"message\":\"request https://raw.githubuse",
   "id": "M5-0079",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 502
  },
  "POST /v8/management/requests/api-call": {
   "body": "{\"error\":\"missing method\"}",
@@ -1248,10 +1272,10 @@
   "status": 400
  },
  "PUT /v0/management/config.yaml": {
-  "body": "",
+  "body": "{\"changed\":[\"config\"],\"ok\":true}",
   "id": "M5-0087",
-  "routed": false,
-  "status": 404
+  "routed": true,
+  "status": 200
  },
  "PUT /v0/management/debug": {
   "body": "{\"error\":\"invalid body\"}",

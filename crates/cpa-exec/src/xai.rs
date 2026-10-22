@@ -332,17 +332,15 @@ async fn upstream_error(upstream: wire::Upstream, capture: &wire::Capture) -> Ex
 /// `sdktranslator.TranslateNonStream(to, responseFormat)`: identity without a pair. An
 /// empty or rejected translation is the apply_patch 502.
 fn translate_non_stream(req: &ExecRequest, p: &Prepared, to: Format, data: &[u8]) -> Result<Bytes, ExecError> {
+    let ctx = ResponseCtx {
+        model: &req.model,
+        original_request: &p.original_payload,
+        translated_request: &p.body,
+    };
     let out = match cpa_translate::pair(req.response_format, to) {
-        Some(pair) => (pair.non_stream)(
-            &ResponseCtx {
-                model: &req.model,
-                original_request: &p.original_payload,
-                translated_request: &p.body,
-            },
-            data,
-        )
-        .map_err(|_| apply_patch_error())?,
-        None => data.to_vec(),
+        Some(pair) => (pair.non_stream)(&ctx, data).map_err(|_| apply_patch_error())?,
+        None => cpa_translate::hooks::unregistered_non_stream(to.as_str(), req.response_format.as_str(), &ctx, data)
+            .unwrap_or_else(|| data.to_vec()),
     };
     if out.is_empty() {
         return Err(apply_patch_error());
@@ -714,25 +712,10 @@ impl XaiExecutor {
                 headers.set("x-idempotency-key", key);
             }
         }
-        let client = self.clients.for_credential(credential, cfg);
         let url = self.url(endpoint(&chat_base_url(credential), path));
-        let route = |_: &url::Url| {
-            Ok(crate::proxy::Route {
-                client: client.clone(),
-                order: None,
-            })
-        };
-        let capture = capture_request(req, credential, method.as_str(), &url, &headers, logged);
-        req.usage.round_trip_started();
-        let send = crate::proxy::send_request(&route, method, &url, headers, body.map(Bytes::from), None);
-        let upstream = fail_if_canceled(&req.usage, send).await;
-        capture.sent(&upstream);
-        let upstream = track_first_byte(upstream?, &req.usage);
-        let status = upstream.status;
-        let headers = upstream.headers.clone();
-        let data = fail_if_canceled(&req.usage, wire::read_all(upstream)).await;
-        capture.read(&data);
-        let data = data?;
+        let (status, headers, data) = self
+            .send_buffered(credential, req, cfg, method, &url, headers, body, logged)
+            .await?;
         if !(200..300).contains(&status) {
             let mut error = response::status_error(status, &data);
             error.headers = Box::new(headers);
@@ -749,6 +732,153 @@ impl XaiExecutor {
             body: ResponseBody::Buffered(data),
         })
     }
+}
+
+impl XaiExecutor {
+    /// One request whose whole response body is read: captured, timed and canceled like
+    /// every xAI call. `logged` is what the capture records as the body.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_buffered(
+        &self,
+        credential: &Credential,
+        req: &ExecRequest,
+        cfg: &Config,
+        method: wreq::Method,
+        url: &str,
+        headers: GoHeaders,
+        body: Option<Vec<u8>>,
+        logged: &[u8],
+    ) -> Result<(u16, HeaderMap, Bytes), ExecError> {
+        let client = self.clients.for_credential(credential, cfg);
+        let route = |_: &url::Url| {
+            Ok(crate::proxy::Route {
+                client: client.clone(),
+                order: None,
+            })
+        };
+        let capture = capture_request(req, credential, method.as_str(), url, &headers, logged);
+        req.usage.round_trip_started();
+        let send = crate::proxy::send_request(&route, method, url, headers, body.map(Bytes::from), None);
+        let upstream = fail_if_canceled(&req.usage, send).await;
+        capture.sent(&upstream);
+        let upstream = track_first_byte(upstream?, &req.usage);
+        let status = upstream.status;
+        let headers = upstream.headers.clone();
+        let data = fail_if_canceled(&req.usage, wire::read_all(upstream)).await;
+        capture.read(&data);
+        Ok((status, headers, data?))
+    }
+
+    /// `executeSpeech`: the speech handler's JSON to `/tts` on the compact base URL (the
+    /// official API unless a custom non-chat-proxy base URL is set; the chat proxy does
+    /// not serve `/tts`, `xaiSpeechRequestURL`), with payload rules for the
+    /// `openai` protocol. The raw audio comes back with the upstream headers.
+    pub async fn speech(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        let cfg = scoped(credential, cfg);
+        let mut model = text(&gj::get(&req.body, "model"));
+        if model.is_empty() {
+            model = req.model.trim().to_owned();
+        }
+        let payload = cpa_common::payload::apply(
+            &cpa_common::payload::Rules::of(cfg.as_ref()),
+            &cpa_common::payload::Request {
+                target_executor: PROVIDER,
+                model: &model,
+                requested_model: request::requested_model(&req),
+                protocol: "openai",
+                from_protocol: SPEECH_SOURCE,
+                root: "",
+                original: &req.body,
+                request_path: &req.request_path,
+                headers: Some(&req.headers),
+            },
+            req.body.to_vec(),
+        );
+        let (token, _) = creds(credential);
+        let mut headers = plain_headers(credential, &token, false, "", &req);
+        // Official TTS answers with raw audio; the media default asks for JSON.
+        headers.set("Accept", "*/*");
+        let url = self.url(endpoint(&compact_base_url(credential), "/tts"));
+        let (status, headers, data) = self
+            .send_buffered(
+                credential,
+                &req,
+                cfg.as_ref(),
+                wreq::Method::POST,
+                &url,
+                headers,
+                Some(payload.clone()),
+                &payload,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            let mut error = response::status_error(status, &data);
+            if error.status == 404 && !speech_model_unavailable(&data) {
+                // Go's `xaiSpeechRequestError` (an unknown voice, say): neither rotated nor
+                // cooled. A request scope without upstream headers is the explicit marker
+                // (classify::explicit_request_scoped); Go's xAI status errors carry none.
+                error.scope = FailureScope::Request;
+            } else {
+                error.headers = Box::new(headers);
+            }
+            return Err(error);
+        }
+        // `EnsurePublished`: one record without usage; the audio is never parsed.
+        req.usage.publish();
+        Ok(ExecResponse {
+            status: 200,
+            headers,
+            body: ResponseBody::Buffered(data),
+        })
+    }
+}
+
+/// Go's `openai-speech` handler type, the speech request's source format.
+const SPEECH_SOURCE: &str = "openai-speech";
+
+/// `xaiSpeechModelUnavailablePatterns`: the auth manager's model-support phrases.
+const SPEECH_MODEL_UNAVAILABLE: [&str; 12] = [
+    "model_not_found",
+    "model_not_supported",
+    "model is not supported",
+    "model is unsupported",
+    "model not supported",
+    "unsupported model",
+    "model is not available",
+    "model not available",
+    "model is unavailable",
+    "model unavailable",
+    "not available for your plan",
+    "not available for your account",
+];
+
+/// `xaiSpeechModelUnavailable`: the error body says the speech model itself is missing,
+/// unsupported or unavailable, rather than a request value being wrong.
+fn speech_model_unavailable(body: &[u8]) -> bool {
+    let names = |text: &str| {
+        let lower = text.go_lower();
+        SPEECH_MODEL_UNAVAILABLE.iter().any(|p| lower.contains(p))
+    };
+    if !gj::valid(body) {
+        return names(&String::from_utf8_lossy(body));
+    }
+    [
+        "code",
+        "error.code",
+        "type",
+        "error.type",
+        "error",
+        "error.message",
+        "message",
+        "detail",
+    ]
+    .iter()
+    .any(|path| names(&gj::get(body, path).str()))
 }
 
 /// The Execute scan over a buffered SSE body: the first completed or incomplete
@@ -843,11 +973,15 @@ struct Pipeline {
 impl Pipeline {
     fn new(req: &ExecRequest, p: Prepared, store: Arc<replay::Store>, capture: wire::Capture) -> Self {
         let translator: Box<dyn StreamTranslator> = match cpa_translate::pair(req.response_format, Format::Codex) {
-            Some(pair) => (pair.stream)(&ResponseCtx {
-                model: &req.model,
-                original_request: &p.original_payload,
-                translated_request: &p.body,
-            }),
+            Some(pair) => crate::translate::stream(
+                pair,
+                &ResponseCtx {
+                    model: &req.model,
+                    original_request: &p.original_payload,
+                    translated_request: &p.body,
+                },
+                req,
+            ),
             None => Box::new(Identity),
         };
         let original = Bytes::from(p.original_payload.clone());

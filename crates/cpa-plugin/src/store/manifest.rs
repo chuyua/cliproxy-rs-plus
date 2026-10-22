@@ -1,6 +1,7 @@
 //! Store manifests (internal/pluginstore/manifest.go): what an installed plugin
 //! records under `plugins.configs.<id>.store`, and the Home sync manifests.
 
+use cpa_core::gostr::GoStr;
 use serde_yaml_ng::{Mapping, Value as Yaml};
 
 use super::client::Release;
@@ -225,7 +226,7 @@ impl Manifest {
 
     /// Go `Manifest.InstallType`.
     pub fn install_type(&self) -> String {
-        match self.install.install_type.trim().to_lowercase() {
+        match self.install.install_type.trim().go_lower() {
             t if t.is_empty() => INSTALL_TYPE_GITHUB_RELEASE.into(),
             t => t,
         }

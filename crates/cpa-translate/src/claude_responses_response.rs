@@ -27,7 +27,7 @@ pub static PAIR: Registered = registered!(
 );
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(crate::claude_responses::convert(ctx.model, body, ctx.stream, false))
+    crate::claude_responses::convert(ctx.model, body, ctx.stream, false)
 }
 
 struct Winner {
@@ -193,12 +193,26 @@ impl Usage {
     }
 }
 
-fn incomplete(stop: &[u8]) -> bool {
-    trim_space(stop).eq_ignore_ascii_case(b"max_tokens")
+/// Go `claudeResponsesIncompleteDetails`: `pause_turn` (a server-tool
+/// iteration pause) is unfinished too, but Responses has no matching reason,
+/// so its details stay null.
+fn incomplete_details(stop: &[u8]) -> Option<&'static str> {
+    let stop = trim_space(stop);
+    if stop.eq_ignore_ascii_case(b"max_tokens") {
+        Some(r#"{"reason":"max_output_tokens"}"#)
+    } else if stop.eq_ignore_ascii_case(b"pause_turn") {
+        Some("null")
+    } else {
+        None
+    }
 }
 
 fn output_status(stop: &[u8]) -> &'static str {
-    if incomplete(stop) { "incomplete" } else { "completed" }
+    if incomplete_details(stop).is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    }
 }
 
 fn web_search_query(input: &[u8]) -> Vec<u8> {
@@ -1191,7 +1205,8 @@ impl State {
                 out.extend(self.finalize_web_search(i, status));
             }
         }
-        let event_type = if incomplete(&self.stop_reason) {
+        let details = incomplete_details(&self.stop_reason);
+        let event_type = if details.is_some() {
             "response.incomplete"
         } else {
             "response.completed"
@@ -1203,12 +1218,8 @@ impl State {
         gj::set_str(&mut completed, "response.id", &self.response_id);
         gj::set_int(&mut completed, "response.created_at", self.created_at);
         gj::set_str(&mut completed, "response.status", status);
-        if incomplete(&self.stop_reason) {
-            gj::set_raw(
-                &mut completed,
-                "response.incomplete_details",
-                r#"{"reason":"max_output_tokens"}"#,
-            );
+        if let Some(details) = details {
+            gj::set_raw(&mut completed, "response.incomplete_details", details);
         }
         copy_request_fields(&mut completed, &self.request, "response.", Echo::default());
         let mut outputs = br#"{"arr":[]}"#.to_vec();
@@ -1462,6 +1473,8 @@ struct OutputItem {
 /// call is an error carrying Go's upstream message (Go's executors answer 502 and drop
 /// the body).
 pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+    let (body, native_model) = common::claude_messages_json_to_sse(body);
+    let body = &*body;
     let request = pick_request(ctx.original_request, ctx.translated_request);
     let tools = Tools::new(request);
     let mut out = br#"{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null,"output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{},"total_tokens":0}}"#.to_vec();
@@ -1664,10 +1677,14 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
     gj::set_str(&mut out, "id", &response_id);
     gj::set_int(&mut out, "created_at", created_at);
     gj::set_str(&mut out, "status", status);
-    if incomplete(&stop) {
-        gj::set_raw(&mut out, "incomplete_details", r#"{"reason":"max_output_tokens"}"#);
+    if let Some(details) = incomplete_details(&stop) {
+        gj::set_raw(&mut out, "incomplete_details", details);
     }
     copy_request_fields(&mut out, request, "", Echo::default());
+    // A native response's model is authoritative.
+    if !native_model.is_empty() {
+        gj::set_str(&mut out, "model", &native_model);
+    }
     let mut outputs = vec![];
     let count = items.len();
     for (i, it) in items.iter().enumerate() {

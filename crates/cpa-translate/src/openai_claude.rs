@@ -3,9 +3,10 @@
 
 use crate::{
     Error, Registered, RequestCtx,
-    common::{self, go_lower, trim_space},
+    common::{self, UserTurnDrops, go_lower, trim_space},
     openai_claude_response as response,
 };
+use base64::Engine as _;
 use cpa_common::json::{self as gj, AnyValue, Kind, Res};
 use std::collections::HashMap;
 
@@ -23,20 +24,21 @@ pub(crate) fn claude_input_tokens(count: i64) -> Vec<u8> {
 }
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, ctx.stream, false))
+    convert(ctx.model, body, ctx.stream, false)
 }
 
 /// ConvertClaudeRequestToOpenAIWithCompat: configured compatibility endpoints keep
 /// assistant thinking text even without a GPT-compatible signature.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, ctx.stream, true))
+    convert(ctx.model, body, ctx.stream, true)
 }
 
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &[u8] =
     b"[Tool returned image content; the images follow in the next user message.]";
 const TOOL_RESULT_IMAGE_RELAY_NOTICE: &[u8] = b"Images returned by the preceding tool call(s):";
 
-fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Vec<u8> {
+/// A user turn left empty because its only attachment cannot be sent is refused.
+fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Result<Vec<u8>, Error> {
     let mut out = br#"{"model":"","messages":[]}"#.to_vec();
     let root = gj::parse(raw);
     gj::set_str(&mut out, "model", model);
@@ -87,6 +89,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
     }
 
     let messages = root.get("messages");
+    let mut drops = UserTurnDrops::default();
     if messages.is_array() {
         let mut turns = Turns {
             preserve_thinking,
@@ -97,6 +100,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
             true
         });
         items.append(&mut turns.reminders);
+        drops = turns.drops;
     }
     if !items.is_empty() {
         let items = common::align_openai_tool_call_messages(items);
@@ -161,7 +165,8 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
     if user.exists() {
         gj::set_str(&mut out, "user", user.bytes());
     }
-    out
+    drops.result()?;
+    Ok(out)
 }
 
 /// Claude `thinking` (with `output_config.effort`) -> `reasoning_effort`.
@@ -214,6 +219,7 @@ struct Turns {
     pending_tool_uses: Vec<Vec<u8>>,
     reminders: Vec<Vec<u8>>,
     tool_names: HashMap<Vec<u8>, Vec<u8>>,
+    drops: UserTurnDrops,
 }
 
 impl Turns {
@@ -270,7 +276,13 @@ impl Turns {
                         reasoning.push(text);
                     }
                 }
-                b"text" | b"image" => content_items.extend(content_part(part)),
+                kind @ (b"text" | b"image" | b"document" | b"container_upload") => match content_part(part) {
+                    Some(item) => content_items.push(item),
+                    None if role == b"user" && kind != b"text" => {
+                        self.drops.drop_part(&String::from_utf8_lossy(kind));
+                    }
+                    None => {}
+                },
                 b"tool_use" if assistant => {
                     let id = part.get("id").bytes().into_owned();
                     let name = part.get("name").bytes().into_owned();
@@ -304,6 +316,9 @@ impl Turns {
             }
         }
 
+        if role == b"user" {
+            self.drops.end_turn(content_items.len() + tool_results.len());
+        }
         let has_content = !content_items.is_empty();
         let reasoning = reasoning.join(&b"\n\n"[..]);
         if preceding_calls_pending && tool_results.is_empty() {
@@ -415,8 +430,32 @@ fn content_part(part: &Res<'_>) -> Option<Vec<u8>> {
             gj::set_str(&mut item, "image_url.url", url);
             Some(item)
         }
+        b"document" | b"container_upload" => file_part(part),
         _ => None,
     }
+}
+
+/// convertClaudeFilePartToOpenAI: an OpenAI file part for inline base64 bytes. A file
+/// id carries none, so it stays unconverted and the caller reports it.
+fn file_part(part: &Res<'_>) -> Option<Vec<u8>> {
+    let source = part.get("source");
+    if &*source.get("type").bytes() != b"base64" {
+        return None;
+    }
+    let data = crate::gemini_responses::go_base64_decode(trim_space(&source.get("data").bytes()), true)?;
+    if data.is_empty() {
+        return None;
+    }
+    let mut media = source.get("media_type").bytes().into_owned();
+    if media.is_empty() {
+        media = b"application/octet-stream".to_vec();
+    }
+    let mut url = [&b"data:"[..], &media, b";base64,"].concat();
+    url.extend_from_slice(crate::gemini_responses::go_base64(true).encode(&data).as_bytes());
+    let mut item = br#"{"type":"file","file":{"filename":"","file_data":""}}"#.to_vec();
+    gj::set_str(&mut item, "file.filename", part.get("filename").bytes());
+    gj::set_str(&mut item, "file.file_data", url);
+    Some(item)
 }
 
 /// convertClaudeToolResultContent: the tool message text plus images to relay.

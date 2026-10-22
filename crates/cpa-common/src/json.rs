@@ -2878,51 +2878,190 @@ pub enum GoValue {
     Object(std::collections::BTreeMap<String, GoValue>),
 }
 
+/// Drops children on a heap stack: a derived drop recurses once per nesting level, which
+/// a document at encoding/json's depth limit turns into a native stack overflow.
+impl Drop for GoValue {
+    fn drop(&mut self) {
+        let mut pending: Vec<GoValue> = match self {
+            Self::Array(items) if !items.is_empty() => std::mem::take(items),
+            Self::Object(map) if !map.is_empty() => std::mem::take(map).into_values().collect(),
+            _ => return,
+        };
+        while let Some(mut value) = pending.pop() {
+            match &mut value {
+                Self::Array(items) => pending.append(items),
+                Self::Object(map) => pending.extend(std::mem::take(map).into_values()),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl GoValue {
-    /// `Decoder.UseNumber()` then decode: numbers keep their literal text.
+    /// The map of an object, or the value itself (values implement `Drop`, so they cannot
+    /// be destructured by move).
+    pub fn into_object(mut self) -> Result<std::collections::BTreeMap<String, GoValue>, Self> {
+        match &mut self {
+            Self::Object(map) => Ok(std::mem::take(map)),
+            _ => Err(self),
+        }
+    }
+
+    /// The items of an array, or the value itself.
+    pub fn into_array(mut self) -> Result<Vec<GoValue>, Self> {
+        match &mut self {
+            Self::Array(items) => Ok(std::mem::take(items)),
+            _ => Err(self),
+        }
+    }
+
+    /// Calls `visit` on every value, each before its children, on a heap stack. `visit`
+    /// may edit the value it gets, removing children included; the children left are
+    /// visited next.
+    pub fn visit_mut(&mut self, mut visit: impl FnMut(&mut GoValue)) {
+        let mut stack = vec![self];
+        while let Some(value) = stack.pop() {
+            visit(value);
+            match value {
+                Self::Array(items) => stack.extend(items.iter_mut()),
+                Self::Object(map) => stack.extend(map.values_mut()),
+                _ => {}
+            }
+        }
+    }
+
+    /// `Decoder.UseNumber()` then decode: numbers keep their literal text. `None` when
+    /// encoding/json rejects the text, including nesting deeper than 10000.
     pub fn parse(text: &[u8]) -> Option<Self> {
-        valid(text).then(|| Self::from_res(&parse(text), false))?
+        Self::decode(text, false)
     }
 
     /// `json.Unmarshal(text, &any)`: numbers become float64, so `1e3` marshals as `1000`.
     /// `None` when the text is invalid or a number overflows float64.
     pub fn parse_f64(text: &[u8]) -> Option<Self> {
-        valid(text).then(|| Self::from_res(&parse(text), true))?
+        Self::decode(text, true)
     }
 
-    fn from_res(r: &Res<'_>, float: bool) -> Option<Self> {
-        Some(match r.kind {
-            Kind::Null => Self::Null,
-            Kind::True => Self::Bool(true),
-            Kind::False => Self::Bool(false),
-            Kind::Number if float => Self::Number(json_float(parse_float(&r.raw))?),
-            Kind::Number => Self::Number(String::from_utf8_lossy(&r.raw).into_owned()),
-            Kind::String => Self::String(go_unquote(&r.raw)?),
-            Kind::Json if r.is_array() => {
-                let mut items = vec![];
-                for item in r.array() {
-                    items.push(Self::from_res(&item, float)?);
-                }
-                Self::Array(items)
+    /// One pass over a document [`std_valid`] accepted, containers on an explicit stack:
+    /// independent of the native stack, and O(n log n) at worst, from the `BTreeMap`
+    /// insert per object member.
+    fn decode(d: &[u8], float: bool) -> Option<Self> {
+        use std::collections::BTreeMap;
+        enum Open {
+            Array(Vec<GoValue>),
+            Object(BTreeMap<String, GoValue>, String),
+        }
+        fn ws(d: &[u8], mut i: usize) -> usize {
+            while i < d.len() && matches!(d[i], b' ' | b'\t' | b'\n' | b'\r') {
+                i += 1;
             }
-            Kind::Json => {
-                let mut map = std::collections::BTreeMap::new();
-                let mut ok = true;
-                r.each(|key, value| {
-                    match (go_unquote(&key.raw), Self::from_res(&value, float)) {
-                        (Some(k), Some(v)) => {
-                            map.insert(k, v);
-                        }
-                        _ => ok = false,
+            i
+        }
+        /// The string token at `i`, decoded, and the index after it.
+        fn string(d: &[u8], i: usize) -> Option<(String, usize)> {
+            let mut j = i + 1;
+            loop {
+                j += memchr::memchr2(b'"', b'\\', d.get(j..)?)?;
+                if d[j] == b'"' {
+                    return Some((go_unquote(&d[i..=j])?, j + 1));
+                }
+                j += 2;
+            }
+        }
+        /// A member key, its colon and the white space before the value.
+        fn key(d: &[u8], i: usize) -> Option<(String, usize)> {
+            let (key, i) = string(d, ws(d, i))?;
+            Some((key, ws(d, i) + 1))
+        }
+        if !std_valid(d) {
+            return None;
+        }
+        let mut stack: Vec<Open> = vec![];
+        let mut i = 0;
+        loop {
+            i = ws(d, i);
+            let mut value = match *d.get(i)? {
+                b'{' => {
+                    i = ws(d, i + 1);
+                    if d.get(i) == Some(&b'}') {
+                        i += 1;
+                        Self::Object(BTreeMap::new())
+                    } else {
+                        let (k, next) = key(d, i)?;
+                        stack.push(Open::Object(BTreeMap::new(), k));
+                        i = next;
+                        continue;
                     }
-                    ok
-                });
-                if !ok {
-                    return None;
                 }
-                Self::Object(map)
+                b'[' => {
+                    i = ws(d, i + 1);
+                    if d.get(i) == Some(&b']') {
+                        i += 1;
+                        Self::Array(vec![])
+                    } else {
+                        stack.push(Open::Array(vec![]));
+                        continue;
+                    }
+                }
+                b'"' => {
+                    let (text, next) = string(d, i)?;
+                    i = next;
+                    Self::String(text)
+                }
+                b't' => {
+                    i += 4;
+                    Self::Bool(true)
+                }
+                b'f' => {
+                    i += 5;
+                    Self::Bool(false)
+                }
+                b'n' => {
+                    i += 4;
+                    Self::Null
+                }
+                _ => {
+                    let start = i;
+                    while i < d.len() && matches!(d[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                        i += 1;
+                    }
+                    let raw = &d[start..i];
+                    Self::Number(if float {
+                        json_float(parse_float(raw))?
+                    } else {
+                        String::from_utf8_lossy(raw).into_owned()
+                    })
+                }
+            };
+            // Hand the finished value to its container, closing every container it ends.
+            loop {
+                let Some(open) = stack.last_mut() else {
+                    return Some(value);
+                };
+                i = ws(d, i);
+                let more = d.get(i) == Some(&b',');
+                match open {
+                    Open::Array(items) => items.push(value),
+                    Open::Object(map, k) => {
+                        map.insert(std::mem::take(k), value);
+                        if more {
+                            let (next_key, next) = key(d, i + 1)?;
+                            *k = next_key;
+                            i = next;
+                            break;
+                        }
+                    }
+                }
+                i += 1;
+                if more {
+                    break;
+                }
+                value = match stack.pop()? {
+                    Open::Array(items) => Self::Array(items),
+                    Open::Object(map, _) => Self::Object(map),
+                };
             }
-        })
+        }
     }
 
     /// serde JSON metadata in Go's model (numbers keep their literal text).
@@ -2942,93 +3081,93 @@ impl GoValue {
     /// `json.Marshal`.
     pub fn marshal(&self) -> Vec<u8> {
         let mut out = vec![];
-        self.write(&mut out);
+        self.write_with(&mut out, true, false);
         out
     }
 
     /// A `json.Encoder` with `SetIndent("", "  ")`, including the trailing newline.
     pub fn encode_indented(&self) -> Vec<u8> {
         let mut out = vec![];
-        self.write_indented(&mut out, 0);
+        self.write_with(&mut out, true, true);
         out.push(b'\n');
         out
-    }
-
-    fn write(&self, out: &mut Vec<u8>) {
-        self.write_with(out, true);
     }
 
     /// An Encoder with `SetEscapeHTML(false)`, without the trailing newline.
     pub fn marshal_no_html(&self) -> Vec<u8> {
         let mut out = vec![];
-        self.write_with(&mut out, false);
+        self.write_with(&mut out, false, false);
         out
     }
 
-    fn write_with(&self, out: &mut Vec<u8>, html: bool) {
-        match self {
-            Self::Null => out.extend_from_slice(b"null"),
-            Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-            Self::Number(n) => out.extend_from_slice(n.as_bytes()),
-            Self::String(s) => marshal_str(out, s.as_bytes(), html),
-            Self::Array(items) => {
-                out.push(b'[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    item.write_with(out, html);
-                }
-                out.push(b']');
-            }
-            Self::Object(map) => {
-                out.push(b'{');
-                for (i, (key, item)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    marshal_str(out, key.as_bytes(), html);
-                    out.push(b':');
-                    item.write_with(out, html);
-                }
-                out.push(b'}');
-            }
+    /// Writes the value with open containers on a heap stack, so the depth encoding/json
+    /// accepts cannot overflow the native stack.
+    fn write_with(&self, out: &mut Vec<u8>, html: bool, indent: bool) {
+        enum Open<'a> {
+            Array(std::slice::Iter<'a, GoValue>, bool),
+            Object(std::collections::btree_map::Iter<'a, String, GoValue>, bool),
         }
-    }
-
-    fn write_indented(&self, out: &mut Vec<u8>, depth: usize) {
         let pad = |out: &mut Vec<u8>, depth: usize| {
-            out.push(b'\n');
-            out.extend(std::iter::repeat_n(b' ', depth * 2));
+            if indent {
+                out.push(b'\n');
+                out.extend(std::iter::repeat_n(b' ', depth * 2));
+            }
         };
-        match self {
-            Self::Array(items) if !items.is_empty() => {
-                out.push(b'[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
+        let mut stack: Vec<Open<'_>> = vec![];
+        let mut next = Some(self);
+        loop {
+            if let Some(value) = next.take() {
+                match value {
+                    Self::Null => out.extend_from_slice(b"null"),
+                    Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+                    Self::Number(n) => out.extend_from_slice(n.as_bytes()),
+                    Self::String(s) => marshal_str(out, s.as_bytes(), html),
+                    Self::Array(items) if items.is_empty() => out.extend_from_slice(b"[]"),
+                    Self::Object(map) if map.is_empty() => out.extend_from_slice(b"{}"),
+                    Self::Array(items) => {
+                        out.push(b'[');
+                        stack.push(Open::Array(items.iter(), true));
                     }
-                    pad(out, depth + 1);
-                    item.write_indented(out, depth + 1);
-                }
-                pad(out, depth);
-                out.push(b']');
-            }
-            Self::Object(map) if !map.is_empty() => {
-                out.push(b'{');
-                for (i, (key, item)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
+                    Self::Object(map) => {
+                        out.push(b'{');
+                        stack.push(Open::Object(map.iter(), true));
                     }
-                    pad(out, depth + 1);
-                    marshal_str(out, key.as_bytes(), true);
-                    out.extend_from_slice(b": ");
-                    item.write_indented(out, depth + 1);
                 }
-                pad(out, depth);
-                out.push(b'}');
             }
-            _ => self.write(out),
+            let depth = stack.len();
+            match stack.last_mut() {
+                None => return,
+                Some(Open::Array(items, first)) => match items.next() {
+                    Some(item) => {
+                        if !std::mem::take(first) {
+                            out.push(b',');
+                        }
+                        pad(out, depth);
+                        next = Some(item);
+                    }
+                    None => {
+                        stack.pop();
+                        pad(out, depth - 1);
+                        out.push(b']');
+                    }
+                },
+                Some(Open::Object(members, first)) => match members.next() {
+                    Some((key, item)) => {
+                        if !std::mem::take(first) {
+                            out.push(b',');
+                        }
+                        pad(out, depth);
+                        marshal_str(out, key.as_bytes(), html);
+                        out.extend_from_slice(if indent { b": " } else { b":" });
+                        next = Some(item);
+                    }
+                    None => {
+                        stack.pop();
+                        pad(out, depth - 1);
+                        out.push(b'}');
+                    }
+                },
+            }
         }
     }
 }
@@ -3136,6 +3275,60 @@ mod tests {
         );
         assert!(GoValue::parse_f64(b"[1e400]").is_none());
         assert_eq!(quote("<&>\u{1}\u{8}"), br#""\u003c\u0026\u003e\u0001\b""#);
+        // White space, empty containers, escaped quotes and backslashes in keys and
+        // values, and a duplicate key inside a nested object.
+        let spaced =
+            b" { \"k\\\"q\" : [ { } , [ ] , \"a\\\\\" , -0.5e+2 ] ,\r\n\t\"o\":{\"d\":1,\"d\":[null , false]} } ";
+        assert_eq!(
+            s(GoValue::parse(spaced).unwrap().marshal()),
+            r#"{"k\"q":[{},[],"a\\",-0.5e+2],"o":{"d":[null,false]}}"#
+        );
+        assert_eq!(
+            s(GoValue::parse(br#"{"b":{"c":[1,{}]},"a":[]}"#)
+                .unwrap()
+                .encode_indented()),
+            "{\n  \"a\": [],\n  \"b\": {\n    \"c\": [\n      1,\n      {}\n    ]\n  }\n}\n"
+        );
+        assert!(GoValue::parse(b"[1,]").is_none());
+        assert!(GoValue::parse(br#"{"a":"\ud800\u"}"#).is_none());
+    }
+
+    /// encoding/json's nesting limit: depth 10001 is rejected; depth 10000 decodes,
+    /// marshals back and drops on a 2 MiB thread, whose stack the recursive versions
+    /// overflow in a debug build.
+    #[test]
+    fn go_value_nesting_limit_and_stack() {
+        let nested = |depth: usize, leaf: &str| {
+            let mut doc = "[{\"d\":".repeat(depth / 2);
+            doc.push_str(leaf);
+            doc.push_str(&"}]".repeat(depth / 2));
+            doc
+        };
+        assert!(GoValue::parse(format!("[{}]", nested(10_000, "1")).as_bytes()).is_none());
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let doc = nested(10_000, "\"leaf\"");
+                let depth_of = |v: &GoValue| {
+                    let (mut depth, mut v) = (0, v);
+                    loop {
+                        v = match v {
+                            GoValue::Array(items) => &items[0],
+                            GoValue::Object(map) => &map["d"],
+                            _ => return depth,
+                        };
+                        depth += 1;
+                    }
+                };
+                let value = GoValue::parse(doc.as_bytes()).expect("depth 10000 decodes");
+                assert_eq!(depth_of(&value), 10_000);
+                let f = GoValue::parse_f64(doc.as_bytes()).expect("depth 10000 decodes");
+                assert_eq!(depth_of(&f), 10_000);
+                assert_eq!(value.marshal(), doc.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     // The string scans jump to the next quote and count the backslashes before it: an

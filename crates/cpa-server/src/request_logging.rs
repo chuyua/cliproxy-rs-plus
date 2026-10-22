@@ -2,6 +2,7 @@
 //! Request bodies in these files are intentionally unredacted, as in Go. Headers
 //! and URL queries are masked before writing; management routes are never captured.
 
+use cpa_core::gostr::GoStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -119,7 +120,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
     let multipart = request.headers().get("content-type").is_some_and(|v| {
         String::from_utf8_lossy(trim(v.as_bytes()))
-            .to_lowercase()
+            .go_lower()
             .starts_with("multipart/form-data")
     });
     let length = request
@@ -130,9 +131,12 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
     let mut request_body = Vec::new();
     if eager {
+        let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
         let body = std::mem::replace(request.body_mut(), Body::empty());
         let bytes = match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => bytes,
+            // Go answers before it logs anything.
+            Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
             Err(error) => {
                 // Preserve the transport error downstream; never turn it into
                 // a successful empty body when capture cannot read the input.
@@ -143,7 +147,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             }
         };
         *request.body_mut() = Body::from(bytes.clone());
-        request_body = decode(bytes.to_vec(), request.headers(), true, None).await.0;
+        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
     }
     let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
         Spool::new(&state.dir, "request-body").ok().map(|spool| {
@@ -1146,7 +1150,7 @@ impl Record {
         let config = self.state.rt.config();
         let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
         let error = self.api_errors.iter().any(|(status, message)| {
-            let lower = message.to_lowercase();
+            let lower = message.go_lower();
             *status != 499 && !lower.contains("context canceled") && !lower.contains("client closed request")
         }) || (self.status >= 400 && self.status != 499);
         let forced = !self.enabled && error && !enabled;
@@ -2649,11 +2653,20 @@ mod tests {
         assert!(content.trim_ascii_end().ends_with(b"\ndone"), "no complete log");
         drop(app);
         drop(state);
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|e| e == "tmp"))
-            .collect();
+        // A spool removes its file when dropped, after its section was copied into the
+        // log, so the log can be complete a moment before the file is gone.
+        let mut leftovers = Vec::new();
+        for _ in 0..500 {
+            leftovers = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|e| e == "tmp"))
+                .collect();
+            if leftovers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(leftovers.is_empty(), "spool files left behind: {leftovers:?}");
         std::fs::remove_dir_all(dir).unwrap();
         content

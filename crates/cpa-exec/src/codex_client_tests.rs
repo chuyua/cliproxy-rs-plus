@@ -54,7 +54,7 @@ fn replays_go_translation_and_optimization() {
                 };
                 let got = translate_request(from, to, &ctx, input, &client).unwrap();
                 assert_eq!(
-                    String::from_utf8(got).unwrap(),
+                    String::from_utf8(got.body).unwrap(),
                     want,
                     "{} -> {} compat={} target={:?} ua={}",
                     from.as_str(),
@@ -76,18 +76,18 @@ fn replays_go_translation_and_optimization() {
     assert_eq!((translated, optimized), (80, 8));
 }
 
-/// The Responses boundary and API keys read orphan delegation without its OAuth-only
-/// (v8 `oauth.providers.codex`) value, as Go's `ForAPIKey` and handler config do.
+/// Orphan delegation is a shared `upstream.codex` setting (Go 52d5507d): API keys
+/// read it from every spelling, the historical `oauth.providers.codex` one included.
 #[test]
-fn orphan_delegation_written_oauth_only_skips_api_keys() {
-    let cfg = Config::parse(
-        "client:\n  codex:\n    optimize-multi-agent-v2: true\noauth:\n  providers:\n    codex:\n      orphan-delegation-compatibility: true\n",
-    )
-    .unwrap();
-    assert!(Settings::from_config(&cfg).orphan_delegation);
-    let api_key = Settings::from_config(&cfg.for_api_key());
-    assert!(!api_key.orphan_delegation);
-    assert!(api_key.optimize_multi_agent_v2);
-    let legacy = Config::parse("codex:\n  orphan-delegation-compatibility: true\n").unwrap();
-    assert!(Settings::from_config(&legacy.for_api_key()).orphan_delegation);
+fn orphan_delegation_is_shared_with_api_keys() {
+    for yaml in [
+        "upstream:\n  codex:\n    orphan-delegation-compatibility: true\n",
+        "oauth:\n  providers:\n    codex:\n      orphan-delegation-compatibility: true\n",
+        "codex:\n  orphan-delegation-compatibility: true\n",
+    ] {
+        let cfg = Config::parse(&format!("client:\n  codex:\n    optimize-multi-agent-v2: true\n{yaml}")).unwrap();
+        assert!(Settings::from_config(&cfg).orphan_delegation, "{yaml}");
+        let api_key = Settings::from_config(&cfg.for_api_key());
+        assert!(api_key.orphan_delegation && api_key.optimize_multi_agent_v2, "{yaml}");
+    }
 }

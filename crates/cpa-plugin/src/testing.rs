@@ -344,3 +344,106 @@ pub fn stored_zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     u16le(&mut out, 0);
     out
 }
+
+/// In-process plugins with scripted answers, for deterministic host tests: each
+/// plugin registers with its capabilities, answers each method with a canned result,
+/// and can fuse a plugin when a given method is called.
+pub mod scripted {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use bytes::Bytes;
+    use cpa_core::config::Config;
+
+    use crate::Host;
+    use crate::client::{CallbackHandler, CallbackInstance, PluginClient};
+    use crate::host::Loader;
+    use crate::platform::{self, PluginFile};
+
+    pub type Log = Arc<Mutex<Vec<String>>>;
+
+    /// One scripted plugin: its capabilities, canned results per method, and an optional
+    /// plugin it fuses when a given method is called.
+    #[derive(Clone, Default)]
+    pub struct Script {
+        pub caps: &'static str,
+        pub results: BTreeMap<&'static str, &'static str>,
+        pub fuse_on: Option<(&'static str, &'static str)>,
+    }
+
+    struct ScriptClient {
+        id: String,
+        script: Script,
+        host: Arc<OnceLock<Host>>,
+        log: Log,
+    }
+
+    impl PluginClient for ScriptClient {
+        fn call(&self, method: &str, _: &[u8]) -> Result<Bytes, String> {
+            if method == "plugin.register" || method == "plugin.reconfigure" {
+                return Ok(Bytes::from(format!(
+                    r#"{{"ok":true,"result":{{"schema_version":6,"metadata":{{"Name":"{}","Version":"1","Author":"t","GitHubRepository":"r"}},"capabilities":{{{}}}}}}}"#,
+                    self.id, self.script.caps
+                )));
+            }
+            self.log.lock().unwrap().push(format!("{} {method}", self.id));
+            if let Some((on, victim)) = self.script.fuse_on
+                && on == method
+            {
+                self.host.get().unwrap().fuse(victim, method, "test");
+            }
+            let result = self.script.results.get(method).copied().unwrap_or("{}");
+            Ok(Bytes::from(format!(r#"{{"ok":true,"result":{result}}}"#)))
+        }
+        fn shutdown(&self) {}
+    }
+
+    struct ScriptLoader {
+        scripts: BTreeMap<&'static str, Script>,
+        host: Arc<OnceLock<Host>>,
+        log: Log,
+    }
+
+    impl Loader for ScriptLoader {
+        fn open(
+            &self,
+            file: &PluginFile,
+            _: Arc<dyn CallbackHandler>,
+            _: Arc<CallbackInstance>,
+        ) -> Result<Arc<dyn PluginClient>, String> {
+            Ok(Arc::new(ScriptClient {
+                id: file.id.clone(),
+                script: self.scripts[file.id.as_str()].clone(),
+                host: self.host.clone(),
+                log: self.log.clone(),
+            }))
+        }
+    }
+
+    /// A host with the scripted plugins loaded from `dir` (recreated), in key order with
+    /// descending priorities (5, 1, -3, ...); the log starts empty.
+    pub async fn host_with(dir: &Path, scripts: BTreeMap<&'static str, Script>) -> (Host, Log) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let mut yaml = format!("plugins:\n  enabled: true\n  dir: {}\n  configs:\n", dir.display());
+        for (i, id) in scripts.keys().enumerate() {
+            std::fs::write(dir.join(format!("{id}{}", platform::extension(platform::goos()))), b"").unwrap();
+            yaml.push_str(&format!(
+                "    {id}:\n      enabled: true\n      priority: {}\n",
+                5 - 4 * i as i64
+            ));
+        }
+        let slot = Arc::new(OnceLock::new());
+        let log: Log = Arc::default();
+        let host = Host::with_loader(Arc::new(ScriptLoader {
+            scripts,
+            host: slot.clone(),
+            log: log.clone(),
+        }));
+        let _ = slot.set(host.clone());
+        host.apply_config(Arc::new(Config::parse(&yaml).unwrap())).await;
+        log.lock().unwrap().clear();
+        (host, log)
+    }
+}

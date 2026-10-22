@@ -11,8 +11,6 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket as AxSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cpa_core::config::Config;
@@ -20,6 +18,7 @@ use cpa_exec::Executors;
 use cpa_server::router;
 use futures_util::StreamExt;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wreq::ws::message::Message;
 
 static FIXTURE: LazyLock<Vec<Value>> = LazyLock::new(|| {
@@ -35,12 +34,25 @@ struct Captured {
     kind: String,
     headers: Vec<(String, String)>,
     body: String,
+    /// The exact bytes, for Go's `body_hex`.
+    raw: Vec<u8>,
 }
 
 #[derive(Default)]
 struct Upstream {
     script: Mutex<VecDeque<Value>>,
     captured: Mutex<Vec<Captured>>,
+    /// Held SSE responses whose request the proxy canceled (Go `http_canceled`).
+    canceled: Mutex<u64>,
+}
+
+/// Counts a held SSE response as canceled once the server drops its body.
+struct Canceled(Arc<Upstream>);
+
+impl Drop for Canceled {
+    fn drop(&mut self) {
+        *self.0.canceled.lock().unwrap() += 1;
+    }
 }
 
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -50,24 +62,41 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn upstream_handler(
-    State(up): State<Arc<Upstream>>,
-    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Ok(ws) = ws {
+async fn upstream_handler(State(up): State<Arc<Upstream>>, mut req: axum::extract::Request) -> Response {
+    let headers = req.headers().clone();
+    let key = headers.get("sec-websocket-key").filter(|_| {
+        headers
+            .get("upgrade")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    });
+    if let Some(key) = key {
         up.captured.lock().unwrap().push(Captured {
             kind: "ws_dial".into(),
             headers: header_pairs(&headers),
             body: String::new(),
+            raw: Vec::new(),
         });
-        return ws.on_upgrade(move |socket| upstream_socket(up, socket));
+        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let upgrade = hyper::upgrade::on(&mut req);
+        tokio::spawn(async move {
+            if let Ok(upgraded) = upgrade.await {
+                upstream_socket(up, hyper_util::rt::TokioIo::new(upgraded)).await;
+            }
+        });
+        return Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-accept", accept)
+            .body(axum::body::Body::empty())
+            .unwrap();
     }
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
     up.captured.lock().unwrap().push(Captured {
         kind: "http".into(),
         headers: header_pairs(&headers),
         body: String::from_utf8_lossy(&body).into_owned(),
+        raw: body.to_vec(),
     });
     let Some(reply) = up.script.lock().unwrap().pop_front() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -87,46 +116,107 @@ async fn upstream_handler(
         let kind = gjson::get(event, "type");
         sse.push_str(&format!("event: {}\ndata: {event}\n\n", kind.str()));
     }
+    if reply["then"] == "hold" {
+        // The events, then an open stream until the proxy cancels the request.
+        let guard = Canceled(up.clone());
+        let body = futures_util::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(sse)) })
+            .chain(futures_util::stream::pending())
+            .map(move |item| {
+                let _ = &guard;
+                item
+            });
+        return (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body),
+        )
+            .into_response();
+    }
     ([("content-type", "text/event-stream")], sse).into_response()
 }
 
-async fn upstream_socket(up: Arc<Upstream>, mut socket: AxSocket) {
-    while let Some(Ok(message)) = socket.recv().await {
-        let AxMessage::Text(text) = message else {
-            continue;
-        };
+/// One frame from the proxy (a client, so masked): opcode and unmasked payload. The
+/// mock reads frames itself, like gorilla, so a text frame need not be UTF-8.
+async fn read_frame<S: AsyncRead + Unpin>(io: &mut S) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    io.read_exact(&mut head).await.ok()?;
+    let len = match head[1] & 0x7f {
+        126 => u64::from(io.read_u16().await.ok()?),
+        127 => io.read_u64().await.ok()?,
+        n => u64::from(n),
+    };
+    let mut mask = [0u8; 4];
+    if head[1] & 0x80 != 0 {
+        io.read_exact(&mut mask).await.ok()?;
+    }
+    let mut payload = vec![0u8; usize::try_from(len).ok()?];
+    io.read_exact(&mut payload).await.ok()?;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+    Some((head[0] & 0x0f, payload))
+}
+
+/// One unmasked, final server frame.
+async fn write_frame<S: AsyncWrite + Unpin>(io: &mut S, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut frame = vec![0x80 | opcode];
+    match payload.len() {
+        n if n < 126 => frame.push(n as u8),
+        n if n <= 0xffff => {
+            frame.push(126);
+            frame.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            frame.push(127);
+            frame.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    io.write_all(&frame).await?;
+    io.flush().await
+}
+
+async fn upstream_socket<S: AsyncRead + AsyncWrite + Unpin>(up: Arc<Upstream>, mut socket: S) {
+    while let Some((opcode, payload)) = read_frame(&mut socket).await {
+        match opcode {
+            0x1 => {}
+            0x8 => {
+                let _ = write_frame(&mut socket, 0x8, &payload).await;
+                return;
+            }
+            0x9 => {
+                let _ = write_frame(&mut socket, 0xa, &payload).await;
+                continue;
+            }
+            _ => continue,
+        }
         up.captured.lock().unwrap().push(Captured {
             kind: "ws_frame".into(),
             headers: Vec::new(),
-            body: text.as_str().to_owned(),
+            body: String::from_utf8_lossy(&payload).into_owned(),
+            raw: payload,
         });
         let Some(reply) = up.script.lock().unwrap().pop_front() else {
             continue;
         };
         for event in reply["events"].as_array().into_iter().flatten() {
-            let _ = socket.send(AxMessage::Text(event.as_str().unwrap().into())).await;
+            let _ = write_frame(&mut socket, 0x1, event.as_str().unwrap().as_bytes()).await;
         }
         let then = reply["then"].as_str().unwrap_or_default();
         if !then.is_empty() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        let close = |code, reason: &str| {
-            AxMessage::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            }))
-        };
+        let close = |code: u16, reason: &str| [&code.to_be_bytes()[..], reason.as_bytes()].concat();
         match then {
             "close" => {
-                let _ = socket.send(close(1000, "bye")).await;
+                let _ = write_frame(&mut socket, 0x8, &close(1000, "bye")).await;
                 return;
             }
             "close1009" => {
-                let _ = socket.send(close(1009, "too big")).await;
+                let _ = write_frame(&mut socket, 0x8, &close(1009, "too big")).await;
                 return;
             }
             "close1009_spaced" => {
-                let _ = socket.send(close(1009, " oversized ")).await;
+                let _ = write_frame(&mut socket, 0x8, &close(1009, " oversized ")).await;
                 return;
             }
             "drop" => return,
@@ -325,13 +415,22 @@ async fn run(name: &str) {
             assert!(expected.is_empty(), "{name} step {i}: Go read after close");
             continue;
         }
-        if step["disable"].as_bool() == Some(true) {
-            // Go `manager.Update` with `Disabled`: config credentials change in memory.
-            for credential in rt.store().snapshot() {
-                let mut disabled = cpa_core::credential::Credential::clone(&credential);
-                disabled.disabled = true;
-                rt.store().replace_config_backed(disabled, credential.revision).unwrap();
+        // Go `manager.Update` with `Disabled`: config credentials change in memory.
+        for (key, disabled) in [("disable", true), ("enable", false)] {
+            if step[key].as_bool() == Some(true) {
+                for credential in rt.store().snapshot() {
+                    let mut changed = cpa_core::credential::Credential::clone(&credential);
+                    changed.disabled = disabled;
+                    rt.store().replace_config_backed(changed, credential.revision).unwrap();
+                }
             }
+        }
+        if let Some(hex) = step["send_hex"].as_str() {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            socket.send(Message::binary(bytes)).await.unwrap();
         }
         if let Some(send) = step["send"].as_str() {
             let send = send.replace("{{last_response_id}}", &last_id);
@@ -409,6 +508,10 @@ async fn run(name: &str) {
             mask(go["body"].as_str().unwrap_or_default()),
             "{name}: upstream body #{i}"
         );
+        if let Some(hex) = go["body_hex"].as_str() {
+            let rust_hex: String = rust.raw.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(rust_hex, hex, "{name}: upstream bytes #{i}");
+        }
         let go_headers = go["headers"]
             .as_object()
             .into_iter()
@@ -420,6 +523,11 @@ async fn run(name: &str) {
             "{name}: upstream headers #{i}"
         );
     }
+    assert_eq!(
+        *up.canceled.lock().unwrap(),
+        scenario["http_canceled"].as_u64().unwrap_or(0),
+        "{name}: held HTTP responses the proxy canceled"
+    );
 }
 
 #[tokio::test]
@@ -445,6 +553,12 @@ async fn local_prewarm_then_followup_sends_the_warmup_input() {
 #[tokio::test]
 async fn upstream_request_fault_is_shown_then_closed() {
     run("ws_request_fault_exposed").await;
+}
+
+/// v8.0.35: the error frame's `headers` come back on the error event, canonicalized.
+#[tokio::test]
+async fn upstream_request_fault_keeps_its_frame_headers() {
+    run("ws_request_fault_headers").await;
 }
 
 #[tokio::test]
@@ -536,10 +650,11 @@ async fn steering_later_error_then_upstream_close_closes_the_client() {
     run("steer_later_error_then_upstream_close").await;
 }
 
-/// The v8 OAuth-only form does not enable steering for API keys.
+/// The historical `oauth.providers.codex` spelling is the shared `upstream.codex`
+/// setting since Go 52d5507d, so it steers API keys too.
 #[tokio::test]
-async fn steering_oauth_only_setting_leaves_api_keys_in_normal_mode() {
-    run("steer_oauth_only_skips_api_key").await;
+async fn steering_historical_oauth_path_steers_api_keys() {
+    run("steer_historical_oauth_path_steers_api_key").await;
 }
 
 #[tokio::test]
@@ -612,16 +727,28 @@ async fn steering_off_idle_upstream_close_closes_the_client() {
     run("steer_idle_upstream_close_legacy_disabled").await;
 }
 
-/// `.../v8_enabled_api_key`: OAuth-only steering leaves the API key in normal mode.
+/// `.../v8_enabled_api_key`: the historical spelling, an API key.
 #[tokio::test]
-async fn steering_oauth_only_idle_upstream_close_closes_an_api_key_client() {
+async fn steering_historical_idle_upstream_close_closes_an_api_key_client() {
     run("steer_idle_upstream_close_v8_api_key").await;
 }
 
-/// `.../v8_enabled_oauth`: OAuth-only steering runs the OAuth account full duplex.
+/// `.../v8_enabled_oauth`: the historical spelling, an OAuth account.
 #[tokio::test]
-async fn steering_oauth_only_idle_upstream_close_closes_an_oauth_client() {
+async fn steering_historical_idle_upstream_close_closes_an_oauth_client() {
     run("steer_idle_upstream_close_v8_oauth").await;
+}
+
+/// `.../upstream_enabled_api_key`.
+#[tokio::test]
+async fn steering_upstream_idle_upstream_close_closes_an_api_key_client() {
+    run("steer_idle_upstream_close_upstream_api_key").await;
+}
+
+/// `.../upstream_enabled_oauth`.
+#[tokio::test]
+async fn steering_upstream_idle_upstream_close_closes_an_oauth_client() {
+    run("steer_idle_upstream_close_upstream_oauth").await;
 }
 
 /// Go `TestResponsesSteeringErrorRecoveryIntegration/disabled_error_remains_terminal`.
@@ -642,6 +769,41 @@ async fn steering_upstream_drop_while_pending_closes_the_client() {
     run("steer_disconnect_pending").await;
 }
 
+/// Go `TestResponsesInterruptInFlight`: idle, malformed and disabled-credential
+/// interrupts fail locally without touching upstream; an in-flight one reaches the
+/// socket unchanged, its `response.incomplete` ends the turn, and the socket continues.
+#[tokio::test]
+async fn interrupt_reaches_the_active_socket_unchanged() {
+    run("interrupt_in_flight").await;
+}
+
+#[tokio::test]
+async fn interrupt_reaches_the_active_socket_unchanged_with_steering() {
+    run("interrupt_in_flight_steering").await;
+}
+
+/// Go `TestResponsesInterruptStopsHTTPUpstream`: an HTTP turn ends locally with
+/// `response.incomplete` (reason interrupted, the collected output), its upstream request
+/// is canceled, and the next turn continues from that transcript.
+#[tokio::test]
+async fn interrupt_cancels_an_http_turn_locally() {
+    run("interrupt_http_local").await;
+}
+
+/// A binary `response.interrupt` holding a non-UTF-8 byte in a string is valid JSON
+/// to Go and reaches upstream byte for byte.
+#[tokio::test]
+async fn binary_interrupt_reaches_upstream_byte_for_byte() {
+    run("interrupt_binary_frame").await;
+}
+
+/// Go `TestResponsesLateInterruptDoesNotPoisonNextCreate`: an interrupt for a finished
+/// response is a silent no-op, before and during the next turn, and never reaches upstream.
+#[tokio::test]
+async fn late_interrupt_does_not_poison_the_next_turn() {
+    run("interrupt_late_ws").await;
+}
+
 #[test]
 fn every_go_scenario_has_a_test() {
     let names: Vec<&str> = FIXTURE.iter().map(|s| s["name"].as_str().unwrap()).collect();
@@ -653,6 +815,7 @@ fn every_go_scenario_has_a_test() {
             "previous_not_found_then_create",
             "prewarm_then_followup",
             "ws_request_fault_exposed",
+            "ws_request_fault_headers",
             "ws_quota_silent_close",
             "ws_continuation_needs_replay",
             "ws_upstream_closes_between_turns",
@@ -668,11 +831,13 @@ fn every_go_scenario_has_a_test() {
             "steer_later_error_recovers",
             "steer_initial_error_terminal",
             "steer_later_error_then_upstream_close",
-            "steer_oauth_only_skips_api_key",
+            "steer_historical_oauth_path_steers_api_key",
             "steer_idle_upstream_close",
             "steer_idle_upstream_close_legacy_disabled",
             "steer_idle_upstream_close_v8_api_key",
             "steer_idle_upstream_close_v8_oauth",
+            "steer_idle_upstream_close_upstream_api_key",
+            "steer_idle_upstream_close_upstream_oauth",
             "steer_disabled_error_terminal",
             "steer_in_flight",
             "steer_disconnect_pending",
@@ -687,6 +852,11 @@ fn every_go_scenario_has_a_test() {
             "steer_credential_disabled",
             "steer_rejected_when_disabled",
             "http_upstream_400_exposed",
+            "interrupt_in_flight",
+            "interrupt_in_flight_steering",
+            "interrupt_http_local",
+            "interrupt_binary_frame",
+            "interrupt_late_ws",
         ]
     );
 }

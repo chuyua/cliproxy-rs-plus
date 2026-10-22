@@ -4,6 +4,7 @@
 //! `~/.cli-proxy-api`. The JWT signature is not checked; the pinned CA fingerprint and
 //! the enrollment secret carry the trust, exactly as in Go.
 
+use cpa_core::gostr::GoStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -115,7 +116,7 @@ pub fn parse_claims(raw: &str) -> Result<Claims> {
 
 /// Go `normalizeFingerprint`.
 pub fn normalize_fingerprint(fingerprint: &str) -> String {
-    fingerprint.trim().to_lowercase().replace([':', ' '], "")
+    fingerprint.trim().go_lower().replace([':', ' '], "")
 }
 
 /// Go `ConfigFromJWT` with the default certificate directory.

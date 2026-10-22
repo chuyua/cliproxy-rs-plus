@@ -560,10 +560,11 @@ impl State {
                 }
                 self.thinking_summary_seen = true;
             }
-            b"response.reasoning_summary_text.delta" => {
+            b"response.reasoning_summary_text.delta" | b"response.reasoning_text.delta" => {
                 self.stop_text(&mut out);
                 self.start_thinking(&mut out);
                 self.thinking_delta(&root.get("delta").bytes(), &mut out);
+                self.thinking_summary_seen = true;
             }
             b"response.content_part.added" => {
                 self.finalize_thinking(&mut out);
@@ -671,6 +672,15 @@ impl State {
                         if !signature.is_empty() {
                             self.thinking_signature = signature.into_owned();
                         }
+                        // Thinking text that only arrives on the done item still streams.
+                        if !self.thinking_summary_seen {
+                            let text = reasoning_item_text(&item);
+                            if !text.is_empty() {
+                                self.start_thinking(&mut out);
+                                self.thinking_delta(&text, &mut out);
+                                self.thinking_summary_seen = true;
+                            }
+                        }
                         if self.thinking_summary_seen {
                             self.finalize_thinking(&mut out);
                         } else {
@@ -723,13 +733,14 @@ fn query_json(query: &[u8]) -> Vec<u8> {
 
 /// codexWebSearchResultContent: `web_search_result` blocks (`None`: no results array).
 fn web_search_results(root: &Res<'_>, item: &Res<'_>) -> Option<Vec<u8>> {
-    let mut results = item.get("results");
-    if !results.is_array() {
-        results = root.get("results");
-    }
-    if !results.is_array() {
-        return None;
-    }
+    let results = [
+        item.get("results"),
+        root.get("results"),
+        item.get("action.sources"),
+        root.get("action.sources"),
+    ]
+    .into_iter()
+    .find(Res::is_array)?;
     let mut blocks = vec![];
     results.each(|_, result| {
         let url = trim_space(&result.get("url").bytes()).to_vec();
@@ -895,18 +906,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
             match item.get("type").bytes().as_ref() {
                 b"reasoning" => {
                     let signature = item.get("encrypted_content").bytes().into_owned();
-                    let summary = item.get("summary");
-                    let mut thinking = if summary.exists() {
-                        joined_text(&summary)
-                    } else {
-                        vec![]
-                    };
-                    if thinking.is_empty() {
-                        let content = item.get("content");
-                        if content.exists() {
-                            thinking = joined_text(&content);
-                        }
-                    }
+                    let thinking = reasoning_item_text(&item);
                     if !thinking.is_empty() || !signature.is_empty() {
                         let mut block = br#"{"type":"thinking","thinking":""}"#.to_vec();
                         gj::set_str(&mut block, "thinking", &thinking);
@@ -999,4 +999,23 @@ fn web_search_blocks(blocks: &mut Vec<Vec<u8>>, item: &Res<'_>, seen: &mut HashS
     }
     blocks.push(result_block);
     seen.insert(id);
+}
+
+/// extractCodexReasoningItemText: the summary text, else the content text.
+fn reasoning_item_text(item: &Res<'_>) -> Vec<u8> {
+    let summary = item.get("summary");
+    let thinking = if summary.exists() {
+        joined_text(&summary)
+    } else {
+        vec![]
+    };
+    if !thinking.is_empty() {
+        return thinking;
+    }
+    let content = item.get("content");
+    if content.exists() {
+        joined_text(&content)
+    } else {
+        vec![]
+    }
 }

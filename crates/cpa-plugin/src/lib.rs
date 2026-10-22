@@ -20,9 +20,11 @@ pub mod client;
 pub mod config;
 pub mod executor;
 pub mod gojson;
+pub mod homeplugins;
 pub mod host;
 pub mod hostauth;
 mod hosthttp;
+pub mod hostmodel;
 pub use hosthttp::{go_preflight, go_read_error_text, go_url_error, go_url_error_text};
 pub mod interceptors;
 pub mod management;
@@ -33,6 +35,8 @@ pub mod platform;
 pub mod quota;
 pub mod routing;
 pub mod rpc;
+#[cfg(unix)]
+mod shadow;
 pub mod store;
 pub mod streams;
 #[cfg(feature = "test-support")]

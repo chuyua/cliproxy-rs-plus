@@ -3,6 +3,7 @@
 //! internal/auth/claude/identity.go).
 
 use cpa_core::credential::Credential;
+use cpa_core::gostr::GoStr;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -18,7 +19,7 @@ fn first_device(raw: Option<&Value>) -> Option<String> {
     raw?.as_array()?
         .iter()
         .filter_map(Value::as_str)
-        .map(|s| s.trim().to_lowercase())
+        .map(|s| s.trim().go_lower())
         .find(|s| valid_device(s))
 }
 

@@ -201,6 +201,8 @@ impl Runner {
             .env("HOME", &runner.work)
             .env("PATH", "/usr/bin:/bin")
             .env("TZ", "UTC")
+            // Keeps native shadow copies in the test's TMPDIR (private under nextest).
+            .env("TMPDIR", std::env::temp_dir())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -210,6 +212,43 @@ impl Runner {
             if let Ok(res) = runner.http(&json!({"method": "GET", "path": "/healthz"}))
                 && res["status"] == 200
             {
+                // Steps compare request-time calls, so the plugin syncs of startup are
+                // waited for and dropped (the generator settles for the same reason).
+                // Like Go, the server syncs plugins twice: before it serves here (Go:
+                // once its listener is up), and when the config watcher's first look
+                // reloads the config (Go's watcher reloads clients when it starts).
+                // Each sync asks every executor plugin, none of which registers models,
+                // for its identifier twice. The watcher's reload comes about 200 ms
+                // after serving starts and can otherwise land in any later step.
+                // The barrier counts this fixture's calls: it does not prove quiescence. A
+                // build that asks fewer times fails here after 10 s; update the count then.
+                let labels = executor_labels(scenario);
+                let identifiers = json!({"methods": ["executor.identifier"]});
+                let synced = Instant::now() + Duration::from_secs(10);
+                let mut asked = loop {
+                    // Non-destructive snapshots, so no call is lost while the recorders
+                    // still append; drained once the count is reached.
+                    let asked: Vec<String> = runner
+                        .read_records(&identifiers, false)
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["label"].as_str().unwrap().to_owned())
+                        .collect();
+                    if labels.iter().all(|l| asked.iter().filter(|a| a == l).count() >= 4) {
+                        break asked;
+                    }
+                    assert!(
+                        Instant::now() < synced,
+                        "{}: startup plugin syncs asked {asked:?} for the executor identifiers of {labels:?}",
+                        scenario["name"]
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                runner.records(&identifiers);
+                asked.sort_unstable();
+                asked.dedup();
+                assert_eq!(asked, labels, "{}: startup executor.identifier", scenario["name"]);
                 return runner;
             }
             if Instant::now() > deadline || runner.child.try_wait().unwrap().is_some() {
@@ -331,7 +370,47 @@ impl Runner {
 
     /// The generator's `records`: every call a recorder received whose method is listed
     /// (a trailing "." matches a prefix), files in name order, then cleared.
+    /// Takes the recorded calls of `args["methods"]`: the record files are read, then
+    /// removed.
     fn records(&self, args: &Value) -> Value {
+        self.read_records(args, true)
+    }
+
+    /// [`Self::records`] once every `request.complete` of `want` (Go's records for the
+    /// step) has arrived, at most ten seconds: completions run on a task of their own,
+    /// so a fixed pause does not guarantee them.
+    fn records_after(&self, args: &Value, want: &Value) -> Value {
+        let completions = |records: &Value| {
+            let mut labels: Vec<String> = records
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["method"] == "request.complete")
+                .map(|r| r["label"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            labels.sort_unstable();
+            labels
+        };
+        let expected = completions(want);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !expected.is_empty() && Instant::now() < deadline {
+            let got = completions(&self.read_records(args, false));
+            if expected
+                .iter()
+                .all(|l| got.iter().filter(|g| *g == l).count() >= expected.iter().filter(|e| *e == l).count())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.records(args)
+    }
+
+    /// The recorded calls of `args["methods"]` in each recorder's order, recorder files
+    /// in name order. `drain` removes the files after reading them; a call appended
+    /// between the read and the removal is lost, so only a reader that has nothing more
+    /// to wait for drains.
+    fn read_records(&self, args: &Value, drain: bool) -> Value {
         let methods: Vec<&str> = args["methods"]
             .as_array()
             .unwrap()
@@ -354,12 +433,31 @@ impl Runner {
         for name in names {
             let path = self.dir("RECDIR").join(&name);
             let data = std::fs::read_to_string(&path).unwrap();
-            std::fs::remove_file(&path).unwrap();
+            if drain {
+                std::fs::remove_file(&path).unwrap();
+            }
+            // `request.complete` runs on a task of its own, but only once the request's
+            // synchronous hooks are done (Go schedules it after response interception,
+            // sdk/api/handlers/handlers_execution.go): none may follow it.
+            let mut completed = std::collections::HashSet::new();
             for line in data.lines() {
                 let Ok(rec) = serde_json::from_str::<Value>(line) else {
                     continue;
                 };
                 let method = rec["method"].as_str().unwrap_or_default();
+                let request_id = serde_json::from_str::<Value>(rec["request"].as_str().unwrap_or_default())
+                    .ok()
+                    .and_then(|r| r["RequestID"].as_str().map(str::to_owned))
+                    .filter(|id| !id.is_empty());
+                if let Some(id) = request_id {
+                    if method == "request.complete" {
+                        completed.insert(id);
+                    } else if (method.starts_with("request.intercept") || method.starts_with("response."))
+                        && completed.contains(&id)
+                    {
+                        panic!("{name}: {method} of request {id} was recorded after its request.complete");
+                    }
+                }
                 if !wanted(method) {
                     continue;
                 }
@@ -381,6 +479,22 @@ impl Drop for Runner {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.work);
     }
+}
+
+/// Go and Rust deliver `request.complete` on a task of its own once the request's
+/// synchronous hooks are done (possibly before the handler writes the response), so its
+/// place among later records, and among other requests' completions, varies with load.
+/// Records compare in order with the completions moved to the end and sorted;
+/// [`Runner::read_records`] checks that no hook follows its own request's completion.
+fn async_completions_last(records: Value) -> Value {
+    let Value::Array(records) = records else {
+        return records;
+    };
+    let (mut completions, mut rest): (Vec<Value>, Vec<Value>) =
+        records.into_iter().partition(|r| r["method"] == "request.complete");
+    completions.sort_by_key(|r| r.to_string());
+    rest.extend(completions);
+    Value::Array(rest)
 }
 
 /// The generator's `varying` and `maskCreated`: per-request IDs and timestamps become
@@ -515,6 +629,25 @@ fn callback_ids(s: &str) -> String {
     out
 }
 
+/// Labels of the scenario's plugins that declare an executor, in label order.
+fn executor_labels(scenario: &Value) -> Vec<&str> {
+    let mut label = None;
+    let mut out = Vec::new();
+    for line in scenario["config"].as_str().unwrap_or_default().lines() {
+        let line = line.trim();
+        if let Some(l) = line.strip_prefix("label: ") {
+            label = Some(l.trim());
+        } else if let Some(caps) = line.strip_prefix("caps: ")
+            && caps.split(',').any(|c| c.trim() == "executor")
+            && let Some(l) = label.take()
+        {
+            out.push(l);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 fn dechunk(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -559,17 +692,57 @@ fn request_path_plugins_match_go() {
                     continue;
                 }
                 "http" => runner.http(&step["args"]).unwrap(),
-                "records" => runner.records(&step["args"]),
+                "records" => runner.records_after(&step["args"], &step["result"]),
                 "upstream" => {
                     let seen = runner.upstream.take();
                     serde_json::from_str(&runner.normalize(&serde_json::to_string(&seen).unwrap())).unwrap()
                 }
                 op => panic!("unknown op {op}"),
             };
-            if got != step["result"] {
+            let mut want = step["result"].clone();
+            // The goldens predate v8.0.35, which exposes `ETag` on every response (`fa68946a`).
+            if let Some(Value::String(exposed)) = want.pointer_mut("/headers/Access-Control-Expose-Headers") {
+                *exposed = exposed.replacen("Retry-After, ", "Retry-After, ETag, ", 1);
+            }
+            // They also predate `pluginapi.UsageRecord.IsNativeKey` and `AccessProvider`
+            // (`37fe2608`); the usage scenario authenticates with a configured client key.
+            if step["op"] == "records" {
+                for record in want.as_array_mut().into_iter().flatten() {
+                    if record["method"] != "usage.handle" {
+                        continue;
+                    }
+                    let Some(Value::String(request)) = record.get_mut("request") else {
+                        continue;
+                    };
+                    let start = request.find(r#""APIKey":""#).unwrap() + r#""APIKey":""#.len();
+                    let end = start + request[start..].find('"').unwrap() + 1;
+                    let native = end > start + 1;
+                    let provider = if native { "config-inline" } else { "" };
+                    request.insert_str(
+                        end,
+                        &format!(r#","IsNativeKey":{native},"AccessProvider":"{provider}""#),
+                    );
+                }
+            }
+            let (mut got, mut want) = match step["op"].as_str() {
+                Some("records") => (async_completions_last(got), async_completions_last(want)),
+                _ => (got, want),
+            };
+            // These three independent model-list requests finish through
+            // asynchronous plugin callbacks. The event set is deterministic,
+            // but their cross-request callback order is not.
+            if name == "model list interceptors"
+                && n == 8
+                && step["op"] == "records"
+                && let (Some(actual), Some(expected)) = (got.as_array_mut(), want.as_array_mut())
+            {
+                actual.sort_by_key(Value::to_string);
+                expected.sort_by_key(Value::to_string);
+            }
+            if got != want {
                 failures.push(format!(
-                    "{name} step {n} {}\n  go:   {}\n  rust: {got}",
-                    step["args"], step["result"]
+                    "{name} step {n} {}\n  go:   {want}\n  rust: {got}",
+                    step["args"]
                 ));
             }
         }

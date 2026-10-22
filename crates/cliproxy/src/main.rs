@@ -1,9 +1,11 @@
 mod discovery;
 mod dotenv;
 mod home;
+mod home_plugins;
 mod plugin_cli;
 mod tui;
 
+use cpa_core::gostr::GoStr;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use cpa_core::config::Config;
 use cpa_exec::Executors;
 use cpa_exec::claude::{ClaudeExecutor, DEFAULT_BASE_URL};
 use cpa_server::Runtime;
-use socket2::{Domain, Socket, Type};
+use cpa_server::listener::bind;
 
 /// Same strings as the management `X-CPA-*` headers.
 const VERSION: &str = concat!("cliproxy-rs-", env!("CARGO_PKG_VERSION"));
@@ -569,46 +571,6 @@ async fn wait_for_cloud_deploy() {
     tracing::info!("Cloud deploy mode: Shutdown signal received; exiting");
 }
 
-/// Binds like Go's `net.Listen("tcp", host:port)`. An empty host is one dual-stack socket
-/// on `[::]` with `IPV6_V6ONLY` cleared, falling back to `0.0.0.0` only when the host has
-/// no usable IPv6. Other errors, such as the port being in use, are returned.
-fn bind(host: &str, port: u16) -> io::Result<std::net::TcpListener> {
-    if !host.is_empty() {
-        let listener = std::net::TcpListener::bind((host, port))?;
-        listener.set_nonblocking(true)?;
-        return Ok(listener);
-    }
-    match listen(Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), true) {
-        Err(e) if no_ipv6(&e) => listen(Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)), false),
-        other => other,
-    }
-}
-
-/// The host has no usable IPv6: the address family is unsupported or `::` cannot be
-/// assigned. Windows reports Winsock codes, not the C runtime's errno values.
-fn no_ipv6(e: &io::Error) -> bool {
-    #[cfg(not(windows))]
-    const EAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
-    #[cfg(windows)]
-    const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
-    e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(EAFNOSUPPORT)
-}
-
-fn listen(domain: Domain, addr: SocketAddr, dual_stack: bool) -> io::Result<std::net::TcpListener> {
-    let socket = Socket::new(domain, Type::STREAM, None)?;
-    if dual_stack {
-        socket.set_only_v6(false)?;
-    }
-    // Go sets SO_REUSEADDR except on Windows, where it would let another socket bind a
-    // port already in use (net/sockopt_windows.go).
-    #[cfg(not(windows))]
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
-}
-
 /// Go `flag.ExitOnError` after a parse error: the message, the usage, exit 2.
 fn flag_error(cmd: &mut clap::Command, message: &str) -> ! {
     eprintln!("{message}");
@@ -850,15 +812,15 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     let cloud = std::env::var("DEPLOY").is_ok_and(|v| v == "cloud");
     // Go main: with a Home JWT the config comes from Home; the config path stays for
     // downstream components but need not exist.
-    let (mut config, home_config) = match &home_jwt {
-        Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery).await {
-            Ok((home_config, config)) => (config, Some(home_config)),
+    let (mut config, home_config, home_plugins) = match &home_jwt {
+        Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery, &plugins).await {
+            Ok((home_config, config, home_plugins)) => (config, Some(home_config), Some(home_plugins)),
             Err(line) => {
                 tracing::error!("{line}");
                 return Ok(());
             }
         },
-        None => (load_config(&config_path, cloud)?, None),
+        None => (load_config(&config_path, cloud)?, None, None),
     };
     if let Some(store) = &store {
         config.auth_dir = store.auth_dir.clone();
@@ -891,9 +853,16 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     cpa_server::logging::configure(&config);
     tracing::info!("{}", banner());
     let before = store.as_ref().map(|store| auth_files(&store.auth_dir));
-    // Go: the loaded config reaches the plugins, and a plugin flag hands the run to the
-    // plugins that own it.
-    if let Some(code) = plugin_cli::execute(&plugins, &config, &config_path, &builtin).await {
+    // Go: the loaded config reaches the plugins (and Home learns which of its plugins
+    // loaded), and a plugin flag hands the run to the plugins that own it.
+    plugins.apply_config(Arc::new(config.clone())).await;
+    if let Some(home_plugins) = home_plugins
+        && let Err(line) = home_plugins.finish(&plugins).await
+    {
+        tracing::error!("{line}");
+        return Ok(());
+    }
+    if let Some(code) = plugin_cli::execute(&plugins, &config_path, &builtin).await {
         if let (Some(store), Some(before)) = (&store, &before) {
             persist_login(store, before).await;
         }
@@ -1141,7 +1110,7 @@ fn auth_files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().to_lowercase().ends_with(".json"))
+        .filter(|e| e.file_name().to_string_lossy().go_lower().ends_with(".json"))
         .filter_map(|e| Some((e.path(), std::fs::read(e.path()).ok()?)))
         .collect()
 }
@@ -1297,6 +1266,25 @@ fn ensure_auth_dir(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// The served routes. In Home mode the config comes from Home and every management
+/// route answers 404 (Go `managementAvailable`), so the Management API is not mounted.
+fn app(rt: &Arc<Runtime>, management: &Arc<cpa_server::management::Management>, home: bool) -> axum::Router {
+    let app = if home {
+        cpa_server::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
+            rt.clone(),
+            cpa_server::remote::gate,
+        ))
+    } else {
+        let app = cpa_server::app(rt.clone(), cpa_server::management::router(management.clone()));
+        cpa_server::safe_mode::router(rt, app)
+    };
+    // Go applies its CORS middleware to every route, not only management.
+    let app = app.layer(axum::middleware::from_fn(cpa_server::management::cors));
+    let app = cpa_server::request_logging::router(management, app);
+    let app = cpa_server::body_limit::layer(rt, app);
+    cpa_server::observability::router(rt, app)
+}
+
 /// `listening` (standalone TUI only) receives the bound address and whether TLS is on.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
@@ -1374,6 +1362,10 @@ async fn serve(
     }
     // Go applies the plugin config before serving; later publishes resync the host.
     cpa_server::plugins::start(&rt).await;
+    if home.is_none() {
+        cpa_server::plugins::reload_plugin_auth_files(&rt).await;
+    }
+    let pprof = cpa_server::pprof::Server::start(&rt);
     // Home mode: the config comes from Home, and management answers 404 (Go
     // `managementAvailable`).
     let _watcher = home.is_none().then(|| cpa_server::watching::start(&management));
@@ -1383,22 +1375,7 @@ async fn serve(
         let published = rt.subscribe_config();
         discovery::advertise::Advertiser::spawn(move || rt.config(), published, tls.is_some())
     };
-    // Go applies its CORS middleware to every route, not only management.
-    let app = match &home {
-        Some(_) => cpa_server::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
-            rt.clone(),
-            cpa_server::remote::gate,
-        )),
-        None => cpa_server::app(rt.clone(), cpa_server::management::router(management.clone())),
-    };
-    let app = if home.is_none() {
-        cpa_server::safe_mode::router(&rt, app)
-    } else {
-        app
-    };
-    let app = app.layer(axum::middleware::from_fn(cpa_server::management::cors));
-    let app = cpa_server::request_logging::router(&management, app);
-    let app = cpa_server::observability::router(&rt, app);
+    let app = app(&rt, &management, home.is_some());
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let app = heap_trim::layer(app);
     // Go's listener also serves the Redis protocol (usage queue) to management clients;
@@ -1422,26 +1399,41 @@ async fn serve(
         }
     };
     let mut home_failed = false;
+    let mut server_done = false;
     let served = tokio::select! {
-        r = &mut server => r.map_err(anyhow::Error::from),
+        r = &mut server => {
+            server_done = true;
+            r.map_err(anyhow::Error::from)
+        },
         _ = shutdown => Ok(()),
         _ = home_stopped => {
             home_failed = true;
             Err(anyhow::anyhow!("home subscriber stopped; shutting down"))
         }
     };
-    // Go's Service.Shutdown sends the mDNS goodbye (shutdownDiscovery) before
-    // Server.Stop, which closes the HTTP server without draining (`http.Server.Close`);
-    // dropping the server future afterwards does the same.
-    advertiser.shutdown().await;
-    drop(server);
-    // Go drains the Home registry and flushes releases before exiting.
-    if let Some((shutdown, task)) = home
-        && !home_failed
-    {
-        shutdown.cancel();
-        let _ = task.await;
+    // Go v8.0.35 stops Home, pprof, discovery, then the API server. Keep serving
+    // API requests while Home drains and flushes releases and pprof drains.
+    let cleanup = async {
+        if let Some((shutdown, task)) = home
+            && !home_failed
+        {
+            shutdown.cancel();
+            let _ = task.await;
+        }
+        pprof.shutdown().await;
+        advertiser.shutdown().await;
+    };
+    tokio::pin!(cleanup);
+    if server_done {
+        cleanup.await;
+    } else {
+        tokio::select! {
+            _ = &mut cleanup => {},
+            _ = &mut server => cleanup.await,
+        }
     }
+    // Server.Stop closes the HTTP server without draining (http.Server.Close).
+    drop(server);
     served
 }
 
@@ -1780,6 +1772,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Go `TestSIWCManagementRouteAccessControl`: the v8 SIWC bind route answers its
+    /// own validation once authorized, 401 without the key, and 404 when management is
+    /// disabled or the node runs in Home mode.
+    #[tokio::test]
+    async fn siwc_bind_route_follows_management_availability() {
+        use tower::ServiceExt as _;
+        let dir = std::env::temp_dir().join(format!("cpa-siwc-route-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, format!("auth-dir: '{}'\n", dir.join("auth").display())).unwrap();
+        let config = Config::load(&path).unwrap();
+        for (name, enabled, home, authorized, want) in [
+            ("authorized invalid target", true, false, true, 400),
+            ("missing management key", true, false, false, 401),
+            ("management disabled", false, false, true, 404),
+            ("home disabled local API", true, true, true, 404),
+        ] {
+            let executors = Executors {
+                claude: ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            };
+            let rt = Arc::new(cpa_server::testing::runtime(config.clone(), Vec::new(), executors));
+            let options = cpa_server::management::Options {
+                // MANAGEMENT_PASSWORD; with no config secret it alone decides availability.
+                management_password: Some(if enabled {
+                    "fake-management-only".into()
+                } else {
+                    String::new()
+                }),
+                // Keeps the log-folder probe out of the working directory.
+                log_dir: Some(dir.join("logs")),
+                ..Default::default()
+            };
+            let management = cpa_server::management::Management::with_options(rt.clone(), path.clone(), options);
+            let mut request = axum::http::Request::post("/v8/management/oauth/siwc/bind")
+                .header("content-type", "application/json")
+                .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    1234,
+                ))));
+            if authorized {
+                request = request.header("authorization", "Bearer fake-management-only");
+            }
+            let response = app(&rt, &management, home)
+                .oneshot(request.body(axum::body::Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, want, "{name}: {}", String::from_utf8_lossy(&body));
+            match want {
+                400 => assert_eq!(&body[..], br#"{"error":"name is required"}"#, "{name}"),
+                // gin `AbortWithStatus`: no body.
+                404 => assert!(body.is_empty(), "{name}: {}", String::from_utf8_lossy(&body)),
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cloud_mode_treats_missing_empty_and_broken_files_as_empty_config() {
         let dir = std::env::temp_dir().join(format!("cpa-cloud-{}", std::process::id()));
@@ -1830,14 +1885,5 @@ mod tests {
             io::ErrorKind::AddrInUse,
             "must not silently fall back to IPv4"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_missing_ipv6_falls_back_to_ipv4() {
-        assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EAFNOSUPPORT)));
-        assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)));
-        assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EADDRINUSE)));
-        assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EACCES)));
     }
 }

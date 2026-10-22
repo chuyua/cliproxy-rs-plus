@@ -5,6 +5,7 @@
 //! Home does not know about.
 
 use base64::Engine;
+use cpa_core::gostr::GoStr;
 use serde_json::{Map, Value};
 
 use crate::client::Client;
@@ -42,7 +43,7 @@ impl RefreshError {
 
 /// Go `statusFromHomeErrorCode`.
 fn status_from_code(code: &str) -> u16 {
-    match code.trim().to_lowercase().as_str() {
+    match code.trim().go_lower().as_str() {
         "authentication_error"
         | "unauthorized"
         | "invalid_grant"
@@ -175,7 +176,7 @@ fn error_envelope(raw: &[u8]) -> Option<RefreshError> {
         404 => "credential refresh target not found",
         _ => "credential refresh temporarily unavailable",
     };
-    let log = match code.trim().to_lowercase() {
+    let log = match code.trim().go_lower() {
         kind if kind.is_empty() => message.to_owned(),
         kind => format!("Home refresh failed: type={kind}"),
     };

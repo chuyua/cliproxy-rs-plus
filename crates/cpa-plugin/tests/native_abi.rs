@@ -80,3 +80,118 @@ fn calls_racing_shutdown_are_safe() {
         Err("plugin client is closed".into())
     );
 }
+
+#[test]
+fn replacing_an_artifact_keeps_old_images_and_rejects_late_callbacks() {
+    // A small native plugin makes each build distinguishable and exposes a late
+    // callback, as a resident Go runtime can issue after logical shutdown.
+    let root = support::scratch("native-shadow");
+    let source = root.join("plugin.c");
+    let artifact = root.join(format!(
+        "plugin{}",
+        cpa_plugin::platform::extension(cpa_plugin::platform::goos())
+    ));
+    std::fs::write(
+        &source,
+        r#"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { void *ptr; size_t len; } buffer;
+typedef struct {
+    uint32_t version; void *ctx;
+    int (*call)(void *, const char *, const uint8_t *, size_t, buffer *);
+    void (*free_buffer)(void *, size_t);
+} host_api;
+typedef struct {
+    uint32_t version;
+    int (*call)(const char *, const uint8_t *, size_t, buffer *);
+    void (*free_buffer)(void *, size_t);
+    void (*shutdown)(void);
+} plugin_api;
+static const host_api *host;
+static int shutdown_count;
+static int late_callback(void) {
+    buffer response = {0};
+    int status = host->call(host->ctx, "host.log", NULL, 0, &response);
+    if (response.ptr) host->free_buffer(response.ptr, response.len);
+    return status;
+}
+static int call(const char *method, const uint8_t *request, size_t len, buffer *response) {
+    (void)request; (void)len;
+    uintptr_t value = strcmp(method, "late") == 0 ? (uintptr_t)late_callback : VERSION + shutdown_count;
+    response->len = sizeof(value);
+    response->ptr = malloc(sizeof(value));
+    memcpy(response->ptr, &value, sizeof(value));
+    return 0;
+}
+static void free_buffer(void *ptr, size_t len) { (void)len; free(ptr); }
+static void shutdown_plugin(void) { shutdown_count++; }
+int cliproxy_plugin_init(const host_api *in, plugin_api *out) {
+    host = in;
+    *out = (plugin_api){1, call, free_buffer, shutdown_plugin};
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let build = |version| {
+        let next = root.join("next.so");
+        let status = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&next)
+            .arg(&source)
+            .arg(format!("-DVERSION={version}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::rename(next, &artifact).unwrap();
+    };
+    let open = || NativeClient::open(&artifact, "shadow-test", Arc::new(NoCallbacks), Arc::default()).unwrap();
+    let value = |client: &NativeClient, method| {
+        usize::from_ne_bytes(client.call(method, b"{}").unwrap()[..].try_into().unwrap())
+    };
+    build(10);
+    let first = open();
+    // SAFETY: geteuid has no preconditions.
+    let shadow_dir = std::env::temp_dir()
+        .join(format!("cliproxy-pluginhost-{}", unsafe { libc::geteuid() }))
+        .join(format!("pid-{}", std::process::id()));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(shadow_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(value(&first, "version"), 10);
+    let late = value(&first, "late");
+    build(20);
+    let second = open();
+    assert_eq!(
+        value(&first, "version"),
+        10,
+        "replacing the source does not affect an active image"
+    );
+    assert_eq!(value(&second, "version"), 20, "a changed build maps as a fresh image");
+    first.shutdown();
+    first.shutdown();
+    drop(first);
+    // SAFETY: the test plugin returns its late_callback entry point as uintptr_t.
+    // It remains callable after shutdown because the loader retains its image.
+    let late: unsafe extern "C" fn() -> std::ffi::c_int = unsafe { std::mem::transmute(late) };
+    assert_eq!(
+        unsafe { late() },
+        1,
+        "a stale context fails lookup without touching a freed host"
+    );
+    assert_eq!(value(&second, "version"), 20);
+    second.shutdown();
+    drop(second);
+    let reused = open();
+    assert_eq!(
+        value(&reused, "version"),
+        21,
+        "unchanged content reuses the resident image"
+    );
+    reused.shutdown();
+    std::fs::remove_dir_all(root).unwrap();
+}

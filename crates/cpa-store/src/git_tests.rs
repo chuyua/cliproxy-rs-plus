@@ -512,6 +512,65 @@ fn fails_closed_on_a_same_path_conflict() {
     );
 }
 
+/// Go `GitTokenStore.Save` order: sync, then write, then commit. A credential another
+/// node changed is pulled before the new contents land, so re-saving it succeeds
+/// where writing first would conflict with the remote change; a failed sync writes
+/// nothing.
+#[test]
+fn save_syncs_before_writing_a_remotely_changed_credential() {
+    let root = scratch("save-order");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let a = store(&remote, "", &root.join("workspace-a"));
+    a.ensure_repository().unwrap();
+    save(&a, "vertex-p.json", r#"{"v":1}"#);
+    let b = store(&remote, "", &root.join("workspace-b"));
+    b.ensure_repository().unwrap();
+    save(&a, "vertex-p.json", r#"{"v":2}"#);
+    let path = b.auth_dir().join("vertex-p.json");
+    let write = |contents: &'static str| -> cpa_server::persist::SaveFn<'static> {
+        let path = path.clone();
+        Box::new(move || {
+            std::fs::write(&path, contents)?;
+            Ok(Some(path))
+        })
+    };
+    assert_eq!(b.save(write(r#"{"v":3}"#)).unwrap(), Some(path.clone()));
+    assert_eq!(
+        remote_file(&remote, "master", "auths/vertex-p.json").unwrap(),
+        r#"{"v":3}"#
+    );
+    let log = git(Path::new(&remote), &["log", "-1", "--format=%s"]);
+    assert_eq!(log, "Update auth vertex-p.json");
+
+    // The same re-save written before the sync conflicts with the remote change.
+    let a_path = a.auth_dir().join("vertex-p.json");
+    a.save(Box::new(|| {
+        std::fs::write(&a_path, r#"{"v":4}"#)?;
+        Ok(Some(a_path.clone()))
+    }))
+    .unwrap();
+    std::fs::write(&path, r#"{"v":5}"#).unwrap();
+    let error = format!(
+        "{:#}",
+        b.persist_auth_files("Sync auth vertex-p.json", std::slice::from_ref(&path))
+            .unwrap_err()
+    );
+    assert!(error.contains("conflicts with local change"), "{error}");
+    git(&root.join("workspace-b"), &["checkout", "--", "auths/vertex-p.json"]);
+
+    std::fs::rename(&remote, root.join("gone.git")).unwrap();
+    let fresh = b.auth_dir().join("vertex-q.json");
+    let called = std::cell::Cell::new(false);
+    let error = b
+        .save(Box::new(|| {
+            called.set(true);
+            Ok(Some(fresh.clone()))
+        }))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("pull"), "{error:#}");
+    assert!(!called.get() && !fresh.exists(), "a failed sync writes nothing");
+}
+
 /// Go `TestCommitAndPushLockedPushesBeforeRunningGC`: a due GC never delays the push.
 #[test]
 fn pushes_before_running_gc() {

@@ -224,25 +224,28 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
     if signatures.is_empty() {
         return gemini;
     }
-    let Some(GoValue::Object(mut root)) = GoValue::parse_f64(&gemini) else {
+    let Some(Ok(mut root)) = GoValue::parse_f64(&gemini).map(GoValue::into_object) else {
         return gemini;
     };
-    let Some(GoValue::Array(contents)) = root.remove("contents") else {
+    let Some(Ok(contents)) = root.remove("contents").map(GoValue::into_array) else {
         return gemini;
     };
     let mut next = 0;
     let mut changed = false;
     let mut kept_contents = vec![];
     for content in contents {
-        let GoValue::Object(mut content) = content else {
-            kept_contents.push(content);
-            continue;
+        let mut content = match content.into_object() {
+            Ok(content) => content,
+            Err(content) => {
+                kept_contents.push(content);
+                continue;
+            }
         };
-        let parts = match content.remove("parts") {
-            Some(GoValue::Array(parts)) => parts,
+        let parts = match content.remove("parts").map(GoValue::into_array) {
+            Some(Ok(parts)) => parts,
             other => {
                 // Contents whose parts are not an array stay as they are.
-                if let Some(parts) = other {
+                if let Some(Err(parts)) = other {
                     content.insert("parts".into(), parts);
                 }
                 kept_contents.push(GoValue::Object(content));
@@ -251,9 +254,12 @@ fn rewrite_claude_reasoning(model: &str, raw: &[u8], gemini: Vec<u8>) -> Vec<u8>
         };
         let mut kept = vec![];
         for part in parts {
-            let GoValue::Object(mut map) = part else {
-                kept.push(part);
-                continue;
+            let mut map = match part.into_object() {
+                Ok(map) => map,
+                Err(part) => {
+                    kept.push(part);
+                    continue;
+                }
             };
             if map.get("thought") != Some(&GoValue::Bool(true)) {
                 kept.push(GoValue::Object(map));

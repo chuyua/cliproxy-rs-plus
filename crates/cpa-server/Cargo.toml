@@ -10,6 +10,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
 axum = { workspace = true, features = ["ws"] }
+backtrace = { version = "0.3", optional = true }
 bytes.workspace = true
 btls = "0.5.6"
 cpa-common.workspace = true
@@ -23,7 +24,7 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml_ng.workspace = true
 socket2.workspace = true
 tokio.workspace = true
@@ -55,15 +56,20 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # ReadDirectoryChangesW on Windows. Both crates are already in the dependency tree.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# CPU sampling is never linked into default builds or published release binaries.
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 
 [features]
 media-relay = ["dep:webrtc", "dep:rtc", "dep:async-trait"]
+pprof = ["dep:pprof", "dep:backtrace"]
 
 [dev-dependencies]
+cpa-core = { workspace = true, features = ["test-support"] }
 cpa-plugin = { workspace = true, features = ["test-support"] }
 url = "2"
 tokio = { workspace = true, features = ["test-util"] }
 wreq = { workspace = true, features = ["ws"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }

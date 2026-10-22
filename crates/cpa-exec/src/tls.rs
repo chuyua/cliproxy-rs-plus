@@ -8,6 +8,9 @@
 //! Every other origin uses Go's standard transport from [`crate::proxy`].
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cpa_core::config::Config;
 
 use crate::proxy::{Hooks, Proxy};
 use wreq::tls::session::LruTlsSessionCache;
@@ -24,7 +27,38 @@ pub(crate) struct Clients {
 /// Process-wide transport cache. Construct once per executor set.
 pub struct Transport {
     hooks: Hooks,
-    cache: Mutex<Vec<(Proxy, Arc<Clients>)>>,
+    /// By effective proxy and TLS handshake bound.
+    cache: Mutex<Vec<(ClientsKey, Arc<Clients>)>>,
+}
+
+type ClientsKey = (Proxy, Option<Duration>);
+
+/// `requests.tls-handshake-timeout-seconds` (Go `SDKConfig.TLSHandshakeTimeout`, v8.0.35
+/// 345cc9d5 and b3dc6c3f): the bound on TLS establishment through the Claude Code and
+/// Chrome transports. 0 or less turns it off; Go saturates values past its duration range.
+/// Read from each request's config snapshot, so a reload applies to the next dial.
+pub(crate) fn handshake_timeout(cfg: &Config) -> Option<Duration> {
+    let seconds = cfg
+        .document
+        .get("requests")?
+        .get("tls-handshake-timeout-seconds")?
+        .as_i64()?;
+    u64::try_from(seconds).ok().filter(|s| *s > 0).map(|s| match s {
+        // Past time.Duration's range Go saturates at math.MaxInt64 nanoseconds.
+        s if s > i64::MAX as u64 / 1_000_000_000 => Duration::from_nanos(i64::MAX as u64),
+        s => Duration::from_secs(s),
+    })
+}
+
+/// Bounds TLS establishment with `handshake`.
+// ponytail: wreq has no handshake-only hook, so the bound also covers DNS, the TCP connect
+// and a proxy CONNECT, which Go leaves unbounded; it never limits a request once its
+// connection is up. Upgrade path: a wreq connector hook around the TLS step.
+pub(crate) fn bound_handshake(builder: wreq::ClientBuilder, handshake: Option<Duration>) -> wreq::ClientBuilder {
+    match handshake {
+        Some(timeout) => builder.connect_timeout(timeout),
+        None => builder,
+    }
 }
 
 impl Transport {
@@ -36,25 +70,30 @@ impl Transport {
     }
 
     /// Clients for `proxy`, most recently used first; evicts the least recently used.
-    pub(crate) fn clients(&self, proxy: &Proxy) -> wreq::Result<Arc<Clients>> {
+    /// `handshake` bounds the native client's TLS establishment ([`handshake_timeout`]);
+    /// the OAuth profile is not Go's shared uTLS client and ignores it.
+    pub(crate) fn clients(&self, proxy: &Proxy, handshake: Option<Duration>) -> wreq::Result<Arc<Clients>> {
         let mut cache = self.cache.lock().expect("transport cache");
-        if let Some(i) = cache.iter().position(|(p, _)| p == proxy) {
+        if let Some(i) = cache.iter().position(|((p, h), _)| p == proxy && *h == handshake) {
             let entry = cache.remove(i);
             let clients = entry.1.clone();
             cache.insert(0, entry);
             return Ok(clients);
         }
         let clients = Arc::new(Clients {
-            native: self.build(Profile::Native, proxy)?,
-            oauth: self.build(Profile::OAuth, proxy)?,
+            native: self.build(Profile::Native, proxy, handshake)?,
+            oauth: self.build(Profile::OAuth, proxy, None)?,
         });
-        cache.insert(0, (proxy.clone(), clients.clone()));
+        cache.insert(0, ((proxy.clone(), handshake), clients.clone()));
         cache.truncate(TRANSPORT_CACHE);
         Ok(clients)
     }
 
-    fn build(&self, profile: Profile, proxy: &Proxy) -> wreq::Result<wreq::Client> {
-        let mut builder = wreq::Client::builder().redirect(wreq::redirect::Policy::none());
+    fn build(&self, profile: Profile, proxy: &Proxy, handshake: Option<Duration>) -> wreq::Result<wreq::Client> {
+        let mut builder = bound_handshake(
+            wreq::Client::builder().redirect(wreq::redirect::Policy::none()),
+            handshake,
+        );
         builder = match profile {
             // Inference requests are timed for the usage record.
             Profile::Native => crate::proxy::watch_connections(builder)
@@ -141,7 +180,7 @@ mod tests {
             trust: None,
             resolve: vec![("claude-capture.test".into(), address)],
         });
-        let clients = transport.clients(&Proxy::Inherit).unwrap();
+        let clients = transport.clients(&Proxy::Inherit, None).unwrap();
         let client = if oauth { &clients.oauth } else { &clients.native };
         // The local listener closes after the ClientHello, so TLS must fail before HTTP.
         assert!(
@@ -252,25 +291,98 @@ mod tests {
         });
         let url = format!("https://{host}:{}/v1/messages", addr.port());
         for _ in 0..3 {
-            let clients = transport.clients(&Proxy::Inherit).unwrap();
+            let clients = transport.clients(&Proxy::Inherit, None).unwrap();
             let response = clients.native.post(&url).body("{}").send().await.unwrap();
             assert_eq!(response.bytes().await.unwrap(), "ok");
         }
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "connections");
     }
 
+    /// A peer that accepts the connection and reads the ClientHello but never answers
+    /// (Go #6615): `requests.tls-handshake-timeout-seconds` fails the native dial; without
+    /// it the request waits.
+    #[tokio::test]
+    async fn silent_handshake_fails_only_with_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut hello = [0; 5];
+                let _ = socket.read_exact(&mut hello).await;
+                held.push(socket);
+            }
+        });
+        let transport = Transport::new(Hooks {
+            trust: None,
+            resolve: vec![("claude-silent.test".into(), address)],
+        });
+        let url = format!("https://claude-silent.test:{}/v1/messages", address.port());
+        let send = |handshake| {
+            let client = transport.clients(&Proxy::Inherit, handshake).unwrap().native.clone();
+            let url = url.clone();
+            async move { client.post(url).body("{}").send().await }
+        };
+        let started = std::time::Instant::now();
+        let bounded = tokio::time::timeout(Duration::from_secs(10), send(Some(Duration::from_secs(1))))
+            .await
+            .expect("bounded handshake returns");
+        assert!(bounded.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), send(None)).await.is_err(),
+            "unbounded handshake keeps waiting"
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_reads_the_root_key_and_its_legacy_spelling() {
+        let read = |yaml: &str| handshake_timeout(&cpa_core::config::Config::parse(yaml).unwrap());
+        assert_eq!(
+            read("requests:\n  tls-handshake-timeout-seconds: 7\n"),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(read("tls-handshake-timeout-seconds: 3\n"), Some(Duration::from_secs(3)));
+        assert_eq!(read("requests:\n  tls-handshake-timeout-seconds: 0\n"), None);
+        assert_eq!(read("requests:\n  tls-handshake-timeout-seconds: -5\n"), None);
+        assert_eq!(read("{}\n"), None);
+        // The canonical key wins over the flat spelling, even at 0.
+        let both =
+            |v: u32| format!("tls-handshake-timeout-seconds: 7\nrequests:\n  tls-handshake-timeout-seconds: {v}\n");
+        assert_eq!(read(&both(12)), Some(Duration::from_secs(12)));
+        assert_eq!(read(&both(0)), None);
+        // The unreleased upstream.claude spelling is not an entry point.
+        assert_eq!(
+            read("upstream:\n  claude:\n    tls-handshake-timeout-seconds: 99\n"),
+            None
+        );
+        // Go saturates at the largest time.Duration (math.MaxInt64 nanoseconds).
+        assert_eq!(
+            read("requests:\n  tls-handshake-timeout-seconds: 9223372036854775807\n"),
+            Some(Duration::from_nanos(i64::MAX as u64))
+        );
+        assert_eq!(
+            read("requests:\n  tls-handshake-timeout-seconds: 9223372037\n"),
+            Some(Duration::from_nanos(i64::MAX as u64))
+        );
+        assert_eq!(
+            read("requests:\n  tls-handshake-timeout-seconds: 9223372036\n"),
+            Some(Duration::from_secs(9_223_372_036))
+        );
+    }
+
     #[test]
     fn transport_lru_bound() {
         let t = Transport::new(Hooks::default());
-        let first = t.clients(&Proxy::Url("http://p0:1".into())).unwrap();
+        let first = t.clients(&Proxy::Url("http://p0:1".into()), None).unwrap();
         for i in 1..=TRANSPORT_CACHE {
-            t.clients(&Proxy::Url(format!("http://p{i}:1"))).unwrap();
+            t.clients(&Proxy::Url(format!("http://p{i}:1")), None).unwrap();
         }
         assert_eq!(t.cache.lock().unwrap().len(), TRANSPORT_CACHE);
         // p0 was least recently used and is rebuilt (a distinct client set).
-        let again = t.clients(&Proxy::Url("http://p0:1".into())).unwrap();
+        let again = t.clients(&Proxy::Url("http://p0:1".into()), None).unwrap();
         assert!(!Arc::ptr_eq(&first, &again));
-        let cached = t.clients(&Proxy::Url("http://p0:1".into())).unwrap();
+        let cached = t.clients(&Proxy::Url("http://p0:1".into()), None).unwrap();
         assert!(Arc::ptr_eq(&again, &cached));
     }
 }

@@ -2,6 +2,7 @@
 //! half of `pickHomeDispatchSelection`): the accounted concurrency tuple, Home's typed
 //! errors and the dispatched auth.
 
+use cpa_core::gostr::GoStr;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -17,7 +18,7 @@ fn recognized_suffix(value: &str) -> bool {
         return true;
     }
     if matches!(
-        value.to_lowercase().as_str(),
+        value.go_lower().as_str(),
         "none" | "auto" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     ) {
         return true;
@@ -31,7 +32,7 @@ fn recognized_suffix(value: &str) -> bool {
 /// Go `canonicalHomeConcurrencyModelKey`: lowercase, trimmed, recognized `(suffix)`
 /// removed.
 pub fn canonical_concurrency_model_key(model: &str) -> String {
-    let trimmed = model.trim_matches(ASCII_WHITESPACE).to_lowercase();
+    let trimmed = model.trim_matches(ASCII_WHITESPACE).go_lower();
     let Some(body) = trimmed.strip_suffix(')') else {
         return trimmed;
     };
@@ -192,7 +193,7 @@ pub fn decode_error(raw: &[u8]) -> Option<HomeError> {
         status: 502,
         kind: HomeErrorKind::Plain,
     };
-    match code.to_lowercase().as_str() {
+    match code.go_lower().as_str() {
         "model_not_found" => error.status = 404,
         "model_cooldown" => {
             error.status = 429;

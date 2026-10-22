@@ -21,10 +21,11 @@ use serde_json::{Map, Value};
 use super::{ModelInfo, ThinkingSupport, pinned};
 use crate::config::Config;
 use crate::credential::{Credential, Source};
+use crate::gostr::GoStr;
 
 /// Go `responsesWebSearchProviderPathSupport`.
 fn provider_web_search_path(provider: &str) -> Option<bool> {
-    match provider.trim().to_lowercase().as_str() {
+    match provider.trim().go_lower().as_str() {
         "codex" | "xai" | "claude" | "antigravity" => Some(true),
         "openai"
         | "openai-compatibility"
@@ -199,7 +200,7 @@ pub fn thinking_value(t: &ThinkingSupport) -> Value {
 /// non-empty `api_key` attribute (`apikey`), then OAuth token metadata (`oauth`).
 /// Unrecognised kinds fall through to the next source.
 pub fn auth_kind(c: &Credential) -> Option<&'static str> {
-    let normalize = |s: &str| match s.trim().to_lowercase().as_str() {
+    let normalize = |s: &str| match s.trim().go_lower().as_str() {
         "apikey" | "api_key" | "api-key" => Some("apikey"),
         "oauth" | "oauth2" => Some("oauth"),
         _ => None,
@@ -264,7 +265,7 @@ fn openai_compat(c: &Credential) -> bool {
     ["compat_name", "provider_key"]
         .iter()
         .any(|k| c.attributes.get(*k).is_some_and(|v| !v.trim().is_empty()))
-        || c.provider.eq_ignore_ascii_case("openai-compatibility")
+        || c.provider.trim().go_eq_fold("openai-compatibility")
 }
 
 /// The provider key a credential registers and is scheduled under.
@@ -276,9 +277,9 @@ pub fn provider_key(c: &Credential) -> String {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
     {
-        return key.to_lowercase();
+        return key.go_lower();
     }
-    c.provider.trim().to_lowercase()
+    c.provider.trim().go_lower()
 }
 
 /// The authoritative `prefix` (attributes first, then file metadata).
@@ -365,8 +366,8 @@ fn sanitize_aliases(entries: Vec<OAuthAlias>) -> Vec<OAuthAlias> {
             e.display_name = e.display_name.trim().to_owned();
             (!e.name.is_empty()
                 && !e.alias.is_empty()
-                && !e.name.eq_ignore_ascii_case(&e.alias)
-                && seen.insert(e.alias.to_lowercase()))
+                && !e.name.go_eq_fold(&e.alias)
+                && seen.insert(e.alias.go_lower()))
             .then_some(e)
         })
         .collect()
@@ -384,7 +385,7 @@ pub fn global_aliases(cfg: &Config) -> HashMap<String, Vec<OAuthAlias>> {
         return out;
     };
     for (channel, list) in map {
-        let channel = channel.as_str().unwrap_or_default().trim().to_lowercase();
+        let channel = channel.as_str().unwrap_or_default().trim().go_lower();
         let entries: Vec<OAuthAlias> = serde_yaml_ng::from_value(list.clone()).unwrap_or_default();
         let clean = sanitize_aliases(entries);
         if !channel.is_empty() && !clean.is_empty() {
@@ -424,7 +425,7 @@ fn alias_channel(c: &Credential) -> Option<String> {
     if is_api_key(c) {
         return None;
     }
-    match c.provider.trim().to_lowercase().as_str() {
+    match c.provider.trim().go_lower().as_str() {
         "gemini" | "" => None,
         other => Some(other.to_owned()),
     }
@@ -435,9 +436,9 @@ fn oauth_aliases_for(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credent
         return Vec::new();
     };
     let mut out = attribute_aliases(c);
-    let mut seen: std::collections::HashSet<String> = out.iter().map(|a| a.alias.to_lowercase()).collect();
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|a| a.alias.go_lower()).collect();
     for entry in cfg_aliases.get(&channel).into_iter().flatten() {
-        if seen.insert(entry.alias.to_lowercase()) {
+        if seen.insert(entry.alias.go_lower()) {
             out.push(entry.clone());
         }
     }
@@ -488,14 +489,15 @@ fn excluded_for(cfg: &Config, c: &Credential) -> Vec<String> {
         return Vec::new();
     }
     crate::config::credentials::oauth_excluded(cfg)
-        .remove(&c.provider.trim().to_lowercase())
+        .remove(&c.provider.trim().go_lower())
         .unwrap_or_default()
 }
 
+/// Go `applyExcludedModels`: patterns and model IDs both go through `strings.ToLower`.
 fn apply_excluded(models: Vec<Spec>, excluded: &[String]) -> Vec<Spec> {
     let patterns: Vec<String> = excluded
         .iter()
-        .map(|p| p.trim().to_lowercase())
+        .map(|p| p.trim().go_lower())
         .filter(|p| !p.is_empty())
         .collect();
     if patterns.is_empty() {
@@ -504,7 +506,7 @@ fn apply_excluded(models: Vec<Spec>, excluded: &[String]) -> Vec<Spec> {
     models
         .into_iter()
         .filter(|m| {
-            let id = m.id.trim().to_lowercase();
+            let id = m.id.trim().go_lower();
             !patterns.iter().any(|p| wildcard(p, &id))
         })
         .collect()
@@ -522,7 +524,7 @@ fn native_web_search(info: &ModelInfo) -> Option<bool> {
 fn normalize_modalities(raw: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     raw.iter()
-        .map(|m| m.trim().to_lowercase())
+        .map(|m| m.trim().go_lower())
         .filter(|m| !m.is_empty() && seen.insert(m.clone()))
         .collect()
 }
@@ -557,7 +559,7 @@ fn codex_channel(name: &str) -> Vec<Spec> {
     let mut models: Vec<Spec> = channel(name)
         .into_iter()
         .filter(|m| {
-            let id = m.id.trim().to_lowercase();
+            let id = m.id.trim().go_lower();
             !id.is_empty() && !builtins.iter().any(|b| b.id == id)
         })
         .collect();
@@ -565,10 +567,10 @@ fn codex_channel(name: &str) -> Vec<Spec> {
     models
 }
 
-/// Go `WithXAIBuiltins` (`upsertModelInfos`): the hard-coded image and video models,
-/// appended after the channel's models and replacing any with the same ID.
+/// Go `WithXAIBuiltins` (`upsertModelInfos`): the hard-coded image, video and speech
+/// models, appended after the channel's models and replacing any with the same ID.
 fn with_xai_builtins(models: Vec<Spec>) -> Vec<Spec> {
-    const BUILTINS: [(&str, i64, &str, &str); 6] = [
+    const BUILTINS: [(&str, i64, &str, &str); 8] = [
         (
             "grok-imagine-image",
             1735689600,
@@ -605,12 +607,25 @@ fn with_xai_builtins(models: Vec<Spec>) -> Vec<Spec> {
             "Grok Imagine Video 1.5 Preview",
             "Compatibility alias for the xAI Grok video generation model.",
         ),
+        (
+            "grok-tts",
+            1773619200,
+            "Grok TTS",
+            "xAI Grok unary text-to-speech model.",
+        ),
+        (
+            "grok-voice-tts-1.0",
+            1773619200,
+            "Grok Voice TTS 1.0",
+            "xAI Grok unary text-to-speech model.",
+        ),
     ];
     let mut out: Vec<Spec> = models
         .into_iter()
         .filter(|m| {
-            let id = m.id.trim();
-            !id.is_empty() && !BUILTINS.iter().any(|(b, ..)| b.eq_ignore_ascii_case(id))
+            // Go `upsertModelInfos` compares `strings.ToLower` keys.
+            let id = m.id.trim().go_lower();
+            !id.is_empty() && !BUILTINS.iter().any(|(b, ..)| b.go_lower() == id)
         })
         .collect();
     out.extend(BUILTINS.iter().map(|(id, created, display, description)| Spec {
@@ -646,7 +661,7 @@ fn build_config_models(
             } else {
                 m.alias.trim()
             };
-            if alias.is_empty() || !seen.insert(alias.to_lowercase()) {
+            if alias.is_empty() || !seen.insert(alias.go_lower()) {
                 return None;
             }
             let display = [m.display_name.trim(), name, alias]
@@ -694,7 +709,7 @@ pub fn normalize_thinking(mut t: ThinkingSupport) -> ThinkingSupport {
     let mut seen = std::collections::HashSet::new();
     let levels = std::mem::take(&mut t.levels);
     for level in levels {
-        let level = level.trim().to_lowercase();
+        let level = level.trim().go_lower();
         if level.is_empty() {
             continue;
         }
@@ -770,7 +785,7 @@ fn compat_models(models: &[ConfigModel], owned_by: &str, now: i64) -> Vec<Spec> 
 fn apply_aliases(aliases: &[OAuthAlias], models: Vec<Spec>) -> Vec<Spec> {
     let mut forward: HashMap<String, Vec<&OAuthAlias>> = HashMap::new();
     for a in aliases {
-        forward.entry(a.name.to_lowercase()).or_default().push(a);
+        forward.entry(a.name.go_lower()).or_default().push(a);
     }
     if forward.is_empty() {
         return models;
@@ -782,7 +797,7 @@ fn apply_aliases(aliases: &[OAuthAlias], models: Vec<Spec>) -> Vec<Spec> {
         if id.is_empty() {
             continue;
         }
-        let key = id.to_lowercase();
+        let key = id.go_lower();
         let Some(entries) = forward.get(&key) else {
             if seen.insert(key) {
                 out.push(model);
@@ -796,7 +811,7 @@ fn apply_aliases(aliases: &[OAuthAlias], models: Vec<Spec>) -> Vec<Spec> {
         let mut added = false;
         for entry in entries {
             let mapped = entry.alias.trim();
-            if mapped.is_empty() || mapped.eq_ignore_ascii_case(&id) || !seen.insert(mapped.to_lowercase()) {
+            if mapped.is_empty() || mapped.go_eq_fold(&id) || !seen.insert(mapped.go_lower()) {
                 continue;
             }
             let mut clone = model.clone();
@@ -822,10 +837,10 @@ fn apply_aliases(aliases: &[OAuthAlias], models: Vec<Spec>) -> Vec<Spec> {
 
 fn rewrite_name(name: &str, old: &str, new: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.is_empty() || old.eq_ignore_ascii_case(new) {
+    if trimmed.is_empty() || old.go_eq_fold(new) {
         return name.to_owned();
     }
-    if trimmed.eq_ignore_ascii_case(old) {
+    if trimmed.go_eq_fold(old) {
         return new.to_owned();
     }
     if let Some(prefix) = trimmed.strip_suffix(old).filter(|p| p.ends_with('/')) {
@@ -892,8 +907,61 @@ pub fn set_web_search_hints(credential: &str, ids: std::collections::HashSet<Str
     changed
 }
 
-/// Bumped whenever [`set_web_search_hints`] changes a credential's hints; registries
-/// derived from credentials key on it.
+/// Plugin-owned models (Go v8.0.35 `pluginHost.ModelsForProvider` and the executor model
+/// clients `plugin:<id>:<provider>:executor`), published by the server's plugin host.
+/// Catalog models reach the registry only through credentials of their provider.
+/// ponytail: one process-wide catalog, as the server runs one plugin host; a second host
+/// in the same process would need the catalog on the runtime instead.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PluginCatalog {
+    /// Lowercased provider to its plugin models, first registration of an ID first.
+    pub providers: HashMap<String, Vec<Spec>>,
+    /// `(client, provider, models)` of the plugin executors that claimed models.
+    pub clients: Vec<(String, String, Vec<Spec>)>,
+}
+
+static PLUGIN_CATALOG: std::sync::LazyLock<std::sync::RwLock<Arc<PluginCatalog>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Replaces the plugin catalog; a change bumps [`capabilities_generation`] and returns
+/// true.
+pub fn set_plugin_catalog(catalog: PluginCatalog) -> bool {
+    let mut current = PLUGIN_CATALOG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if **current == catalog {
+        return false;
+    }
+    *current = Arc::new(catalog);
+    HINTS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    true
+}
+
+fn plugin_catalog() -> Arc<PluginCatalog> {
+    PLUGIN_CATALOG
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Go `appendPluginModels`: the provider's plugin models not excluded by their own IDs,
+/// after the models the credential already has.
+fn append_plugin_models(provider: &str, mut models: Vec<Spec>, excluded: &[String]) -> Vec<Spec> {
+    let catalog = plugin_catalog();
+    let Some(plugin) = catalog.providers.get(provider) else {
+        return models;
+    };
+    let mut seen: std::collections::HashSet<String> = models.iter().map(|m| m.id.trim().to_owned()).collect();
+    for model in apply_excluded(plugin.clone(), excluded) {
+        if seen.insert(model.id.trim().to_owned()) {
+            models.push(model);
+        }
+    }
+    models
+}
+
+/// Bumped whenever [`set_web_search_hints`] changes a credential's hints or
+/// [`set_plugin_catalog`] the plugin catalog; registries derived from credentials key on it.
 pub fn capabilities_generation() -> u64 {
     HINTS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -905,7 +973,7 @@ fn with_web_search_hints(credential: &str, mut models: Vec<Spec>) -> Vec<Spec> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(ids) = hints.get(credential) {
         for model in &mut models {
-            if ids.contains(&model.id.trim().to_lowercase()) {
+            if ids.contains(&model.id.trim().go_lower()) {
                 model.supports_web_search = true;
             }
         }
@@ -921,10 +989,12 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
     let excluded = excluded_for(cfg, c);
     let configured = config_models(c);
     let api_key = is_api_key(c);
-    let provider = c.provider.trim().to_lowercase();
+    let provider = c.provider.trim().go_lower();
     if openai_compat(c) {
         let owned_by = c.attributes.get("compat_name").cloned().unwrap_or_default();
-        let models = compat_models(&configured, &owned_by, now);
+        // Go appends the provider's plugin models here too, without exclusions, and
+        // even when no models are configured.
+        let models = append_plugin_models(&provider_key(c), compat_models(&configured, &owned_by, now), &[]);
         return apply_prefix(models, credential_prefix(c), cfg.routing.force_model_prefix);
     }
     let with_config = |channel_models: Vec<Spec>, owned_by: &str, kind: &str, metadata: &str| {
@@ -956,7 +1026,7 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
             let plan = c
                 .attributes
                 .get("plan_type")
-                .map(|p| p.trim().to_lowercase())
+                .map(|p| p.trim().go_lower())
                 .unwrap_or_default();
             codex_channel(match plan.as_str() {
                 "plus" => "codex-plus",
@@ -974,6 +1044,7 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
     };
     let models = apply_excluded(models, &excluded);
     let models = apply_aliases(&oauth_aliases_for(aliases, c), models);
+    let models = append_plugin_models(&provider, models, &excluded);
     // ponytail: oauth.settings max-context-length overrides are not applied yet.
     apply_prefix(models, credential_prefix(c), cfg.routing.force_model_prefix)
 }
@@ -1055,6 +1126,11 @@ impl Registry {
                 registry.register(&c.id, &provider_key(c), models);
             }
         }
+        for (client, provider, models) in &plugin_catalog().clients {
+            if !registry.has_client(client) {
+                registry.register(client, provider, models.clone());
+            }
+        }
         registry
     }
 
@@ -1127,8 +1203,8 @@ impl Registry {
             return Vec::new();
         }
         let exact = self.model_providers(model);
-        if exact.is_empty() && model.to_lowercase() != model {
-            return self.model_providers(&model.to_lowercase());
+        if exact.is_empty() && model.go_lower() != model {
+            return self.model_providers(&model.go_lower());
         }
         exact
     }
@@ -1140,7 +1216,7 @@ impl Registry {
             && self
                 .clients
                 .get(client)
-                .is_some_and(|c| c.models.keys().any(|id| id.eq_ignore_ascii_case(model)))
+                .is_some_and(|c| c.models.keys().any(|id| id.go_eq_fold(model)))
     }
 
     /// Whether `client` registered anything (unregistered credentials never route).
@@ -1153,12 +1229,7 @@ impl Registry {
         let c = self.clients.get(client)?;
         c.models
             .get(model)
-            .or_else(|| {
-                c.models
-                    .iter()
-                    .find(|(id, _)| id.eq_ignore_ascii_case(model))
-                    .map(|(_, m)| m)
-            })
+            .or_else(|| c.models.iter().find(|(id, _)| id.go_eq_fold(model)).map(|(_, m)| m))
             .cloned()
     }
 
@@ -1226,7 +1297,7 @@ impl Registry {
     /// each with the first such credential's model info. Registration order (Go's is
     /// map order).
     pub fn available_by_provider(&self, provider: &str, state: impl Fn(&str, &str) -> Suspension) -> Vec<Arc<Spec>> {
-        let provider = provider.trim().to_lowercase();
+        let provider = provider.trim().go_lower();
         if provider.is_empty() {
             return Vec::new();
         }
@@ -1303,7 +1374,10 @@ fn candidates(requested: &str) -> Vec<String> {
     out
 }
 
-fn resolve_with<'a, I>(requested: &str, entries: I) -> AliasResult
+/// Go's alias resolution over `entries`: `matches(alias, candidate)` is `EqualFold` for
+/// configured models and per-credential aliases, and `strings.ToLower` key equality for
+/// the global OAuth alias table.
+fn resolve_with<'a, I>(requested: &str, entries: I, matches: fn(&str, &str) -> bool) -> AliasResult
 where
     I: Iterator<Item = (&'a str, &'a str, bool)> + Clone,
 {
@@ -1311,10 +1385,10 @@ where
     for candidate in candidates(requested) {
         for (name, alias, force) in entries.clone() {
             let (name, alias) = (name.trim(), alias.trim());
-            if name.is_empty() || alias.is_empty() || !alias.eq_ignore_ascii_case(&candidate) {
+            if name.is_empty() || alias.is_empty() || !matches(alias, &candidate) {
                 continue;
             }
-            if name.eq_ignore_ascii_case(base) {
+            if name.go_eq_fold(base) {
                 if !force {
                     return AliasResult::default();
                 }
@@ -1332,6 +1406,66 @@ where
         }
     }
     AliasResult::default()
+}
+
+fn fold(a: &str, b: &str) -> bool {
+    a.go_eq_fold(b)
+}
+
+fn same_lower(a: &str, b: &str) -> bool {
+    a.go_lower() == b.go_lower()
+}
+
+/// Go `resolveOAuthModelAliasWithResult`: the credential's own aliases first, compared
+/// with `EqualFold`, then the channel's global table, looked up by `strings.ToLower` key
+/// (`resolveUpstreamModelFromAliasTable`), with no `EqualFold` fallback.
+fn resolve_oauth(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credential, requested: &str) -> AliasResult {
+    let Some(channel) = alias_channel(c) else {
+        return AliasResult::default();
+    };
+    fn entries(aliases: &[OAuthAlias]) -> impl Iterator<Item = (&str, &str, bool)> + Clone {
+        aliases
+            .iter()
+            .map(|a| (a.name.as_str(), a.alias.as_str(), a.force_mapping))
+    }
+    let own = attribute_aliases(c);
+    let r = resolve_with(requested, entries(&own), fold);
+    if !r.upstream.is_empty() {
+        return r;
+    }
+    let global = cfg_aliases.get(&channel).map(Vec::as_slice).unwrap_or_default();
+    resolve_with(requested, entries(global), same_lower)
+}
+
+/// Go `lookupAPIKeyUpstreamModel` over the table `compileAPIKeyModelAliasForModels`
+/// builds: each entry with both a name and an alias adds its alias, suffix-free alias,
+/// name and suffix-free name under `strings.ToLower` keys, the first entry winning a key.
+/// The requested model is looked up, then its suffix-free form.
+fn api_key_table_upstream(requested: &str, models: &[ConfigModel]) -> Option<String> {
+    let requested = requested.trim();
+    let base = |s: &'_ str| -> String {
+        let s = s.trim();
+        match suffix_of(s) {
+            Some(_) => s[..s.rfind('(').unwrap()].trim().go_lower(),
+            None => s.go_lower(),
+        }
+    };
+    let mut keys = vec![requested.go_lower()];
+    let requested_base = base(requested);
+    if !requested_base.is_empty() && requested_base != keys[0] {
+        keys.push(requested_base);
+    }
+    keys.into_iter().filter(|k| !k.is_empty()).find_map(|key| {
+        models.iter().find_map(|m| {
+            let (name, alias) = (m.name.trim(), m.alias.trim());
+            if name.is_empty() || alias.is_empty() {
+                return None;
+            }
+            [alias.go_lower(), base(alias), name.go_lower(), base(name)]
+                .contains(&key)
+                .then(|| preserve_suffix(name, requested))
+        })
+    })
 }
 
 /// Go `rewriteModelForAuth`: drop the credential's `prefix/`.
@@ -1365,6 +1499,7 @@ pub fn execution_models(
                 models
                     .iter()
                     .map(|m| (m.name.as_str(), m.alias.as_str(), m.force_mapping)),
+                fold,
             );
             if r.upstream.is_empty() {
                 AliasResult {
@@ -1376,13 +1511,7 @@ pub fn execution_models(
             }
         }
     } else {
-        let aliases = oauth_aliases_for(cfg_aliases, c);
-        resolve_with(
-            requested,
-            aliases
-                .iter()
-                .map(|a| (a.name.as_str(), a.alias.as_str(), a.force_mapping)),
-        )
+        resolve_oauth(cfg_aliases, c, requested)
     };
     let upstream = if configured || alias.upstream.is_empty() {
         requested.to_owned()
@@ -1391,8 +1520,16 @@ pub fn execution_models(
     };
     if configured && !models.is_empty() {
         let pool = alias_pool(&upstream, &models);
-        if openai_compat(c) && pool.len() > 1 {
+        // Go `executionModelCandidatesWithAlias`: a non-empty compat pool wins. Otherwise
+        // `applyAPIKeyModelAliasWithRouting` tries an API key's lowercase-keyed table
+        // before the `EqualFold` scan.
+        if openai_compat(c) && !pool.is_empty() {
             return (pool, alias);
+        }
+        if is_api_key(c)
+            && let Some(upstream) = api_key_table_upstream(&upstream, &models)
+        {
+            return (vec![upstream], alias);
         }
         if let Some(first) = pool.into_iter().next() {
             return (vec![first], alias);
@@ -1408,11 +1545,11 @@ fn alias_pool(requested: &str, models: &[ConfigModel]) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         for m in models {
             let (name, alias) = (m.name.trim(), m.alias.trim());
-            if alias.is_empty() || !alias.eq_ignore_ascii_case(&candidate) {
+            if alias.is_empty() || !alias.go_eq_fold(&candidate) {
                 continue;
             }
             let resolved = preserve_suffix(if name.is_empty() { &candidate } else { name }, requested);
-            if !resolved.is_empty() && seen.insert(resolved.to_lowercase()) {
+            if !resolved.is_empty() && seen.insert(resolved.go_lower()) {
                 out.push(resolved);
             }
         }
@@ -1423,7 +1560,7 @@ fn alias_pool(requested: &str, models: &[ConfigModel]) -> Vec<String> {
     for candidate in candidates(requested) {
         if let Some(m) = models
             .iter()
-            .find(|m| !m.name.trim().is_empty() && m.name.trim().eq_ignore_ascii_case(&candidate))
+            .find(|m| !m.name.trim().is_empty() && m.name.trim().go_eq_fold(&candidate))
         {
             return vec![preserve_suffix(m.name.trim(), requested)];
         }
@@ -1438,13 +1575,7 @@ pub fn selection_model(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Crede
     if is_api_key(c) || openai_compat(c) {
         return requested.to_owned();
     }
-    let aliases = oauth_aliases_for(cfg_aliases, c);
-    let r = resolve_with(
-        requested,
-        aliases
-            .iter()
-            .map(|a| (a.name.as_str(), a.alias.as_str(), a.force_mapping)),
-    );
+    let r = resolve_oauth(cfg_aliases, c, requested);
     if r.upstream.is_empty() {
         requested.to_owned()
     } else {
@@ -1600,6 +1731,155 @@ mod tests {
             ),
             "claude-sonnet-5"
         );
+    }
+
+    /// Exclusions match the way Go lowercases both sides (`strings.ToLower`, where U+0130
+    /// becomes a plain `i`): a configured `MİNİ` excluded as `MİNİ` or `mini` is not
+    /// registered.
+    #[test]
+    fn exclusions_match_with_go_lowercasing() {
+        for excluded in ["MİNİ", "mini"] {
+            let cfg = Config::parse(&format!(
+                "claude-api-key:\n  - api-key: k\n    models: [{{name: MİNİ}}, {{name: keep}}]\n    excluded-models: [{excluded}]\n"
+            ))
+            .unwrap();
+            let creds: Vec<_> = crate::config::credentials::from_config(&cfg)
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            let r = Registry::build(&cfg, &creds);
+            assert_eq!(r.ids().collect::<Vec<_>>(), ["keep"], "excluded: {excluded}");
+        }
+    }
+
+    /// An openai-compatibility group named `HİGH` registers under Go's lowercased key,
+    /// and asking for it by its configured name finds its models (Go
+    /// `GetAvailableModelsByProvider` lowercases with `strings.ToLower`).
+    #[test]
+    fn compat_provider_lookup_lowercases_like_go() {
+        let cfg = Config::parse(
+            "openai-compatibility:\n  - name: HİGH\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: m1}]\n",
+        )
+        .unwrap();
+        let creds: Vec<_> = crate::config::credentials::from_config(&cfg)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        assert_eq!(provider_key(&creds[0]), "openai-compatible-high");
+        let r = Registry::build(&cfg, &creds);
+        for asked in ["openai-compatible-HİGH", "openai-compatible-high"] {
+            let ids: Vec<String> = r
+                .available_by_provider(asked, |_, _| Suspension::None)
+                .iter()
+                .map(|m| m.id.clone())
+                .collect();
+            assert_eq!(ids, ["m1"], "{asked}");
+        }
+    }
+
+    /// The Devin catalog keys IDs with Go `strings.ToLower` (`ΟΣ` becomes `devin/οσ`,
+    /// where Rust's `to_lowercase` would give a final sigma), and admission compares with
+    /// Go `EqualFold` (`ClientSupportsModel`), where σ and ς are equal: a request for
+    /// `devin/ος` reaches the credential. This test alone in this binary loads the
+    /// process-wide Devin catalog.
+    #[test]
+    fn devin_admission_folds_final_sigma_like_go() {
+        assert_eq!(
+            crate::registry::devin::global().load(r#"{"devin":[{"id":"ΟΣ"}]}"#.as_bytes(), "test"),
+            Ok(true)
+        );
+        let c = file("d.json", serde_json::json!({"type":"devin"}), &[]);
+        let r = Registry::build(&Config::default(), std::slice::from_ref(&c));
+        assert!(r.ids().any(|id| id == "devin/οσ"), "{:?}", r.ids().collect::<Vec<_>>());
+        assert!(r.client_supports("d.json", "devin/ος"));
+        assert_eq!(r.client_model("d.json", "devin/ος").unwrap().id, "devin/οσ");
+    }
+
+    /// Go `applyAPIKeyModelAliasWithRouting`: an API key resolves through its
+    /// `strings.ToLower`-keyed alias table before the `EqualFold` scan, so aliases σ and ς
+    /// stay distinct; `Σ` lowercases to σ.
+    #[test]
+    fn api_key_aliases_use_lowercase_keys_before_fold() {
+        let cfg = Config::parse(
+            "claude-api-key:\n  - api-key: k\n    models: [{name: one, alias: σ}, {name: two, alias: ς}]\n",
+        )
+        .unwrap();
+        let c = crate::config::credentials::from_config(&cfg).remove(0);
+        let upstream = |model: &str| execution_models(&HashMap::new(), &c, model).0;
+        assert_eq!(upstream("ς"), ["two"]);
+        assert_eq!(upstream("σ"), ["one"]);
+        assert_eq!(upstream("Σ(high)"), ["one(high)"]);
+
+        // go_lower("İ") is i, which EqualFold("i", "İ") does not match.
+        let cfg = Config::parse("claude-api-key:\n  - api-key: k\n    models: [{name: one, alias: i}]\n").unwrap();
+        let c = crate::config::credentials::from_config(&cfg).remove(0);
+        assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["one(high)"]);
+
+        // An OpenAI-compatible API key falls back to the table when the EqualFold pool is
+        // empty.
+        let cfg = Config::parse(
+            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: one, alias: i}]\n",
+        )
+        .unwrap();
+        let c = crate::config::credentials::from_config(&cfg).remove(0);
+        assert!(is_api_key(&c));
+        assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["one(high)"]);
+        // A single-entry EqualFold pool still wins over the table, which maps σ to the
+        // name σ here.
+        let cfg = Config::parse(
+            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: σ, alias: x}, {name: one, alias: ς}]\n",
+        )
+        .unwrap();
+        let c = crate::config::credentials::from_config(&cfg).remove(0);
+        assert_eq!(execution_models(&HashMap::new(), &c, "σ").0, ["one"]);
+        // A keyless compatible credential has no API-key table.
+        let cfg = Config::parse(
+            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    models: [{name: one, alias: i}]\n",
+        )
+        .unwrap();
+        let c = crate::config::credentials::from_config(&cfg).remove(0);
+        assert!(!is_api_key(&c));
+        assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["İ(high)"]);
+    }
+
+    /// Go `resolveOAuthModelAliasWithResult`: the credential's own aliases match with
+    /// `EqualFold`, the global table by `strings.ToLower` key only.
+    #[test]
+    fn oauth_aliases_fold_per_credential_and_key_globally() {
+        let cfg = Config::parse(
+            "oauth:\n  model-alias:\n    claude:\n      - {name: one, alias: σ}\n      - {name: two, alias: ς}\n      - {name: four, alias: i}\n",
+        )
+        .unwrap();
+        let aliases = global_aliases(&cfg);
+        let global = file("a.json", serde_json::json!({"type":"claude"}), &[]);
+        assert_eq!(execution_models(&aliases, &global, "ς").0, ["two"]);
+        assert_eq!(selection_model(&aliases, &global, "ς"), "two");
+        assert_eq!(execution_models(&aliases, &global, "σ").0, ["one"]);
+        let own = file(
+            "b.json",
+            serde_json::json!({"type":"claude"}),
+            &[("model_aliases", r#"[{"name":"three","alias":"σ"}]"#)],
+        );
+        assert_eq!(
+            execution_models(&aliases, &own, "ς").0,
+            ["three"],
+            "EqualFold on its own aliases"
+        );
+        // go_lower("İ") is i, so the global key matches; EqualFold("i", "İ") is false, so
+        // the credential's own alias i does not, and resolution falls through to the
+        // global table.
+        assert_eq!(execution_models(&aliases, &global, "İ").0, ["four"]);
+        let own_i = file(
+            "c.json",
+            serde_json::json!({"type":"claude"}),
+            &[("model_aliases", r#"[{"name":"five","alias":"i"}]"#)],
+        );
+        assert_eq!(execution_models(&aliases, &own_i, "İ").0, ["four"]);
+        // A global lowercase miss does not fall back to EqualFold.
+        let only_sigma = global_aliases(
+            &Config::parse("oauth:\n  model-alias:\n    claude:\n      - {name: one, alias: σ}\n").unwrap(),
+        );
+        assert_eq!(execution_models(&only_sigma, &global, "ς").0, ["ς"]);
     }
 
     #[test]

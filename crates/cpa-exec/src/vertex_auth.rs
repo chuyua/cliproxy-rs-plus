@@ -703,41 +703,13 @@ pub fn import(auth_dir: &Path, key_path: &str, prefix: &str) -> Result<PathBuf, 
             path_error("open", Path::new(path), &e)
         )
     })?;
-    // json.Unmarshal into map[string]any: numbers become float64.
-    let mut sa = match GoValue::parse_f64(&data) {
-        Some(GoValue::Object(sa)) => sa,
-        // `null` leaves the map nil, which NormalizeServiceAccountMap rejects.
-        Some(GoValue::Null) => return Err("vertex-import: service account payload is empty".into()),
-        Some(other) => {
-            let kind = match other {
-                GoValue::Array(_) => "array",
-                GoValue::String(_) => "string",
-                GoValue::Bool(_) => "bool",
-                _ => "number",
-            };
-            return Err(format!(
-                "vertex-import: invalid service account json: json: cannot unmarshal {kind} into Go value of type map[string]interface {{}}"
-            ));
-        }
-        None => {
-            // Go's syntax error, else the first number beyond float64.
-            let error = meta_wire::check_valid(&data).err().unwrap_or_else(|| {
-                let number = first_overflow(&gj::parse(&data)).unwrap_or_default();
-                format!("json: cannot unmarshal number {number} into Go value of type float64")
-            });
-            return Err(format!("vertex-import: invalid service account json: {error}"));
-        }
-    };
+    let sa = decode_service_account(&data)
+        .map_err(|e| format!("vertex-import: invalid service account json: {e}"))
+        .and_then(|sa| normalize_decoded(sa).map_err(|e| format!("vertex-import: {e}")))?;
     let text = |sa: &BTreeMap<String, GoValue>, key: &str| match sa.get(key) {
         Some(GoValue::String(s)) => s.clone(),
         _ => String::new(),
     };
-    let private_key = text(&sa, "private_key");
-    if private_key.trim().is_empty() {
-        return Err("vertex-import: service account missing private_key".into());
-    }
-    let private_key = sanitize_private_key(&private_key).map_err(|e| format!("vertex-import: {e}"))?;
-    sa.insert("private_key".into(), GoValue::String(private_key));
     let (email, project) = (text(&sa, "client_email"), text(&sa, "project_id"));
     if project.trim().is_empty() {
         return Err("vertex-import: project_id missing in service account json".into());
@@ -773,13 +745,158 @@ pub fn import(auth_dir: &Path, key_path: &str, prefix: &str) -> Result<PathBuf, 
     go_mkdir_all(dir).map_err(|e| save_failed(format!("auth filestore: create dir failed: {e}")))?;
     // misc.LogSavingCredentials.
     println!("Saving credentials to {}", out.display());
-    std::fs::write(&out, GoValue::Object(doc).encode_indented()).map_err(|e| {
+    // Private (0600) and atomic, like every other credential writer; Go uses os.Create.
+    crate::kimi_auth::write_private(&out, &GoValue::Object(doc).encode_indented()).map_err(|e| {
         save_failed(format!(
             "vertex credential: create file failed: {}",
             path_error("open", &out, &e)
         ))
     })?;
     Ok(out)
+}
+
+/// `json.Unmarshal` into `map[string]any` with Go's error text; `None` for `null`.
+fn decode_service_account(data: &[u8]) -> Result<Option<BTreeMap<String, GoValue>>, String> {
+    // Numbers become float64.
+    match GoValue::parse_f64(data).map(GoValue::into_object) {
+        Some(Ok(sa)) => Ok(Some(sa)),
+        // `null` leaves the map nil.
+        Some(Err(GoValue::Null)) => Ok(None),
+        Some(Err(other)) => {
+            let kind = match other {
+                GoValue::Array(_) => "array",
+                GoValue::String(_) => "string",
+                GoValue::Bool(_) => "bool",
+                _ => "number",
+            };
+            Err(format!(
+                "json: cannot unmarshal {kind} into Go value of type map[string]interface {{}}"
+            ))
+        }
+        // Go's syntax error, else the first number beyond float64.
+        None => Err(meta_wire::check_valid(data).err().unwrap_or_else(|| {
+            let number = first_overflow(&gj::parse(data)).unwrap_or_default();
+            format!("json: cannot unmarshal number {number} into Go value of type float64")
+        })),
+    }
+}
+
+/// [`normalize_service_account`] for a decoded Go map; `None` is a nil map.
+fn normalize_decoded(sa: Option<BTreeMap<String, GoValue>>) -> Result<BTreeMap<String, GoValue>, String> {
+    let mut sa = sa.ok_or("service account payload is empty")?;
+    let private_key = match sa.get("private_key") {
+        Some(GoValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    if private_key.trim().is_empty() {
+        return Err("service account missing private_key".into());
+    }
+    sa.insert(
+        "private_key".into(),
+        GoValue::String(sanitize_private_key(&private_key)?),
+    );
+    Ok(sa)
+}
+
+/// A service account imported through the Management API, checked and merged with an
+/// existing file but not yet written ([`Upload::write`]).
+#[derive(Debug)]
+pub struct Upload {
+    pub path: PathBuf,
+    pub project: String,
+    pub email: String,
+    pub location: String,
+    contents: Vec<u8>,
+}
+
+impl Upload {
+    /// Go `VertexCredentialStorage.SaveTokenToFile`, called by the token store's `Save`.
+    pub fn write(&self) -> Result<(), UploadError> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        go_mkdir_all(dir).map_err(|e| UploadError::Save(format!("auth filestore: create dir failed: {e}")))?;
+        crate::kimi_auth::write_private(&self.path, &self.contents).map_err(|e| {
+            UploadError::Save(format!(
+                "vertex credential: create file failed: {}",
+                path_error("open", &self.path, &e)
+            ))
+        })
+    }
+}
+
+/// Why a Management API import failed, with Go's message for each answer.
+#[derive(Debug)]
+pub enum UploadError {
+    InvalidJson(String),
+    InvalidServiceAccount(String),
+    ProjectMissing,
+    Save(String),
+}
+
+/// Management `ImportVertexCredential`: like `-vertex-import`, but without a prefix,
+/// with the given location (`us-central1` when empty), and saved as the management
+/// token store saves: settings and `disabled` of an existing file are kept
+/// (`mergeExistingAuthFileMetadata`). Nothing is written yet: the caller saves the
+/// result through its token store.
+pub fn import_upload(auth_dir: &Path, data: &[u8], location: &str) -> Result<Upload, UploadError> {
+    let sa = decode_service_account(data).map_err(UploadError::InvalidJson)?;
+    let sa = normalize_decoded(sa).map_err(UploadError::InvalidServiceAccount)?;
+    // `valueAsString`: `fmt.Sprint` for a value that is not a string, so a numeric
+    // project ID 1000000 names `vertex-1e+06.json`, as in Go.
+    let text = |key: &str| match sa.get(key) {
+        None | Some(GoValue::Null) => String::new(),
+        Some(value) => go_sprint(value).trim().to_owned(),
+    };
+    let (project, email) = (text("project_id"), text("client_email"));
+    if project.is_empty() {
+        return Err(UploadError::ProjectMissing);
+    }
+    let location = match location.trim() {
+        "" => "us-central1".to_owned(),
+        l => l.to_owned(),
+    };
+    let mut doc = BTreeMap::new();
+    doc.insert("email".to_owned(), GoValue::String(email.clone()));
+    doc.insert("label".to_owned(), GoValue::String(label(&project, &email)));
+    doc.insert("location".to_owned(), GoValue::String(location.clone()));
+    doc.insert("project_id".to_owned(), GoValue::String(project.clone()));
+    doc.insert("service_account".to_owned(), GoValue::Object(sa));
+    doc.insert("type".to_owned(), GoValue::String("vertex".into()));
+    let path = go_clean(&auth_dir.join(format!("vertex-{}.json", file_part(&project))));
+    let disabled = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| crate::meta_auth::go_map_from_json(&raw))
+        .and_then(|(existing, _)| crate::meta_auth::merge_existing(&mut doc, &existing, "vertex"))
+        .unwrap_or(false);
+    crate::meta_auth::normalize_metadata(&mut doc);
+    if let Some(weight) = doc.get("weight") {
+        let json: Value = serde_json::from_slice(&weight.marshal()).unwrap_or(Value::Null);
+        cpa_core::config::credentials::parse_weight(&json)
+            .map_err(|e| UploadError::Save(format!("auth filestore: invalid metadata weight: {e}")))?;
+    }
+    doc.insert("disabled".to_owned(), GoValue::Bool(disabled));
+    Ok(Upload {
+        path,
+        project,
+        email,
+        location,
+        contents: GoValue::Object(doc).encode_indented(),
+    })
+}
+
+/// `fmt.Sprint` of a value `json.Unmarshal` decoded into `any`: numbers are float64
+/// printed as `%v`, maps print their keys sorted.
+fn go_sprint(value: &GoValue) -> String {
+    match value {
+        GoValue::Null => "<nil>".into(),
+        GoValue::Bool(b) => b.to_string(),
+        GoValue::String(s) => s.clone(),
+        GoValue::Number(n) => crate::xai_auth::go_float_v(cpa_common::json::parse_float(n.as_bytes())),
+        GoValue::Array(items) => format!("[{}]", items.iter().map(go_sprint).collect::<Vec<_>>().join(" ")),
+        GoValue::Object(map) => {
+            let items: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{}", go_sprint(v))).collect();
+            format!("map[{}]", items.join(" "))
+        }
+    }
 }
 
 /// The first number, in document order, that does not fit a float64.

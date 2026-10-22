@@ -29,14 +29,41 @@
 # (+0.84 MB binary, +0.35 MB archive) over master's build at 586eba0 in this job; the
 # rest of the rise from the previous budget values came with master's changes since
 # 2026-10-05.
-size.x86_64-unknown-linux-gnu.binary_bytes   41_287_408  2
-size.x86_64-unknown-linux-gnu.text_bytes     27_195_447  2
-size.x86_64-unknown-linux-gnu.rodata_bytes    8_508_896  2
-size.x86_64-unknown-linux-gnu.archive_bytes  17_516_134  2
+# 2026-10-20: plugin-owned catalogs, credentials and executors (#73): credential-bound
+# plugin execution (buffered, streaming and count_tokens translation), catalog
+# arbitration and the executor table, +125 KB .text over master's build at 450fca7 in
+# this job (27_641_079 to 27_766_199); the rest of the rise came with master's changes
+# since 2026-10-13. All four size lines are re-measured from that job (at dc3729c), as
+# in #54.
+# 2026-10-21: Home-managed plugin sync, tasks and status reports (#103): plugin plan
+# fetch and validation, store installs (now reachable from the binary), delete tasks,
+# status reports and the Home config worker's resumable finalization. At efbb8c0, +247 KB
+# .text (+295 KB binary, +129 KB archive) over master's build at 0d0e1d1 in this job
+# (28_239_671 to 28_487_159); the lines below are that job's measurements. The next head
+# compiles the spawned plugin unload once instead of once per calling crate, 38 KB less
+# .text in a local build. The rest of the rise came with master's changes since
+# 2026-10-20.
+# 2026-10-22: Codex requests and refresh through Sign in with ChatGPT tokens (#147):
+# the SIWC request rules (HTTP, WebSocket, Images, live), its refresh partition beside
+# the outer tokens with a second single-flight table, Go's expiry parsing and the
+# management refresh of SIWC-only credentials. At 6ad8f33, +60 KB .text (+74 KB binary,
+# +30 KB archive) over master's build at 0805c43 (29_042_103 to 29_102_199); the lines
+# below are that job's measurements. The rest of the rise came with master's changes
+# since 2026-10-21.
+size.x86_64-unknown-linux-gnu.binary_bytes   43_592_784  2
+size.x86_64-unknown-linux-gnu.text_bytes     29_102_199  2
+size.x86_64-unknown-linux-gnu.rodata_bytes    8_562_144  2
+size.x86_64-unknown-linux-gnu.archive_bytes  18_504_245  2
 # Crates linked into the binary in two or more versions; a new one fails until it is
 # justified here. 2026-10-05: base64, block-buffer, cpufeatures, crypto-common, digest,
 # getrandom, hashbrown (3), rand, rand_core, sha2, thiserror.
-deps.x86_64-unknown-linux-gnu.duplicate_crates  11  0
+# 2026-10-23: gcl2api Antigravity proxy-group SQLite sidecar adds rusqlite
+# 0.40.2, which requires fallible-iterator 0.3 while the existing Postgres
+# path still uses 0.2; one extra duplicate. GitHub Linux size run 39818655454
+# measured binary 43,538,320, text 29,056,759 and archive 18,481,855 bytes,
+# all within the unchanged upstream size budgets. This change acknowledges
+# the measured dependency cost; it does not relax any byte/RSS budget.
+deps.x86_64-unknown-linux-gnu.duplicate_crates  12  0
 
 # Idle, Linux (every pull request): 30 s without requests, after 30 s of warm-up,
 # with 1 and with 2,000 auth files. RSS gets 10% of room: three 1-file runs on the Ubuntu

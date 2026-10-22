@@ -270,6 +270,7 @@ struct Framed {
     /// A stack reservation that failed in `finalize_tool_input`; the stream is broken.
     failed: Option<Error>,
     options: StreamOptions,
+    executor_chunks: bool,
 }
 
 /// A transform applied to each translated chunk ([`StreamOptions::chunk`]).
@@ -355,6 +356,9 @@ fn openai_lines(event: &[u8]) -> Vec<Vec<u8>> {
 
 impl Framed {
     fn framed(&mut self, chunks: Vec<Vec<u8>>) -> Vec<Bytes> {
+        if self.executor_chunks {
+            return chunks.into_iter().filter(|c| !c.is_empty()).map(Bytes::from).collect();
+        }
         if responses_client(self.client) {
             let mut out = vec![];
             for chunk in &chunks {
@@ -371,6 +375,10 @@ impl Framed {
 }
 
 impl StreamTranslator for Framed {
+    fn executor_chunks(&mut self) {
+        self.executor_chunks = true;
+    }
+
     fn flush_frames(&mut self) -> Vec<Bytes> {
         self.responses.flush()
     }
@@ -520,6 +528,7 @@ pub(crate) fn framed_with(
         seen: crate::Depth::default(),
         failed: None,
         options,
+        executor_chunks: false,
     })
 }
 

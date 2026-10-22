@@ -701,7 +701,7 @@ pub fn normalize_client_secret_session(session: &[u8]) -> Result<(Vec<u8>, Vec<u
     } else {
         session
     };
-    let Some(GoValue::Object(mut map)) = GoValue::parse_f64(session) else {
+    let Some(Ok(mut map)) = GoValue::parse_f64(session).map(GoValue::into_object) else {
         return Err(SessionError::Invalid("session must be a valid JSON object".into()));
     };
     let string = |map: &BTreeMap<String, GoValue>, key: &str| match map.get(key) {
@@ -805,7 +805,7 @@ pub fn client_secret_lifetime(expires_after: Option<&(String, i64)>) -> Result<D
 
 /// `realtimeSessionResponse`: the client session with `id`, `object` and `expires_at`.
 pub fn session_response(session: &[u8], id: &str, expires_at: i64) -> Option<GoValue> {
-    let Some(GoValue::Object(mut map)) = GoValue::parse_f64(session) else {
+    let Some(Ok(mut map)) = GoValue::parse_f64(session).map(GoValue::into_object) else {
         return None;
     };
     map.insert("id".into(), GoValue::String(id.into()));
@@ -915,6 +915,9 @@ pub struct LiveSocket {
 pub struct DialError {
     /// The handshake response when the upstream answered.
     pub response: Option<Box<HandshakeResponse>>,
+    /// The status of a refusal before dialling (Go's status error from
+    /// `PrepareHttpRequest`); never an upstream answer.
+    pub status: Option<u16>,
     pub message: String,
 }
 
@@ -1071,6 +1074,8 @@ impl CodexExecutor {
         headers: Vec<(String, String)>,
         body: Bytes,
     ) -> Result<Upstream, ExecError> {
+        // `PrepareRequest`: Sign in with ChatGPT needs its token.
+        crate::codex_siwc::require_token(target.credential)?;
         let view = target.view();
         let headers = Self::live_credential_headers(&view, target.client, headers);
         target.record_post(url, &headers, &body);
@@ -1082,7 +1087,7 @@ impl CodexExecutor {
             Ok(Route {
                 client: self
                     .transport
-                    .for_url(next.as_str(), &view.proxy, view.chatgpt_keep_alive),
+                    .for_url(next.as_str(), &view.proxy, view.chatgpt_keep_alive, view.handshake),
                 order: None,
             })
         };
@@ -1105,6 +1110,14 @@ impl CodexExecutor {
         headers: Vec<(String, String)>,
         protocols: Vec<String>,
     ) -> Result<LiveSocket, DialError> {
+        // `PrepareHttpRequest`: Sign in with ChatGPT needs its token (Go's 401).
+        if let Err(error) = crate::codex_siwc::require_token(target.credential) {
+            return Err(DialError {
+                response: None,
+                status: Some(error.status),
+                message: String::from_utf8_lossy(&error.body).into_owned(),
+            });
+        }
         let view = target.view();
         let mut map = HeaderMap::new();
         for (name, value) in Self::live_credential_headers(&view, target.client, headers) {
@@ -1117,6 +1130,7 @@ impl CodexExecutor {
         }
         let fail = |message: &str| DialError {
             response: None,
+            status: None,
             message: message.into(),
         };
         // gorilla's dialer offers the client's subprotocols as one header and accepts
@@ -1153,6 +1167,7 @@ impl CodexExecutor {
                 }
                 return Err(DialError {
                     response: Some(Box::new(HandshakeResponse { status, headers, body })),
+                    status: None,
                     message: "websocket: bad handshake".into(),
                 });
             }

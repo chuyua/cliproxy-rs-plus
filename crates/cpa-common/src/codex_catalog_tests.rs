@@ -1,5 +1,5 @@
 //! Replays tests/fixtures/codex_catalog_go.json.gz, written by Go's catalog builder at
-//! 6fecc6e with the registry facts it looked up (tests/reference/codex_client/README.md).
+//! v8.0.35 with the registry facts it looked up (tests/reference/codex_client/README.md).
 
 use super::*;
 use serde_json::Value;
@@ -70,10 +70,7 @@ fn catalogs_match_go() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| match GoValue::from_json(m) {
-            GoValue::Object(map) => map,
-            other => panic!("not an object: {other:?}"),
-        })
+        .map(|m| GoValue::from_json(m).into_object().expect("an object"))
         .collect();
     let registry = Recorded(&fixture);
     let patch_table = &fixture["apply_patch"];
@@ -122,6 +119,10 @@ fn validation_matches_go() {
         }
     }
     assert!(validate(crate::codex_client::CLIENT_MODELS_JSON.as_bytes()).is_ok());
+    // Since e240bd84 a catalog without `gpt-5.5` is valid; its first model becomes the
+    // default template.
+    let other = r#"{"models":[{"slug":"other","display_name":"a","description":"b","base_instructions":"c","minimal_client_version":"0","visibility":"list","default_reasoning_level":"low","context_window":1,"max_context_window":5,"priority":0,"supported_reasoning_levels":[{"effort":"low"}]}]}"#;
+    assert_eq!(validate(other.as_bytes()), Ok(()));
 }
 
 #[test]

@@ -1,18 +1,15 @@
 //! The plugin host's auth manager (Go `pluginHost.SetAuthManager(authManager)` in
 //! internal/api/server.go): `host.auth.*` read the credential store, saves go through
-//! the auth-file pipeline uploads use, and `host.affinity.lookup` observes the
-//! scheduler's session bindings (Go `Manager.LookupSessionAffinity`).
+//! the auth-file pipeline uploads use, and `host.affinity.lookup` answers
+//! `unsupported` (Go `Manager.LookupSessionAffinity`).
 //!
 //! ponytail: Go's raw `Auth.Status` is approximated from the store as the auth-files
 //! view does: `disabled`, `error` while a credential-wide cooldown runs, else
 //! `active`; created and updated times are the file's modification time.
 //! ponytail: an overwrite that changes a credential's type gets that type's auth
 //! index at once; Go's `Update` keeps the old index until the next restart.
-//! ponytail: a binding made for a selection across providers is keyed by its provider
-//! list, where Go uses one `mixed` key, so two such selections can both hold a
-//! session that Go would have rebound (reported as `ambiguous` here).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, Weak};
@@ -26,28 +23,6 @@ use serde_json::Value;
 
 use super::Management;
 use super::auth_files::{auth_kind, file_name, parse_time, path_of, recent_requests, status_message};
-
-/// Go `cliproxysession.CandidateSessionPrefixes`.
-const CANDIDATE_SESSION_PREFIXES: [&str; 18] = [
-    "lcp:v1:",
-    "lcp:",
-    "codex:",
-    "claude:",
-    "header:",
-    "session:",
-    "affinity:",
-    "slot:",
-    "task:",
-    "conv:",
-    "thread:",
-    "clientreq:",
-    "geminicache:",
-    "pck:",
-    "user:",
-    "execution:",
-    "agy:",
-    "derived:",
-];
 
 /// Gives the runtime's plugin host this management state as its auth manager.
 pub(crate) fn attach(state: &Arc<Management>) {
@@ -91,6 +66,7 @@ impl AuthManager for PluginAuthManager {
         write()?;
         let path = PathBuf::from(auth.attributes.get("path").cloned().unwrap_or_default());
         let bytes = persist(&path, &auth)?;
+        credentials::note_plugin_auth_write(&path, &bytes);
         let cfg = state.rt.config();
         let credential = match credentials::from_file(&cfg, &cfg.auth_dir, &path, &bytes) {
             Ok(Some(c)) => {
@@ -120,70 +96,11 @@ impl AuthManager for PluginAuthManager {
         Ok(())
     }
 
-    /// Go `LookupSessionAffinity` with `SessionAffinitySelector.LookupAffinity`.
-    // ponytail: Go also answers `unsupported` while a plugin scheduler is active and
-    // consults the LCP session matcher; neither exists here yet.
-    fn lookup_session_affinity(&self, provider: &str, model: &str, session_id: &str) -> (String, Option<HostAuth>) {
-        let status = |s: &str| (s.to_owned(), None);
-        let Some(state) = self.0.upgrade() else {
-            return status("unsupported");
-        };
-        if !state.rt.policy().session_affinity {
-            return status("unsupported");
-        }
-        let model_key = crate::scheduler::canonical_model(model).to_owned();
-        let model_key = if model_key.is_empty() {
-            model.to_owned()
-        } else {
-            model_key
-        };
-        let candidates: Vec<String> = if CANDIDATE_SESSION_PREFIXES.iter().any(|p| session_id.starts_with(p)) {
-            vec![session_id.to_owned()]
-        } else {
-            std::iter::once(session_id.to_owned())
-                .chain(CANDIDATE_SESSION_PREFIXES.iter().map(|p| format!("{p}{session_id}")))
-                .collect()
-        };
-        let bounded: Vec<String> = candidates
-            .iter()
-            .map(|c| cpa_common::session::bound_session_identity(c))
-            .collect();
-        let store = state.rt.store();
-        let snapshot = store.snapshot();
-        // Bindings are keyed by scheduling key (an OpenAI-compatible credential's
-        // `provider_key`), which Go's `Auth.Provider` holds.
-        let provider_of = |id: &str| {
-            snapshot
-                .iter()
-                .find(|c| c.id == id)
-                .map(|c| crate::registry::provider_key(c))
-        };
-        // Go keys bindings by provider, or `mixed` for a selection across providers;
-        // here a mixed selection's scope lists its providers.
-        let mixed = provider == "mixed";
-        let found: BTreeSet<String> = store
-            .affinity_bound(|(scope, key_model, session)| {
-                let scope_ok = if mixed {
-                    scope.contains(',')
-                } else {
-                    scope == provider || scope.contains(',')
-                };
-                scope_ok && *key_model == model_key && bounded.contains(session)
-            })
-            .into_iter()
-            .filter(|id| mixed || provider_of(id).as_deref() == Some(provider))
-            .collect();
-        let auth_id = match found.len() {
-            0 => return status("unbound"),
-            1 => found.into_iter().next().unwrap_or_default(),
-            _ => return status("ambiguous"),
-        };
-        match snapshot.iter().find(|c| c.id == auth_id) {
-            Some(c) if mixed || crate::registry::provider_key(c) == provider => {
-                ("bound".into(), Some(host_auth(&state, c)))
-            }
-            _ => status("unbound"),
-        }
+    /// Go `LookupSessionAffinity`: `unsupported` whenever a plugin scheduler is
+    /// attached, and Go's server always attaches the plugin host
+    /// (sdk/cliproxy/builder.go:240-246, :272-273; conductor_selection.go:471-474).
+    fn lookup_session_affinity(&self, _: &str, _: &str, _: &str) -> (String, Option<HostAuth>) {
+        ("unsupported".into(), None)
     }
 }
 
@@ -310,5 +227,72 @@ fn host_auth(state: &Management, c: &Credential) -> HostAuth {
         next_retry_after: go_time(cooldown.map(|cd| SystemTime::now() + cd.remaining)),
         account_type: account_type.into(),
         account,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A plugin's `host.auth.save` writes and publishes under the disk lock, so it cannot
+    /// interleave with a SIWC commit, which holds that lock from its read of the backing
+    /// file to its publication: the save's write waits until the lock is released, and
+    /// the file and the registered credential then agree.
+    #[test]
+    fn a_plugin_save_waits_for_a_commit_holding_the_disk_lock() {
+        let dir = std::env::temp_dir().join(format!("cpa-plugin-save-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, format!("oauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
+        let cfg = cpa_core::config::Config::load(&path).unwrap();
+        let rt = Arc::new(crate::testing::runtime(
+            cfg,
+            Vec::new(),
+            cpa_exec::Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        ));
+        let state = Management::new(rt, path);
+        let manager = PluginAuthManager(Arc::downgrade(&state));
+        let file = dir.join("saved.json");
+        let auth = HostAuth {
+            attributes: [("path".to_owned(), file.display().to_string())].into(),
+            metadata: serde_json::json!({"type": "claude", "access_token": "saved"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ..Default::default()
+        };
+        let commit = state.disk.lock().unwrap();
+        let (wrote, written) = mpsc::channel();
+        let save = std::thread::spawn({
+            let file = file.clone();
+            move || {
+                manager.save(auth, &mut || {
+                    wrote.send(()).unwrap();
+                    std::fs::write(&file, r#"{"type":"claude","access_token":"saved"}"#).map_err(|e| e.to_string())
+                })
+            }
+        });
+        assert!(
+            written.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the save wrote while a commit held the disk lock"
+        );
+        assert!(!file.exists());
+        drop(commit);
+        written.recv_timeout(Duration::from_secs(5)).unwrap();
+        save.join().unwrap().unwrap();
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let stored = state.rt.store().get("saved.json").unwrap();
+        assert_eq!(on_disk, Value::Object(stored.metadata.clone()));
+        assert_eq!(stored.metadata["access_token"], "saved");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

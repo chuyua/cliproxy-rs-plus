@@ -15,6 +15,7 @@
 //! custom `apply_patch` tool goes upstream as a JSON function and its calls come back as
 //! the custom tool.
 
+use cpa_core::gostr::GoStr;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -259,7 +260,7 @@ impl MetaExecutor {
             let (tapped, usage) = defer_usage(lines, &req.usage, UsageRule::MetaResponses);
             ResponseBody::Stream(stream_events(
                 tapped,
-                (prepared.response.stream)(&ctx),
+                crate::translate::stream(prepared.response, &ctx, &req),
                 responses_client,
                 prepared.apply_patch,
                 usage,
@@ -385,13 +386,15 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
             body,
             &client,
         )
+        .map(|t| t.body)
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.0))
     };
+    // Go translates the original request first, for payload-rule defaults, then the
+    // working one, even when they are equal (a stateful plugin normalizer sees both).
+    let original_translated = translate(original(req))?;
     let mut body = translate(&req.body)?;
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
-    // Go translates the original request too, for payload-rule defaults.
-    let original_translated = translate(original(req))?;
     let thinking = apply_request_thinking(&RequestThinking {
         body: &body,
         payload: &req.body,
@@ -522,6 +525,7 @@ fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         headers: Box::default(),
         retry_after,
         direct: false,
+        addon: None,
     }
 }
 
@@ -542,8 +546,8 @@ fn subscription_quota(body: &[u8]) -> bool {
     if body.is_empty() {
         return false;
     }
-    let message = gj::get(body, "error.message").str().to_lowercase();
-    let code = gj::get(body, "error.code").str().to_lowercase();
+    let message = gj::get(body, "error.message").str().go_lower();
+    let code = gj::get(body, "error.code").str().go_lower();
     if message.contains("subscription quota") || message.contains("quota exhausted") {
         return true;
     }

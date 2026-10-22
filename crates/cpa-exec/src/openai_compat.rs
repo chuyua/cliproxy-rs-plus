@@ -134,8 +134,10 @@ fn not_registered(what: &str, from: Format, to: Format) -> ExecError {
 
 /// `helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent` for this executor
 /// (no target executor): Codex-client rewrites, then the pair or its compat variant.
-// ponytail: the configuration-update intent is not exposed by crate::codex_client
-// (owner: Codex), so thinking always sees `updates_changed: false`.
+// ponytail: the configuration-update intent crate::codex_client reports is not read
+// here yet, so thinking always sees `updates_changed: false`, and equal original and
+// working payloads are translated twice (Go translates once); the OpenAI-compatible
+// port reads it.
 fn translate_body(
     req: &ExecRequest,
     cfg: &Config,
@@ -147,6 +149,7 @@ fn translate_body(
 ) -> Result<Vec<u8>, ExecError> {
     let client = crate::codex_client::Client::new(&req.headers, cfg, "", is_compat);
     crate::codex_client::translate_request(req.source_format, target, &RequestCtx { model, stream }, body, &client)
+        .map(|t| t.body)
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
 
@@ -331,11 +334,15 @@ impl OpenAICompatExecutor {
         };
         if req.stream {
             let translator: Box<dyn StreamTranslator> = match response_pair {
-                Some(pair) => (pair.stream)(&ResponseCtx {
-                    model: &req.model,
-                    original_request: &original,
-                    translated_request: &body,
-                }),
+                Some(pair) => crate::translate::stream(
+                    pair,
+                    &ResponseCtx {
+                        model: &req.model,
+                        original_request: &original,
+                        translated_request: &body,
+                    },
+                    &req,
+                ),
                 None => Box::new(Identity),
             };
             let mut lines = wire::lines(upstream, MAX_LINE);
@@ -370,17 +377,19 @@ impl OpenAICompatExecutor {
         if req.usage.enabled() {
             req.usage.response_body(target, &raw);
         }
+        let ctx = ResponseCtx {
+            model: &req.model,
+            original_request: &original,
+            translated_request: &body,
+        };
         let mut out = match response_pair {
-            Some(pair) => (pair.non_stream)(
-                &ResponseCtx {
-                    model: &req.model,
-                    original_request: &original,
-                    translated_request: &body,
-                },
-                &raw,
-            )
-            .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
-            None => raw.to_vec(),
+            Some(pair) => (pair.non_stream)(&ctx, &raw)
+                .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
+            // Go's TranslateNonStream still runs the plugin response hooks.
+            None => {
+                cpa_translate::hooks::unregistered_non_stream(target.as_str(), req.response_format.as_str(), &ctx, &raw)
+                    .unwrap_or_else(|| raw.to_vec())
+            }
         };
         if out.is_empty() {
             return Err(ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION));
@@ -615,7 +624,7 @@ impl StreamTranslator for Identity {
         Ok(if event.starts_with(b"data: [DONE]") {
             Vec::new()
         } else {
-            vec![Bytes::copy_from_slice(event)]
+            vec![Bytes::from([event, b"\n\n"].concat())]
         })
     }
 
@@ -672,10 +681,10 @@ impl Frames {
         self.failed = true;
     }
 
+    /// One Go `TranslateStream` call per frame's joined `data:` line: no blank line
+    /// follows it, so plugin stream hooks run once per line, as in Go.
     fn translate(&mut self, line: &[u8]) -> bool {
-        let mut event = line.to_vec();
-        event.extend_from_slice(b"\n\n");
-        match self.translator.event(&event) {
+        match self.translator.event(line) {
             Ok(out) => {
                 self.ready.extend(out.into_iter().map(Ok));
                 false

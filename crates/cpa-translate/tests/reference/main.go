@@ -16,6 +16,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	claudechat "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/chat-completions"
+	clauderesponses "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses"
 	codexclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/codex/claude"
 	geminiclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/claude"
 	interactionsclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/interactions/claude"
@@ -56,6 +58,8 @@ type fixture struct {
 	Outputs    [][]string `json:"outputs"`
 	Finalize   bool       `json:"finalize,omitempty"`
 	ToolError  bool       `json:"tool_error,omitempty"`
+	// RequestError is the request-scoped refusal a request translation returned.
+	RequestError string `json:"request_error,omitempty"`
 	// Variants are every distinct output of a request whose Go output is not stable
 	// (map iteration order); Rust must match one of them modulo object key order.
 	Variants []string `json:"variants,omitempty"`
@@ -383,8 +387,19 @@ func toolInputFailed(param any) bool {
 	return ok && state.ToolInputError() != nil
 }
 
+// lastRequestError is the error the last request translation returned.
+var lastRequestError string
+
+func requestResult(body []byte, err error) [][]string {
+	if err != nil {
+		lastRequestError = err.Error()
+	}
+	return [][]string{{string(body)}}
+}
+
 func run(r registration, f fixture) [][]string {
 	lastToolError = false
+	lastRequestError = ""
 	ctx := context.Background()
 	if r.upstream == "antigravity" {
 		// The Antigravity executor streams with an empty `alt` (antigravity_executor_stream.go).
@@ -400,19 +415,22 @@ func run(r registration, f fixture) [][]string {
 	}
 	switch f.Path {
 	case "request":
-		return [][]string{{string(sdk.TranslateRequest(from, to, f.Model, []byte(f.Input), f.Stream))}}
+		env := sdk.TranslateRequestEnvelope(context.Background(), from, to, sdk.RequestEnvelope{Format: from, Model: f.Model, Stream: f.Stream, Body: []byte(f.Input)})
+		return requestResult(env.Body, env.Err)
 	case "request_compat":
 		switch r.client + ":" + r.upstream {
 		case "openai:claude":
-			return [][]string{{string(claudechat.ConvertOpenAIRequestToClaudeWithCompat(f.Model, []byte(f.Input), f.Stream))}}
+			return requestResult(claudechat.ConvertOpenAIRequestToClaudeWithCompat(f.Model, []byte(f.Input), f.Stream))
+		case "openai-response:claude":
+			return requestResult(clauderesponses.ConvertOpenAIResponsesRequestToClaudeWithCompat(f.Model, []byte(f.Input), f.Stream))
 		case "claude:openai":
-			return [][]string{{string(openaiclaude.ConvertClaudeRequestToOpenAIWithCompat(f.Model, []byte(f.Input), f.Stream))}}
+			return requestResult(openaiclaude.ConvertClaudeRequestToOpenAIWithCompat(f.Model, []byte(f.Input), f.Stream))
 		case "claude:gemini":
-			return [][]string{{string(geminiclaude.ConvertClaudeRequestToGeminiWithCompat(f.Model, []byte(f.Input), f.Stream))}}
+			return requestResult(geminiclaude.ConvertClaudeRequestToGeminiWithCompat(f.Model, []byte(f.Input), f.Stream))
 		case "claude:codex":
-			return [][]string{{string(codexclaude.ConvertClaudeRequestToCodexWithCompat(f.Model, []byte(f.Input), f.Stream))}}
+			return requestResult(codexclaude.ConvertClaudeRequestToCodexWithCompat(f.Model, []byte(f.Input), f.Stream))
 		case "claude:interactions":
-			return [][]string{{string(interactionsclaude.ConvertClaudeRequestToInteractionsWithCompat(f.Model, []byte(f.Input), f.Stream))}}
+			return requestResult(interactionsclaude.ConvertClaudeRequestToInteractionsWithCompat(f.Model, []byte(f.Input), f.Stream))
 		}
 		panic("no compat request for " + r.client + ":" + r.upstream)
 	case "request_envelope":
@@ -420,7 +438,7 @@ func run(r registration, f fixture) [][]string {
 		webSearch := true
 		info := &registry.ModelInfo{ID: f.Model, NativeCapabilities: &registry.NativeCapabilities{WebSearch: &webSearch}}
 		env := sdk.TranslateRequestEnvelope(ctx, from, to, sdk.RequestEnvelope{Format: from, Model: f.Model, Stream: f.Stream, Body: []byte(f.Input), ModelInfo: info})
-		return [][]string{{string(env.Body)}}
+		return requestResult(env.Body, env.Err)
 	case "non_stream":
 		var param any
 		out := sdk.TranslateNonStream(ctx, to, from, f.Model, orig, req, []byte(f.Input), &param)
@@ -535,6 +553,7 @@ func record(r registration, f fixture) fixture {
 	start := time.Now().Unix()
 	a := run(r, f)
 	f.ToolError = lastToolError
+	f.RequestError = lastRequestError
 	if f.Unordered {
 		seen := map[string]bool{}
 		for i := 0; i < 25; i++ {
@@ -635,6 +654,13 @@ func main() {
 		applyPatchResponses(os.Args[2])
 		return
 	}
+	// Pairs are regenerated as their ports land, so each file names the commit it
+	// came from.
+	head, err := exec.Command("git", "-C", os.Args[1], "rev-parse", "--short=8", "HEAD").Output()
+	if err != nil {
+		panic(err)
+	}
+	reference := strings.TrimSpace(string(head))
 	regs := registrations(os.Args[1])
 	for _, want := range os.Args[3:] {
 		var r *registration
@@ -661,7 +687,7 @@ func main() {
 			}
 			out = append(out, encode(record(*r, f)))
 		}
-		raw, err := json.MarshalIndent(map[string]any{"client": r.client, "upstream": r.upstream, "token_count": r.tokenCount != "", "fixtures": out}, "", " ")
+		raw, err := json.MarshalIndent(map[string]any{"client": r.client, "upstream": r.upstream, "reference": reference, "token_count": r.tokenCount != "", "fixtures": out}, "", " ")
 		if err != nil {
 			panic(err)
 		}

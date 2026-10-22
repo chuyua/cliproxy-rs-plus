@@ -1,5 +1,5 @@
 // Command main writes goldens for cpa_common::payload and cpa_common::headers from
-// CLIProxyAPI at 6fecc6e: ApplyPayloadConfigWithTrackedPathsForExecutor and
+// CLIProxyAPI v8.0.35 (ae3ee3be): ApplyPayloadConfigWithTrackedPathsForExecutor and
 // ApplyCustomHeadersFromAttrs, called in-process. No sockets, no providers.
 package main
 

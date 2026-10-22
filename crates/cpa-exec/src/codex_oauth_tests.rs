@@ -297,10 +297,10 @@ fn jwt_with_exp(exp: i64) -> String {
 }
 
 #[test]
-fn refresh_due_uses_jwt_exp_before_metadata_and_a_24h_lead() {
+fn refresh_due_uses_jwt_exp_before_metadata_and_a_96h_lead() {
     let now = Utc::now();
-    let soon = (now + chrono::TimeDelta::hours(23)).timestamp();
-    let later = (now + chrono::TimeDelta::hours(25)).timestamp();
+    let soon = (now + chrono::TimeDelta::hours(95)).timestamp();
+    let later = (now + chrono::TimeDelta::hours(97)).timestamp();
     let far = (now + chrono::TimeDelta::days(9)).to_rfc3339();
     // JWT exp wins over a distant metadata expiry.
     let c = credential(json!({"type":"codex","refresh_token":"r","access_token":jwt_with_exp(soon),"expired":far}));
@@ -312,7 +312,7 @@ fn refresh_due_uses_jwt_exp_before_metadata_and_a_24h_lead() {
     let c = credential(json!({"type":"codex","access_token":jwt_with_exp(soon)}));
     assert!(!refresh_due(&c, now), "no refresh token, nothing to do");
     let c = credential(
-        json!({"type":"codex","refresh_token":"r","access_token":"opaque","last_refresh":(now - chrono::TimeDelta::hours(25)).to_rfc3339()}),
+        json!({"type":"codex","refresh_token":"r","access_token":"opaque","last_refresh":(now - chrono::TimeDelta::hours(97)).to_rfc3339()}),
     );
     assert!(refresh_due(&c, now));
     let c =
@@ -424,7 +424,7 @@ async fn retained_results_never_block_a_new_refresh() {
         .await
         .expect("a 65th distinct token still reaches OAuth");
     assert_eq!(mock.take().len(), MAX_RETAINED_REFRESHES + 1);
-    assert!(oauth.refreshes.lock().unwrap().len() <= MAX_RETAINED_REFRESHES);
+    assert!(oauth.refreshes.outer.lock().unwrap().len() <= MAX_RETAINED_REFRESHES);
     // The newest result is still deduplicated.
     oauth.refresh("rt-extra").await.unwrap();
     assert!(mock.take().is_empty());

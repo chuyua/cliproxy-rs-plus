@@ -2,6 +2,7 @@
 //! flattened back to the legacy layout (`flattenV8`), each field typed and ordered by a
 //! shape table generated from Go's structs, absent fields taking Go's load defaults,
 //! then Go's post-load normalizers (`LoadConfig`).
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -294,7 +295,7 @@ pub(super) fn convert(shape: &Shape, v: &Yaml) -> Value {
         },
         k if k.starts_with("marshaler:") => match v {
             Yaml::Bool(b) => Value::Bool(*b),
-            Yaml::String(s) => match s.trim().to_lowercase().as_str() {
+            Yaml::String(s) => match s.trim().go_lower().as_str() {
                 "true" => Value::Bool(true),
                 "chat" => Value::from("chat"),
                 "passthrough" => Value::from("passthrough"),

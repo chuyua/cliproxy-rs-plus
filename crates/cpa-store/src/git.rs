@@ -12,6 +12,7 @@
 //! container needs `git` installed. Any failure to read HEAD's objects counts as
 //! corruption; go-git tells a missing object from other read errors, the CLI does not.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -511,7 +512,7 @@ impl GitStore {
     fn pull_once(&self) -> Result<()> {
         let fetched = self.run_in(&self.repo, &["fetch", "-q", "origin"])?;
         if !fetched.status.success() {
-            let message = String::from_utf8_lossy(&fetched.stderr).to_lowercase();
+            let message = String::from_utf8_lossy(&fetched.stderr).go_lower();
             // Go ignores authentication prompts and empty remotes during this sync.
             let benign = message.contains("authentication failed")
                 || message.contains("could not read username")
@@ -951,6 +952,21 @@ impl GitStore {
         self.commit_and_push(&mut last_gc, message, &rels, false)
     }
 
+    /// Go `Save`: under the repository lock, syncs with the remote, runs `write` and
+    /// commits and pushes what it wrote, so a remote change to the same file is taken
+    /// before the write instead of conflicting with it.
+    pub fn save(&self, write: cpa_server::persist::SaveFn<'_>) -> Result<Option<PathBuf>> {
+        let mut last_gc = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.ensure_locked(&mut last_gc)?;
+        let Some(path) = write()? else {
+            return Ok(None);
+        };
+        let rel = self.relative(&path)?;
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.commit_and_push(&mut last_gc, &format!("Update auth {name}"), &[rel], false)?;
+        Ok(Some(path))
+    }
+
     /// Go `Delete`: removes the file and commits the removal.
     pub fn delete(&self, path: &Path) -> Result<()> {
         let mut last_gc = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -994,6 +1010,10 @@ impl cpa_server::persist::StorePersister for GitPersister {
     fn delete_auth(&self, path: PathBuf) -> Result<()> {
         // Inline on the caller's blocking thread: no second blocking-pool slot.
         self.0.delete(&path)
+    }
+
+    fn save_auth(&self, write: cpa_server::persist::SaveFn<'_>) -> Result<Option<PathBuf>> {
+        self.0.save(write)
     }
 
     fn auth_dir(&self) -> PathBuf {

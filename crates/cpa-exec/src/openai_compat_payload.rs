@@ -184,12 +184,9 @@ pub(crate) fn resolve_compat(credential: &Credential, cfg: &Config) -> Option<Co
         return Some(entry.clone());
     }
     let candidates = [attr("compat_name"), attr("provider_key"), credential.provider.trim()];
-    entries.into_iter().find(|entry| {
-        !entry.disabled
-            && candidates
-                .iter()
-                .any(|c| !c.is_empty() && c.eq_ignore_ascii_case(&entry.name))
-    })
+    entries
+        .into_iter()
+        .find(|entry| !entry.disabled && candidates.iter().any(|c| !c.is_empty() && c.go_eq_fold(&entry.name)))
 }
 
 /// `normalizeOpenAICompatibilityModelName`.

@@ -66,6 +66,9 @@ pub fn plan(local_model: bool, home_enabled: bool) -> Plan {
 /// providers after each change to the set. In Home mode the local store stays empty, so
 /// every updater starts at once, as in Go.
 pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
+    if test_runtime(rt) {
+        return;
+    }
     let plan = plan(rt.local_model(), home_enabled);
     // Updaters that serve one provider, each started by that provider's first credential.
     let mut wanted: Vec<(&'static str, fn())> = Vec::new();
@@ -112,8 +115,7 @@ pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
         });
     }
     if plan.models {
-        static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        STARTED.get_or_init(|| {
+        MODELS_STARTED.get_or_init(|| {
             let urls = MODELS_URLS.iter().map(|u| (*u).to_owned()).collect();
             tokio::spawn(run(urls, REFRESH_INTERVAL));
         });
@@ -124,12 +126,21 @@ pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
     }
 }
 
+/// The models.json refresh loop, once started.
+static MODELS_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// A Codex client asked for its model catalog: start the catalog's updater, unless
 /// `--local-model` keeps every catalog local.
 pub(crate) fn codex_client_catalog_wanted(rt: &Runtime) {
-    if !rt.local_model() {
+    if !rt.local_model() && !test_runtime(rt) {
         cpa_exec::codex_catalog_updater::start_codex_client_models_updater();
     }
+}
+
+/// A runtime built by [`crate::testing::runtime`] never fetches remote catalogs: tests
+/// stay off the network and keep the embedded data.
+fn test_runtime(rt: &Runtime) -> bool {
+    rt.deny_external.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Go `runModelsUpdater`: one refresh now, then one per `interval`.
@@ -221,5 +232,28 @@ mod tests {
         assert_eq!(plan(true, true), p(false, false, false));
         assert_eq!(plan(false, true), p(false, true, true));
         assert_eq!(plan(false, false), p(true, true, true));
+    }
+
+    /// A test runtime starts no remote catalog refresh, through either entry point: the
+    /// startup plan (Home mode starts every updater at once) or a Codex client asking
+    /// for its catalog.
+    #[tokio::test]
+    async fn test_runtimes_start_no_catalog_refresh() {
+        let executors = cpa_exec::Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: Default::default(),
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        };
+        let dir = std::env::temp_dir().join(format!("cpa-updater-{}", uuid::Uuid::new_v4()));
+        let cfg = cpa_core::config::Config::parse(&format!("auth-dir: {}\n", dir.display())).unwrap();
+        let rt = Arc::new(crate::testing::runtime(cfg, Vec::new(), executors));
+        start(&rt, false);
+        start(&rt, true);
+        let _ = crate::codex_models::response(&rt, "0.130.0");
+        assert!(!cpa_exec::codex_catalog_updater::codex_client_models_updater_started());
+        assert!(MODELS_STARTED.get().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

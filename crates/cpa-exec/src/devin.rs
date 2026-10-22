@@ -189,6 +189,7 @@ fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecErr
         headers: Box::new(headers),
         retry_after,
         direct: false,
+        addon: None,
     }
 }
 
@@ -549,7 +550,7 @@ impl DevinExecutor {
             translated_request: &req.body,
         };
         if req.stream {
-            let translator = pair.map(|pair| (pair.stream)(&ctx));
+            let translator = pair.map(|pair| crate::translate::stream(pair, &ctx, &req));
             let claude = ClaudeInputTokens::new(
                 req.source_format,
                 Format::Interactions,

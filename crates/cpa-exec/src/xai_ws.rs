@@ -58,6 +58,10 @@ const NO_READ_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 pub(crate) struct Ws {
     pool: Pool,
     states: Mutex<HashMap<String, Arc<IdState>>>,
+    /// Test hook: the next turn signals once it holds its session and waits before it
+    /// takes the ID state.
+    #[cfg(test)]
+    pause: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
 impl Default for Ws {
@@ -67,6 +71,8 @@ impl Default for Ws {
         Self {
             pool,
             states: Mutex::default(),
+            #[cfg(test)]
+            pause: Mutex::default(),
         }
     }
 }
@@ -90,6 +96,30 @@ impl Ws {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
+    }
+
+    /// `closeXAIWebsocketSessionsInStoreForAuthID`: ends a removed credential's sessions
+    /// and drops their ID state.
+    pub(crate) fn close_credential(&self, credential: &str) {
+        self.pool.close_credential_with(credential, |id| {
+            self.states
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        });
+    }
+
+    #[cfg(test)]
+    async fn paused(&self) {
+        let pause = self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((reached, resume)) = pause {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
     }
 
     /// `UpstreamDisconnectChan`.
@@ -196,9 +226,13 @@ impl IdState {
         inner.transcript = next;
     }
 
-    /// `websocketSessionTargetChanged`.
-    fn target_changed(&self, target: &Target) -> bool {
-        self.lock().last_target.as_ref().is_some_and(|last| last != target)
+    /// `websocketSessionTargetChanged`; `live` when the session's socket for the same
+    /// credential is still open, which keeps its dial-time global proxy (`effectiveConfig`).
+    fn target_changed(&self, target: &Target, live: bool) -> bool {
+        self.lock()
+            .last_target
+            .as_ref()
+            .is_some_and(|last| !if live { last.serves(target) } else { last.same(target) })
     }
 
     fn set_target(&self, target: &Target) {
@@ -431,9 +465,10 @@ impl Ids<'_> {
 
 // --- request and frame helpers ----------------------------------------------------------
 
-/// `xaiWebsocketsEnabled`: the `websockets` attribute when it parses, else the metadata
-/// value (a bool, or a string that parses).
-pub(crate) fn websockets_enabled(credential: &Credential) -> bool {
+/// `xaiWebsocketsEnabled` (and Go's identical `authWebsocketsEnabled`): the
+/// `websockets` attribute when it parses, else the metadata value (a bool, or a string
+/// that parses).
+pub fn websockets_enabled(credential: &Credential) -> bool {
     if let Some(parsed) = credential
         .attributes
         .get("websockets")
@@ -693,6 +728,8 @@ fn validate_compaction(data: &[u8]) -> Result<(String, Vec<u8>), ExecError> {
 /// and the events of its socket. A no-op without an observer.
 struct WsCapture {
     sink: CaptureSink,
+    /// Go `EmitWebSocketResponseEvent`, called with every `AppendAPIWebsocketResponse`.
+    websocket: Option<cpa_core::exec::WebSocketEmitter>,
     url: String,
     headers: Vec<(String, String)>,
     frame: Vec<u8>,
@@ -705,10 +742,12 @@ struct WsCapture {
 impl WsCapture {
     fn new(req: &ExecRequest, credential: &Credential, url: &str, headers: &HeaderMap, frame: &[u8]) -> Self {
         let sink = req.capture().clone();
+        let websocket = req.websocket_emitter(crate::xai::PROVIDER, credential);
         if !sink.enabled() {
             // Nothing reads the fields without an observer: keep no copy of the frame.
             return Self {
                 sink,
+                websocket,
                 url: String::new(),
                 headers: Vec::new(),
                 frame: Vec::new(),
@@ -722,6 +761,7 @@ impl WsCapture {
         Self {
             headers: crate::openai_compat_http::header_pairs(headers),
             sink,
+            websocket,
             url: url.to_owned(),
             frame: frame.to_vec(),
             auth_id: credential.id.clone(),
@@ -804,8 +844,12 @@ impl WsCapture {
     }
 
     /// `AppendAPIWebsocketResponse`.
-    fn response(&self, payload: &[u8]) {
+    /// Records the message and returns its observation, if any.
+    fn response(&self, payload: &[u8]) -> Option<futures_util::future::BoxFuture<'static, ()>> {
         self.sink.record(CaptureEvent::WebsocketResponse(payload));
+        let websocket = self.websocket.clone()?;
+        let payload = payload.to_vec();
+        Some(Box::pin(async move { websocket.emit(&payload).await }))
     }
 }
 
@@ -827,7 +871,9 @@ struct Turn {
     rx: mpsc::Receiver<Read>,
     conn: Arc<Upstream>,
     session: Arc<Session>,
-    _turn: OwnedMutexGuard<()>,
+    _turn: Option<OwnedMutexGuard<()>>,
+    /// The observation of the message being read, while it runs.
+    observing: Option<crate::ws_observation::Observation>,
     apply_patch: apply_patch::State,
     restorer: NamespaceRestorer,
     filter: XSearchFilter,
@@ -851,7 +897,10 @@ struct Turn {
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        self.conn.deactivate();
+        // An abandoned turn keeps its session until an observation it started returns,
+        // as Go's executor holds the session lock through the synchronous observer.
+        let conn = self.conn.clone();
+        crate::ws_observation::release_after(self.observing.take(), self._turn.take(), move || conn.deactivate());
     }
 }
 
@@ -894,13 +943,13 @@ impl Turn {
     }
 
     /// One upstream text message.
-    fn message(&mut self, message: &str) {
+    async fn message(&mut self, message: &str) {
         let payload = cpa_common::gostr::trim_space(message.as_bytes());
         if payload.is_empty() {
             return;
         }
         self.usage.first_byte();
-        self.capture.response(payload);
+        crate::ws_observation::observe(&mut self.observing, self.capture.response(payload)).await;
         if let Some(error) = ws_error(payload) {
             self.capture.error("upstream_error", &error);
             crate::openai_compat_http::publish_failure(&self.usage, &error);
@@ -996,7 +1045,7 @@ impl Turn {
                 return None;
             }
             match self.rx.recv().await {
-                Some(Read::Text(message)) => self.message(&message),
+                Some(Read::Text(message)) => self.message(&message).await,
                 Some(Read::Failed(error)) => self.read_failed(error),
                 // The reader's terminal error did not fit a full queue (Go's
                 // `sendTerminalWebsocketRead` waits for room); it is kept on the socket.
@@ -1064,7 +1113,9 @@ impl XaiExecutor {
         if state_id.is_empty() {
             state_id.clone_from(&exec_id);
         }
-        let state = self.ws.state(&state_id);
+        // The ID state is taken after the session and its turn lock, as Go builds the
+        // mapper: a credential removal drops both together, so a replacement session
+        // never shares a state that was already dropped.
         if crate::xai::input_has_item_type(&req.body, "compaction_trigger") {
             if exec_session.continuation {
                 req.usage.discard();
@@ -1072,7 +1123,7 @@ impl XaiExecutor {
             }
             let session = self.ws.pool.session(&exec_id);
             let _turn = session.turn.clone().lock_owned().await;
-            let mapper = state.map(|s| IdMapper::new(s, &req.body));
+            let mapper = self.ws.state(&state_id).map(|s| IdMapper::new(s, &req.body));
             return self.ws_compaction(credential, &req, cfg, mapper).await;
         }
 
@@ -1090,17 +1141,19 @@ impl XaiExecutor {
             gj::set_str(&mut prepared.body, "previous_response_id", &previous);
         }
         let http_url = format!("{}/responses", base.strip_suffix('/').unwrap_or(&base));
-        let target = Target {
-            credential: credential.id.clone(),
-            url: self.url(ws_url(&http_url)?),
-            proxy: crate::proxy::Proxy::effective(credential, cfg),
-        };
+        let target = Target::new(credential, self.url(ws_url(&http_url)?), cfg);
 
         let session = self.ws.pool.session(&exec_id);
         let guard = session.turn.clone().lock_owned().await;
+        #[cfg(test)]
+        self.ws.paused().await;
+        let state = self.ws.state(&state_id);
         let mut mapper = state.clone().map(|s| IdMapper::new(s, &req.body));
         if let Some(m) = &mut mapper {
-            if m.state.target_changed(&target) {
+            let live = session
+                .current()
+                .is_some_and(|c| c.target.credential == target.credential);
+            if m.state.target_changed(&target, live) {
                 m.upstream_previous.clear();
             }
             prepared.body = m.upstream_request(std::mem::take(&mut prepared.body));
@@ -1119,7 +1172,7 @@ impl XaiExecutor {
         capture.request();
 
         let (mut conn, mut handshake) = if exec_session.continuation {
-            match session.current().filter(|c| c.target == target) {
+            match session.current().filter(|c| c.target.serves(&target)) {
                 Some(conn) => (conn, None),
                 None => return Err(ExecError::replay_required()),
             }
@@ -1188,7 +1241,8 @@ impl XaiExecutor {
             rx,
             conn,
             session,
-            _turn: guard,
+            _turn: Some(guard),
+            observing: None,
             apply_patch: prepared.apply_patch,
             restorer: NamespaceRestorer::new(prepared.namespace_tools),
             filter: XSearchFilter::new(prepared.filter_internal_x_search, prepared.client_declared_tools),
@@ -1235,7 +1289,7 @@ impl XaiExecutor {
         retry: bool,
     ) -> Result<(Arc<Upstream>, Option<HeaderMap>), ExecError> {
         if let Some(current) = session.current() {
-            if current.target == *target {
+            if current.target.serves(target) {
                 return Ok((current, None));
             }
             // target_changed: another credential, URL or proxy now serves this session.
@@ -1252,7 +1306,7 @@ impl XaiExecutor {
         let conn = Upstream::new(target.clone(), sink, self.ws.pool.write);
         // Publish before the reader runs, as the Codex executor does.
         let mut reader = conn.reader.lock().expect("reader handle");
-        *session.conn.lock().expect("session conn") = Some(conn.clone());
+        session.publish(conn.clone());
         let task = tokio::spawn(codex_ws::read_loop(
             stream,
             Arc::downgrade(session),

@@ -117,7 +117,9 @@
             },
             "advertise-management": "bool"
           }
-        }
+        },
+        "max-request-body-bytes": "int",
+        "github-token": "string"
       }
     },
     "management": {
@@ -368,7 +370,8 @@
               }
             }
           }
-        }
+        },
+        "tls-handshake-timeout-seconds": "int"
       }
     },
     "oauth": {
@@ -429,11 +432,6 @@
             },
             "codex": {
               "fields": {
-                "disable-codex-cloaking": "bool",
-                "stream-bootstrap-buffering": "bool",
-                "stream-bootstrap-timeout": "string",
-                "orphan-delegation-compatibility": "bool",
-                "model-level-cooling": "bool",
                 "live-media-relay": {
                   "fields": {
                     "enabled": "bool",
@@ -455,7 +453,6 @@
                     }
                   }
                 },
-                "response-steering": "bool",
                 "header-defaults": {
                   "fields": {
                     "user-agent": "string",
@@ -463,31 +460,6 @@
                   }
                 },
                 "chatgpt-keep-alive": "bool"
-              }
-            },
-            "claude": {
-              "fields": {
-                "model-level-cooling": "bool",
-                "claude-code": {
-                  "fields": {
-                    "disable-cloaking-model-list": "bool"
-                  }
-                },
-                "disable-claude-cloak-mode": "bool",
-                "header-defaults": {
-                  "fields": {
-                    "user-agent": "string",
-                    "package-version": "string",
-                    "runtime-version": "string",
-                    "os": "string",
-                    "arch": "string",
-                    "timeout": "string",
-                    "timezone": "string",
-                    "stabilize-device-profile": {
-                      "optional": "bool"
-                    }
-                  }
-                }
               }
             },
             "antigravity": {
@@ -513,11 +485,6 @@
                   "optional": "bool"
                 },
                 "antigravity-credits": "bool"
-              }
-            },
-            "xai": {
-              "fields": {
-                "inject-x-search": "bool"
               }
             },
             "devin": {
@@ -560,6 +527,46 @@
           "fields": {
             "enable": "bool",
             "addr": "string"
+          }
+        }
+      }
+    },
+    "upstream": {
+      "fields": {
+        "codex": {
+          "fields": {
+            "disable-codex-cloaking": "bool",
+            "stream-bootstrap-buffering": "bool",
+            "stream-bootstrap-timeout": "string",
+            "orphan-delegation-compatibility": "bool",
+            "model-level-cooling": "bool",
+            "response-steering": "bool"
+          }
+        },
+        "claude": {
+          "fields": {
+            "model-level-cooling": "bool",
+            "disable-claude-cloak-mode": "bool",
+            "header-defaults": {
+              "fields": {
+                "user-agent": "string",
+                "package-version": "string",
+                "runtime-version": "string",
+                "os": "string",
+                "arch": "string",
+                "timeout": "string",
+                "timezone": "string",
+                "stabilize-device-profile": {
+                  "optional": "bool"
+                }
+              }
+            },
+            "disable-cloaking-model-list": "bool"
+          }
+        },
+        "xai": {
+          "fields": {
+            "inject-x-search": "bool"
           }
         }
       }

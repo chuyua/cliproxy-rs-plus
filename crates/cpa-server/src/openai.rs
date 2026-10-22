@@ -1,6 +1,7 @@
 //! OpenAI routes: Chat Completions, legacy Completions, Responses and compact
 //! (sdk/api/handlers/openai/openai_handlers.go, openai_responses_handlers.go).
 
+use cpa_core::gostr::GoStr;
 use std::sync::Arc;
 
 use axum::Extension;
@@ -50,10 +51,23 @@ fn call(req: Request, entry: Format, model: String, body: Bytes, stream: bool, a
 
 /// Go `handlers.ReadRequestBody`: `Content-Encoding` is decoded (zstd, applied last
 /// first; identity is a no-op) before the JSON is read. A body that fails to decode
-/// but is valid JSON is used as sent; otherwise the handler answers 400.
+/// but is valid JSON is used as sent; otherwise the handler answers 400. A decoded body
+/// over `limit` (`server.max-request-body-bytes`) answers 413 instead.
 // ponytail: decode errors carry the zstd crate's reason, not klauspost/compress's, and
 // the decoded size is bounded by MAX_REQUEST_BYTES (Go reads it unbounded).
-fn read_body(headers: &HeaderMap, raw: Bytes) -> Result<Bytes, Box<Response>> {
+pub(crate) fn read_body(headers: &HeaderMap, raw: Bytes, limit: Option<u64>) -> Result<Bytes, Box<Response>> {
+    decode_body(headers, raw, limit).map_err(|(status, reason)| {
+        Box::new(respond::error_detail(
+            status,
+            &format!("Invalid request: {reason}"),
+            "invalid_request_error",
+        ))
+    })
+}
+
+/// [`read_body`]'s decoding, failing with the status and Go's error text, for handlers
+/// that render the failure in their own shape.
+pub(crate) fn decode_body(headers: &HeaderMap, raw: Bytes, limit: Option<u64>) -> Result<Bytes, (u16, String)> {
     let encoding = headers
         .get(axum::http::header::CONTENT_ENCODING)
         .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
@@ -61,44 +75,45 @@ fn read_body(headers: &HeaderMap, raw: Bytes) -> Result<Bytes, Box<Response>> {
     if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
         return Ok(raw);
     }
-    let decode = || -> Result<Bytes, String> {
+    let decode = || -> Result<Bytes, Option<String>> {
         let mut body = raw.clone();
         for part in encoding.split(',').rev() {
             match part.trim().to_ascii_lowercase().as_str() {
                 "" | "identity" => {}
-                "zstd" => body = decode_zstd(&body)?,
-                other => return Err(format!("unsupported request content encoding: {other}")),
+                "zstd" => body = decode_zstd(&body, limit)?,
+                other => return Err(Some(format!("unsupported request content encoding: {other}"))),
             }
         }
         Ok(body)
     };
     match decode() {
         Ok(body) => Ok(body),
+        // Go returns the limit error before its valid-JSON fallback.
+        Err(None) => Err((413, crate::body_limit::MESSAGE.to_owned())),
         Err(_) if serde_json::from_slice::<serde::de::IgnoredAny>(&raw).is_ok() => Ok(raw),
-        Err(e) => Err(Box::new(respond::error_detail(
-            400,
-            &format!("Invalid request: {e}"),
-            "invalid_request_error",
-        ))),
+        Err(Some(e)) => Err((400, e)),
     }
 }
 
-fn decode_zstd(raw: &[u8]) -> Result<Bytes, String> {
+/// `Err(None)` when the decoded body passes `limit`.
+fn decode_zstd(raw: &[u8], limit: Option<u64>) -> Result<Bytes, Option<String>> {
     use std::io::Read;
-    let fail = |e: std::io::Error| format!("failed to decode zstd request body: {e}");
-    let decoder =
-        zstd::stream::read::Decoder::new(raw).map_err(|e| format!("failed to create zstd request decoder: {e}"))?;
+    let fail = |e: std::io::Error| Some(format!("failed to decode zstd request body: {e}"));
+    let decoder = zstd::stream::read::Decoder::new(raw)
+        .map_err(|e| Some(format!("failed to create zstd request decoder: {e}")))?;
+    let cap = limit.unwrap_or(u64::MAX).min(crate::MAX_REQUEST_BYTES as u64);
     let mut out = Vec::new();
-    decoder
-        .take(crate::MAX_REQUEST_BYTES as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(fail)?;
+    decoder.take(cap + 1).read_to_end(&mut out).map_err(fail)?;
+    if limit.is_some_and(|limit| out.len() as u64 > limit) {
+        return Err(None);
+    }
     if out.len() > crate::MAX_REQUEST_BYTES {
         return Err(fail(std::io::Error::other("decoded body too large")));
     }
     Ok(Bytes::from(out))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_completions(
     State(rt): State<Arc<Runtime>>,
     Extension(caller): Extension<Caller>,
@@ -106,10 +121,11 @@ pub async fn chat_completions(
     matched: Option<MatchedPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let mut body = match body {
-        Ok(body) => match read_body(&headers, body) {
+        Ok(body) => match read_body(&headers, body, limit.0) {
             Ok(body) => body,
             Err(response) => return *response,
         },
@@ -180,6 +196,7 @@ fn responses_shaped(body: &[u8]) -> bool {
     keys.messages.is_none() && (keys.input.is_some() || keys.instructions.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn completions(
     State(rt): State<Arc<Runtime>>,
     Extension(caller): Extension<Caller>,
@@ -187,10 +204,11 @@ pub async fn completions(
     matched: Option<MatchedPath>,
     original: OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let body = match body {
-        Ok(body) => match read_body(&headers, body) {
+        Ok(body) => match read_body(&headers, body, limit.0) {
             Ok(body) => body,
             Err(response) => return *response,
         },
@@ -408,6 +426,7 @@ impl Writer for ChatSse {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn responses(
     State(rt): State<Arc<Runtime>>,
     Extension(caller): Extension<Caller>,
@@ -415,17 +434,18 @@ pub async fn responses(
     matched: Option<MatchedPath>,
     original: OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let body = match body {
-        Ok(body) => match read_body(&headers, body) {
+        Ok(body) => match read_body(&headers, body, limit.0) {
             Ok(body) => body,
             Err(response) => return *response,
         },
         Err(rejection) => return read_failed(&rejection),
     };
     // Go `prepareCodexMultiAgentV2Tools` then `prepareCodexOrphanDelegation`.
-    let settings = cpa_common::codex_client::Settings::for_responses_handler(&rt.config());
+    let settings = cpa_common::codex_client::Settings::from_config(&rt.config());
     // The spawn_agent model list comes from the Codex client catalog.
     // Cost: one header check, then one `Once` check, per request.
     if cpa_common::codex_client::multi_agent_client(&headers, settings.optimize_multi_agent_v2) {
@@ -472,8 +492,21 @@ pub async fn responses(
                     let mut framer = ResponsesSse::new(codex_client);
                     let mut ready = first.map(|f| framer.chunk(f)).unwrap_or_default();
                     while framer.data_frames == 0 && framer.terminal_error.is_none() {
-                        match futures_util::StreamExt::next(&mut rest).await {
-                            Some(Ok(event)) => ready.extend(framer.chunk(event)),
+                        let next = futures_util::StreamExt::next(&mut rest).await;
+                        if let Some(Ok(event)) = next {
+                            ready.extend(framer.chunk(event));
+                            continue;
+                        }
+                        // Go flushes the framer before deciding: a pending data frame
+                        // commits the stream, which then ends with the error or the end.
+                        ready.extend(framer.flush());
+                        if framer.data_frames > 0 {
+                            let tail = futures_util::StreamExt::boxed(futures_util::stream::iter(next));
+                            let finished = framer.stopped();
+                            return respond::sse(respond::resume(ready, finished, tail, framer, keepalive));
+                        }
+                        match next {
+                            Some(Ok(_)) => unreachable!("handled above"),
                             Some(Err(error)) => {
                                 let status = crate::classify::response_status(&error);
                                 let text = sanitize_error_text(status, &crate::classify::error_text(&error));
@@ -522,7 +555,7 @@ fn codex_client(headers: &HeaderMap) -> bool {
     {
         return true;
     }
-    let originator = get("originator").to_lowercase();
+    let originator = get("originator").go_lower();
     matches!(originator.as_str(), "codex desktop" | "codex-tui" | "codex_cli_rs")
         || ["codex desktop/", "codex-tui/", "codex_cli_rs/"]
             .iter()
@@ -558,7 +591,7 @@ pub(crate) fn sanitize_error_text(status: u16, text: &str) -> String {
 }
 
 fn sensitive_key(key: &str) -> bool {
-    let k = key.trim().to_lowercase().replace('-', "_");
+    let k = key.trim().go_lower().replace('-', "_");
     if ["tokens", "token_count", "token_limit", "token_usage"]
         .iter()
         .any(|s| k.contains(s))
@@ -719,8 +752,9 @@ fn stream_error_frame(codex: bool, status: u16, text: &str, seq: i64, lead: bool
     }
 }
 
-/// Go `responsesSSEFramer` over complete frames.
+/// Go `responsesSSEFramer`: join executor chunks at the HTTP boundary, after interceptors.
 struct ResponsesSse {
+    framer: cpa_translate::stream::ResponsesFramer,
     codex: bool,
     data_frames: i64,
     last_event: String,
@@ -733,6 +767,7 @@ struct ResponsesSse {
 impl ResponsesSse {
     fn new(codex: bool) -> Self {
         Self {
+            framer: Default::default(),
             codex,
             data_frames: 0,
             last_event: String::new(),
@@ -906,12 +941,32 @@ fn frame_with_data(frame: &[u8], payload: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
+impl ResponsesSse {
+    /// Go `responsesSSEFramer.Flush`: the pending frame, repaired, if any.
+    fn flush(&mut self) -> Vec<Bytes> {
+        self.framer
+            .flush()
+            .into_iter()
+            .filter_map(|frame| self.repair(frame))
+            .collect()
+    }
+}
+
 impl Writer for ResponsesSse {
     fn chunk(&mut self, event: Bytes) -> Vec<Bytes> {
         if !self.terminal_event.is_empty() {
             return Vec::new();
         }
-        self.repair(respond::ensure_frame(event)).into_iter().collect()
+        let event = if event.trim_ascii_start().starts_with(b"{") {
+            respond::ensure_frame(event)
+        } else {
+            event
+        };
+        self.framer
+            .write(&event)
+            .into_iter()
+            .filter_map(|frame| self.repair(frame))
+            .collect()
     }
 
     fn stopped(&self) -> bool {
@@ -919,17 +974,21 @@ impl Writer for ResponsesSse {
     }
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
+        let mut out = self.flush();
         if !self.terminal_event.is_empty() {
-            return Vec::new();
+            return out;
         }
         let status = crate::classify::response_status(error);
         let text = sanitize_error_text(status, &crate::classify::error_text(error));
-        vec![stream_error_frame(self.codex, status, &text, self.data_frames, true)]
+        out.push(stream_error_frame(self.codex, status, &text, self.data_frames, true));
+        out
     }
 
     fn end(&mut self) -> Vec<Bytes> {
+        let mut out = self.flush();
         if self.terminal_error.is_some() || !self.terminal_event.is_empty() {
-            return vec![Bytes::from_static(b"\n")];
+            out.push(Bytes::from_static(b"\n"));
+            return out;
         }
         let last = if self.last_event.is_empty() {
             "none"
@@ -937,10 +996,12 @@ impl Writer for ResponsesSse {
             &self.last_event
         };
         let text = format!("upstream stream closed before a terminal event (last event: {last})");
-        vec![stream_error_frame(self.codex, 502, &text, self.data_frames, true)]
+        out.push(stream_error_frame(self.codex, 502, &text, self.data_frames, true));
+        out
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     State(rt): State<Arc<Runtime>>,
     Extension(caller): Extension<Caller>,
@@ -948,17 +1009,18 @@ pub async fn compact(
     matched: Option<MatchedPath>,
     original: OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let body = match body {
-        Ok(body) => match read_body(&headers, body) {
+        Ok(body) => match read_body(&headers, body, limit.0) {
             Ok(body) => body,
             Err(response) => return *response,
         },
         Err(rejection) => return read_failed(&rejection),
     };
     // Go `prepareCodexOrphanDelegation` (compact skips the multi-agent tool step).
-    let settings = cpa_common::codex_client::Settings::for_responses_handler(&rt.config());
+    let settings = cpa_common::codex_client::Settings::from_config(&rt.config());
     let mut body = Bytes::from(cpa_common::codex_client::rewrite_orphan_delegation_input(
         &headers,
         &body,

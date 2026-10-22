@@ -1,5 +1,6 @@
 //! Release checksums (internal/pluginstore/checksum.go, direct.go).
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -17,7 +18,7 @@ pub fn parse_checksums(data: &[u8]) -> Result<BTreeMap<String, String>, String> 
         if fields.len() < 2 {
             return Err(format!("line {}: invalid checksum entry", number + 1));
         }
-        let hash = fields[0].trim().to_lowercase();
+        let hash = fields[0].trim().go_lower();
         if hash.len() != 64 {
             return Err(format!("line {}: invalid sha256 length", number + 1));
         }
@@ -36,7 +37,7 @@ pub fn parse_checksums(data: &[u8]) -> Result<BTreeMap<String, String>, String> 
 
 /// Go `VerifyChecksum`.
 pub fn verify_checksum(name: &str, data: &[u8], checksums: &BTreeMap<String, String>) -> Result<(), String> {
-    let expected = checksums.get(name).map(|h| h.trim().to_lowercase()).unwrap_or_default();
+    let expected = checksums.get(name).map(|h| h.trim().go_lower()).unwrap_or_default();
     if expected.is_empty() {
         return Err(format!("checksum for {name} not found"));
     }

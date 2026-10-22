@@ -7,6 +7,7 @@
 //! everything else follows net/http's order (Host, User-Agent, Content-Length, then
 //! byte-sorted keys).
 
+use cpa_core::gostr::GoStr;
 use http::HeaderMap;
 
 use super::betas::{self, Requested};
@@ -308,7 +309,7 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         if !probe && !p.count_tokens && signals::has_1h_ttl(p.body) {
             b = betas::with_extended_ttl(&b);
         }
-        let model = rawjson::string(p.body, "model").trim().to_lowercase();
+        let model = rawjson::string(p.body, "model").trim().go_lower();
         if model.contains("haiku") && !rawjson::get(p.body, "fallbacks").exists() && !p.helper {
             b = betas::without(&b, betas::SERVER_SIDE_FALLBACK);
         }

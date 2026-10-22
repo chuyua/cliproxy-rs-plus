@@ -7,6 +7,7 @@
 //! Anthropic hosts Go's tests intercepted); what Rust sends and returns is compared
 //! with what Go sent and returned. Nothing leaves loopback.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -618,6 +619,7 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             .as_str()
             .and_then(Format::parse)
             .unwrap_or(source),
+        stream_payloads: false,
         requested_model: metadata["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: if original.is_empty() {
@@ -638,6 +640,7 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         caller: Caller {
             principal: record["caller"].as_str().unwrap_or_default().to_owned(),
             source: "authorization",
+            provider: String::new(),
         },
     };
     let chat = req.response_format == Format::OpenAI && kind == "execute_stream";
@@ -729,11 +732,11 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         let value = |v: &str| version.replace(v, "CLIProxyAPI/<version>").into_owned();
         let mut want = Headers::new();
         for (k, v) in header_pairs(&go["headers"]) {
-            want.entry(k.to_lowercase()).or_default().push(value(&v));
+            want.entry(k.go_lower()).or_default().push(value(&v));
         }
         let mut got = Headers::new();
         for (k, v) in &rust.headers {
-            let k = k.to_lowercase();
+            let k = k.go_lower();
             if want.contains_key(&k) || !transport.contains(&k.as_str()) {
                 got.entry(k).or_default().push(value(v));
             }

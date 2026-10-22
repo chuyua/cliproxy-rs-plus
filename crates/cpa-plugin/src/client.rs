@@ -173,6 +173,46 @@ impl GuardedClient {
         }
     }
 
+    /// [`GuardedClient::call`] for synchronous callers (translator hooks and thinking
+    /// appliers run inside the translation that needs them, as Go's do). The call runs
+    /// on this thread, inside `block_in_place` on a multi-threaded runtime so plugin
+    /// callbacks may block on it. From a current-thread runtime it runs on a scoped
+    /// thread while the runtime waits, so callbacks that need the runtime
+    /// (`host.http.*`, `host.model.*`) fail during the call instead of hanging.
+    pub fn call_blocking(self: &Arc<Self>, method: &str, request: &[u8]) -> Result<Bytes, GuardError> {
+        let inner = self.acquire()?;
+        struct Release<'a>(&'a GuardedClient);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release = Release(self);
+        let call = || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.call(method, request)))
+                .map_err(|p| GuardError::Panic(panic_text(&*p)))?
+                .map_err(GuardError::Transport)
+        };
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(call),
+            Ok(_) => {
+                // This thread drives the runtime and now waits, so callbacks that need
+                // the runtime fail fast (see `PARKED_CURRENT_THREAD`).
+                use std::sync::atomic::Ordering;
+                struct Parked;
+                impl Drop for Parked {
+                    fn drop(&mut self) {
+                        crate::callbacks::PARKED_CURRENT_THREAD.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                crate::callbacks::PARKED_CURRENT_THREAD.fetch_add(1, Ordering::AcqRel);
+                let _parked = Parked;
+                std::thread::scope(|s| s.spawn(call).join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            }
+            Err(_) => call(),
+        }
+    }
+
     /// Detaches the client at once, then waits up to `wait` for running calls to drain
     /// and the plugin to shut down. Shutdown itself always completes on a dedicated
     /// thread (Go `ShutdownContext`). `None` waits indefinitely.
@@ -219,6 +259,13 @@ impl GuardedClient {
     pub fn active_calls(&self) -> usize {
         lock(&self.state).calls
     }
+}
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_owned())
 }
 
 #[cfg(test)]

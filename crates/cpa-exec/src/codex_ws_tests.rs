@@ -90,6 +90,8 @@ struct Upstream {
     ended: Mutex<usize>,
     /// Send a binary message right after the handshake, before any request.
     binary_first: Mutex<bool>,
+    /// Close the socket right after the handshake, before any request.
+    close_first: Mutex<bool>,
 }
 
 async fn handler(State(up): State<Arc<Upstream>>, ws: WebSocketUpgrade, headers: axum::http::HeaderMap) -> Response {
@@ -118,6 +120,11 @@ async fn handler(State(up): State<Arc<Upstream>>, ws: WebSocketUpgrade, headers:
 async fn serve_socket(up: Arc<Upstream>, mut socket: AxSocket) {
     if *up.binary_first.lock().unwrap() {
         let _ = socket.send(AxMessage::Binary(vec![1u8, 2, 3].into())).await;
+    }
+    if *up.close_first.lock().unwrap() {
+        let _ = socket.send(AxMessage::Close(None)).await;
+        *up.ended.lock().unwrap() += 1;
+        return;
     }
     while let Some(Ok(message)) = socket.recv().await {
         let AxMessage::Text(text) = message else {
@@ -194,6 +201,7 @@ fn request(body: &str) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::OpenAIResponse,
         response_format: Format::OpenAIResponse,
+        stream_payloads: false,
         requested_model: "gpt-fixture".into(),
         model: "gpt-fixture".into(),
         original_body: body.clone(),
@@ -210,6 +218,7 @@ fn request(body: &str) -> ExecRequest {
         caller: Caller {
             principal: "client-key-FAKE".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -235,6 +244,41 @@ async fn collect(response: ExecResponse) -> Vec<Result<String, ExecError>> {
 const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#;
 const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
 const BODY: &str = r#"{"model":"gpt-fixture","input":[{"type":"message","role":"user","content":"hi"}]}"#;
+
+/// Go `TestWebsocketActivationAfterUpstreamDisconnect` (d31b61cb): a turn that activates
+/// after the socket's reader stopped, on a close or a binary message, gets the reader's
+/// error at once instead of waiting forever. The xAI executor shares this reader.
+#[tokio::test]
+async fn a_turn_activating_after_the_reader_stopped_gets_its_error() {
+    for (name, binary, close) in [("close", false, true), ("binary", true, false)] {
+        let (up, url) = upstream(vec![]).await;
+        *up.binary_first.lock().unwrap() = binary;
+        *up.close_first.lock().unwrap() = close;
+        let executor = CodexExecutor::new().unwrap();
+        let session = executor.ws.session("conn-1");
+        let target = Target::new(
+            &credential(&url),
+            ws_url(&format!("{url}/responses")).unwrap(),
+            &Config::default(),
+        );
+        let (conn, _) = executor
+            .ensure(&session, &target, &HeaderMap::new(), "gpt-fixture", false, None)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.link.lock().unwrap().lost.is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}: the disconnect was not processed"));
+        let mut reads = conn.activate();
+        let read = tokio::time::timeout(Duration::from_secs(1), reads.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: activation waited"));
+        assert!(matches!(read, Some(Read::Failed(_))), "{name}");
+    }
+}
 
 #[tokio::test]
 async fn continuation_without_a_socket_requires_replay() {
@@ -390,6 +434,102 @@ async fn closing_the_session_ends_the_kept_pick() {
     ended(&up, 1).await;
 }
 
+/// Go 1e37b52b: after a reload that changes only `requests.proxy-url`, the session's
+/// open socket keeps serving its credential (continuation and new turn alike), while a
+/// new session dials through the new proxy and a credential's own proxy still re-targets.
+#[tokio::test]
+async fn a_global_proxy_reload_keeps_the_open_socket() {
+    let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED]); 3]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let cred = credential(&url);
+    // Nothing listens on port 1: a dial through this proxy fails.
+    let reloaded = Config::parse("requests:\n  proxy-url: http://127.0.0.1:1\n").unwrap();
+    for (cfg, continuation) in [(&Config::default(), false), (&reloaded, true), (&reloaded, false)] {
+        let response = executor
+            .execute_in_session(&cred, request(BODY), cfg, &session(continuation))
+            .await
+            .unwrap_or_else(|e| panic!("continuation={continuation}: {e:?}"));
+        let events = collect(response).await;
+        assert!(events.len() == 2 && events.iter().all(Result::is_ok), "{events:?}");
+    }
+    assert_eq!(up.dials.lock().unwrap().len(), 1, "every turn kept the first socket");
+
+    let mut other = request(BODY);
+    other.execution_session = Some("conn-2".into());
+    let fresh = ExecSession {
+        id: "conn-2".into(),
+        ..session(false)
+    };
+    let error = executor
+        .execute_in_session(&cred, other, &reloaded, &fresh)
+        .await
+        .err()
+        .expect("a new socket dials through the reloaded proxy");
+    assert_eq!(error.scope, FailureScope::Transport, "{error}");
+
+    let mut own = cred.clone();
+    own.attributes.insert("proxy_url".into(), "http://127.0.0.1:1".into());
+    let error = executor
+        .execute_in_session(&own, request(BODY), &reloaded, &session(true))
+        .await
+        .err()
+        .expect("the credential's own proxy no longer matches the socket");
+    assert!(error.is_replay_required(), "{error}");
+    assert_eq!(up.dials.lock().unwrap().len(), 1);
+}
+
+/// Go `websocketSessionTargetMatches` compares the trimmed proxy settings, not parsed
+/// proxies: `direct` and `none`, or two unparseable settings, are different targets. A
+/// continuation that changes `(global, own)` after the first turn keeps the socket or
+/// needs a replay as Go decides.
+#[tokio::test]
+async fn proxy_settings_match_as_go_compares_them() {
+    type Row = (
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        bool,
+    );
+    let rows: [Row; 6] = [
+        ("", None, "http://127.0.0.1:1", None, true),
+        ("direct", Some("none"), "http://127.0.0.1:1", None, false),
+        ("", Some("direct"), "", Some("none"), false),
+        ("", Some("bogus://a"), "", Some("bogus://b"), false),
+        ("", Some("direct"), "", Some(" direct "), true),
+        ("none", None, "NONE", None, true),
+    ];
+    for (dial_global, dial_own, global, own, reuse) in rows {
+        let row = format!("{dial_global:?} {dial_own:?} -> {global:?} {own:?}");
+        let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED]); 2]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let turn = |global: &str, own: Option<&str>, continuation: bool| {
+            let cfg = Config::parse(&format!("requests:\n  proxy-url: {global:?}\n")).unwrap();
+            let mut cred = credential(&url);
+            if let Some(own) = own {
+                cred.attributes.insert("proxy_url".into(), own.into());
+            }
+            let executor = &executor;
+            async move {
+                let response = executor
+                    .execute_in_session(&cred, request(BODY), &cfg, &session(continuation))
+                    .await?;
+                let events = collect(response).await;
+                assert!(events.len() == 2 && events.iter().all(Result::is_ok), "{events:?}");
+                Ok::<(), ExecError>(())
+            }
+        };
+        turn(dial_global, dial_own, false)
+            .await
+            .unwrap_or_else(|e| panic!("{row}: first turn {e:?}"));
+        match turn(global, own, true).await {
+            Ok(()) => assert!(reuse, "{row}: kept the socket"),
+            Err(e) => assert!(!reuse && e.is_replay_required(), "{row}: {e:?}"),
+        }
+        assert_eq!(up.dials.lock().unwrap().len(), 1, "{row}");
+    }
+}
+
 /// A rejected handshake reports the upstream status with Go's classification and the
 /// quota headers are observed.
 #[tokio::test]
@@ -493,7 +633,7 @@ async fn a_socket_dropped_without_a_close_frame_reads_as_close_1006() {
 async fn pings_do_not_extend_the_idle_deadline() {
     let (_up, url) = upstream(vec![Act::Pings(Duration::from_millis(100), 30)]).await;
     let mut executor = CodexExecutor::new().unwrap();
-    executor.ws = Pool::with_idle(Duration::from_millis(400));
+    executor.ws = Arc::new(Pool::with_idle(Duration::from_millis(400)));
     let response = executor
         .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
         .await
@@ -532,10 +672,10 @@ async fn a_write_the_upstream_never_reads_times_out() {
     tokio::spawn(async move { axum::serve(listener, app).await });
 
     let mut executor = CodexExecutor::new().unwrap();
-    executor.ws = Pool::with_write(WriteLimit {
+    executor.ws = Arc::new(Pool::with_write(WriteLimit {
         floor: Duration::from_millis(300),
         rate: usize::MAX,
-    });
+    }));
     // Far larger than loopback socket buffers, so the write cannot finish.
     let body = format!(
         r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
@@ -620,9 +760,8 @@ async fn reader_failure_before_the_turn_activates_fails_the_turn() {
 }
 
 /// With model-level cooling, a usage-limit handshake rejection cools only the model
-/// (`newCodexStatusErrWithCooling`); without it, the whole credential. API keys see
-/// `ForAPIKey`: the v8 `oauth.providers.codex` spelling is OAuth-only, the legacy
-/// top-level `codex` spelling stays global.
+/// (`newCodexStatusErrWithCooling`); without it, the whole credential. The setting is
+/// shared (`upstream.codex`, Go 52d5507d), so every spelling applies to API keys.
 #[tokio::test]
 async fn handshake_usage_limit_honours_model_level_cooling() {
     const LIMIT: &str = r#"{"error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":3600}}"#;
@@ -631,7 +770,11 @@ async fn handshake_usage_limit_honours_model_level_cooling() {
         ("codex:\n  model-level-cooling: true\n", FailureScope::Model),
         (
             "oauth:\n  providers:\n    codex:\n      model-level-cooling: true\n",
-            FailureScope::Credential,
+            FailureScope::Model,
+        ),
+        (
+            "upstream:\n  codex:\n    model-level-cooling: true\n",
+            FailureScope::Model,
         ),
     ] {
         let (up, url) = upstream(vec![]).await;
@@ -1008,6 +1151,268 @@ async fn capture_records_an_upstream_error_event() {
             ),
         ]
     );
+}
+
+/// Go's executor holds the session lock through its synchronous observer: a turn
+/// abandoned while an observation runs keeps the session until the observer returns, so
+/// the next turn can neither write upstream nor be observed before that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_turn_keeps_its_session_until_its_observation_returns() {
+    /// Holds every message until `release`.
+    struct Holding {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Credential,
+            _: &'a str,
+            _: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let _ = self.release.acquire().await.unwrap();
+            })
+        }
+    }
+    let (up, url) = upstream(vec![
+        Act::Send(vec![CREATED, COMPLETED]),
+        Act::Send(vec![CREATED, COMPLETED]),
+    ])
+    .await;
+    let executor = Arc::new(CodexExecutor::new().unwrap());
+    let observer = Arc::new(Holding {
+        calls: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let turn = |executor: Arc<CodexExecutor>| {
+        let (url, observer) = (url.clone(), observer.clone());
+        tokio::spawn(async move {
+            let mut req = request(BODY);
+            req.usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer));
+            if let Ok(response) = executor
+                .execute_in_session(&credential(&url), req, &Config::default(), &session(false))
+                .await
+            {
+                collect(response).await;
+            }
+        })
+    };
+    let a = turn(executor.clone());
+    let calls = || observer.calls.load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..250 {
+        if calls() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(calls(), 1, "turn A's first message was not observed");
+    a.abort();
+    let _ = a.await;
+    let lock = executor.ws.session("conn-1").turn.clone();
+    assert!(
+        lock.try_lock().is_err(),
+        "dropping A released the session during its observation"
+    );
+    let b = turn(executor.clone());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        up.frames.lock().unwrap().len(),
+        1,
+        "turn B wrote while A's observation ran"
+    );
+    assert_eq!(calls(), 1, "turn B was observed while A's observation ran");
+    observer.release.add_permits(100);
+    tokio::time::timeout(Duration::from_secs(10), b).await.unwrap().unwrap();
+    assert!(lock.try_lock().is_ok(), "the session stayed locked after both turns");
+    assert_eq!(
+        up.frames.lock().unwrap().len(),
+        2,
+        "turn B did not run after the release"
+    );
+}
+
+/// A pooled socket on session "conn-1" to the mock at `url`, its reader running.
+async fn pooled(executor: &CodexExecutor, url: &str) -> Arc<super::Upstream> {
+    let session = executor.ws.session("conn-1");
+    let target = Target::new(
+        &credential(url),
+        ws_url(&format!("{url}/responses")).unwrap(),
+        &Config::default(),
+    );
+    executor
+        .ensure(&session, &target, &HeaderMap::new(), "gpt-fixture", false, None)
+        .await
+        .unwrap()
+        .0
+}
+
+async fn read_text(reads: &mut mpsc::Receiver<Read>) -> String {
+    match tokio::time::timeout(Duration::from_secs(5), reads.recv()).await {
+        Ok(Some(Read::Text(text))) => text,
+        Ok(Some(Read::Failed(error))) => panic!("read failed: {error}"),
+        other => panic!("no upstream event: {}", other.is_ok()),
+    }
+}
+
+/// What the mock upstream received, once `count` frames arrived.
+async fn received(up: &Upstream, count: usize) -> Vec<String> {
+    for _ in 0..250 {
+        if up.frames.lock().unwrap().len() >= count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    up.frames.lock().unwrap().clone()
+}
+
+const INTERRUPT_R1: &str = r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#;
+
+/// Go `TestInterruptExecutionSessionRequiresActiveRead`: a socket kept between turns is
+/// not the current upstream (the HTTP fallback may cancel locally); once a turn reads,
+/// the interrupt reaches the socket byte for byte.
+#[tokio::test]
+async fn interrupt_needs_a_turn_reading_on_the_socket() {
+    let (up, url) = upstream(vec![]).await;
+    let executor = CodexExecutor::new().unwrap();
+    assert_eq!(
+        executor
+            .interrupt_session("conn-1", INTERRUPT_R1.as_bytes(), |_| true)
+            .await,
+        Err(InterruptError::NoActive),
+        "no session"
+    );
+    let conn = pooled(&executor, &url).await;
+    assert_eq!(
+        executor
+            .interrupt_session("conn-1", INTERRUPT_R1.as_bytes(), |_| true)
+            .await,
+        Err(InterruptError::NoActive),
+        "idle socket"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(up.frames.lock().unwrap().is_empty(), "the idle socket was written");
+
+    let _reads = conn.activate();
+    let mut checked = Vec::new();
+    let check = |id: &str| {
+        checked.push(id.to_owned());
+        false
+    };
+    assert_eq!(
+        executor
+            .interrupt_session("conn-1", INTERRUPT_R1.as_bytes(), check)
+            .await,
+        Err(InterruptError::Rejected(
+            "websocket credential is no longer enabled".into()
+        )),
+        "disabled credential"
+    );
+    assert_eq!(checked, ["codex-ws.json"], "the check gets the socket's credential");
+    executor
+        .interrupt_session("conn-1", INTERRUPT_R1.as_bytes(), |_| true)
+        .await
+        .unwrap();
+    assert_eq!(received(&up, 1).await, [INTERRUPT_R1]);
+}
+
+/// Go `TestInterruptExecutionSessionCompletesDuringAuthCheck`: the response finishes
+/// while the account check runs. The interrupt is then done, not forwarded: the socket's
+/// state is read after the check.
+#[tokio::test]
+async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
+    let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED])]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let conn = pooled(&executor, &url).await;
+    let mut reads = conn.activate();
+    conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
+    read_text(&mut reads).await;
+    read_text(&mut reads).await;
+    // The turn is still reading when the check starts and done when it returns.
+    let finish = || {
+        conn.deactivate();
+        true
+    };
+    executor
+        .interrupt_session("conn-1", br#"{"type":"response.interrupt","response_id":"r1"}"#, |_| {
+            finish()
+        })
+        .await
+        .unwrap();
+    conn.send("barrier".into()).await.unwrap();
+    assert_eq!(received(&up, 2).await, [r#"{"type":"response.create"}"#, "barrier"]);
+}
+
+/// Go `TestInterruptExecutionSessionAfterTerminal`: a late interrupt for a finished
+/// response is done, also while the next response runs, and never reaches upstream; an
+/// unknown ID on an idle socket falls through to the HTTP fallback; after the socket is
+/// lost there is no active upstream.
+#[tokio::test]
+async fn late_interrupts_for_finished_responses_are_done() {
+    for terminal in [
+        "response.completed",
+        "response.done",
+        "response.incomplete",
+        "response.failed",
+    ] {
+        let finished: &'static str =
+            Box::leak(format!(r#"{{"type":"{terminal}","response":{{"id":"r1","output":[]}}}}"#).into_boxed_str());
+        let (up, url) = upstream(vec![
+            Act::Send(vec![CREATED, finished]),
+            Act::Send(vec![r#"{"type":"response.incomplete","response":{"id":"r2"}}"#]),
+            Act::SendClose(vec![], 1000),
+        ])
+        .await;
+        let executor = CodexExecutor::new().unwrap();
+        let conn = pooled(&executor, &url).await;
+        let interrupt = |id: &str| format!(r#"{{"type":"response.interrupt","response_id":"{id}"}}"#);
+        let send = |id: &'static str| {
+            let executor = &executor;
+            async move {
+                executor
+                    .interrupt_session("conn-1", interrupt(id).as_bytes(), |_| true)
+                    .await
+            }
+        };
+        let mut reads = conn.activate();
+        conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
+        read_text(&mut reads).await;
+        read_text(&mut reads).await;
+        conn.deactivate();
+        for _ in 0..2 {
+            assert_eq!(send("r1").await, Ok(()), "{terminal}: finished r1");
+        }
+        assert_eq!(
+            send("unknown").await,
+            Err(InterruptError::NoActive),
+            "{terminal}: unknown"
+        );
+
+        let mut reads = conn.activate();
+        assert_eq!(send("r1").await, Ok(()), "{terminal}: r1 while r2 runs");
+        assert_eq!(send("r2").await, Ok(()), "{terminal}: active r2");
+        read_text(&mut reads).await;
+        conn.deactivate();
+        for id in ["r1", "r2"] {
+            assert_eq!(send(id).await, Ok(()), "{terminal}: finished {id}");
+        }
+        assert_eq!(
+            received(&up, 2).await,
+            [r#"{"type":"response.create"}"#.to_owned(), interrupt("r2")],
+            "{terminal}: only the active response's interrupt reached upstream"
+        );
+        conn.send("bye".into()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
+            .await
+            .unwrap_or_else(|_| panic!("{terminal}: the disconnect was not reported"));
+        assert_eq!(
+            send("r2").await,
+            Err(InterruptError::NoActive),
+            "{terminal}: lost socket"
+        );
+    }
 }
 
 #[path = "codex_duplex_tests.rs"]

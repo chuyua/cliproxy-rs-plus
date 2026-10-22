@@ -19,6 +19,7 @@
 //! system (NFS, 9p such as WSL2's /mnt/c, sshfs) raises no event here and is seen with
 //! the next local change; on an SMB/CIFS share it may not be reported, depending on the
 //! server.
+use cpa_core::gostr::GoStr;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -75,7 +76,7 @@ impl Dir {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn matters(&self, name: &std::ffi::OsStr) -> bool {
         let lossy = name.to_string_lossy();
-        (self.json && lossy.to_lowercase().ends_with(".json"))
+        (self.json && lossy.go_lower().ends_with(".json"))
             || self.names.as_ref().is_none_or(|names| {
                 names.iter().any(|n| {
                     if cfg!(windows) {
@@ -219,7 +220,7 @@ fn dirs(t: &Targets) -> Vec<Dir> {
         let file = entry.path();
         let json = file
             .file_name()
-            .is_some_and(|n| n.to_string_lossy().to_lowercase().ends_with(".json"));
+            .is_some_and(|n| n.to_string_lossy().go_lower().ends_with(".json"));
         if !json || !entry.file_type().is_ok_and(|f| f.is_symlink()) {
             continue;
         }

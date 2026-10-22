@@ -2,6 +2,7 @@
 //! per request identity (network scope and credentials), shared across release
 //! metadata and API asset downloads.
 
+use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -228,7 +229,7 @@ fn rate_limit_message(body: &[u8]) -> bool {
     let Ok(decoded) = crate::gojson::from_slice::<RateLimitBody>(body) else {
         return false;
     };
-    let text = decoded.message.to_lowercase();
+    let text = decoded.message.go_lower();
     text.contains("secondary rate limit")
         || text.contains("api rate limit exceeded")
         || text.contains("abuse detection")

@@ -132,7 +132,7 @@ fn error_payloads_match_go() {
     for v in vectors("error_payload") {
         let status = v["status"].as_u64().unwrap_or(0) as u16;
         assert_eq!(
-            error_payload(status, s(v, "raw")),
+            error_payload(status, s(v, "raw"), None),
             s(v, "out"),
             "{status} {:?}",
             s(v, "raw")

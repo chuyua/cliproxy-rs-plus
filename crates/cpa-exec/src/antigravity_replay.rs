@@ -256,26 +256,19 @@ fn header(headers: &HeaderMap, name: &str) -> String {
 /// `antigravityClaudeReplaySystemLane`: a hash of the Claude system prompt without its
 /// `cache_control` markers, so a changed system prompt starts a new chain.
 fn system_lane(payload: &[u8]) -> String {
-    fn strip(value: GoValue) -> GoValue {
-        match value {
-            GoValue::Object(map) => GoValue::Object(
-                map.into_iter()
-                    .filter(|(key, _)| !key.trim().go_eq_fold("cache_control"))
-                    .map(|(key, child)| (key, strip(child)))
-                    .collect(),
-            ),
-            GoValue::Array(items) => GoValue::Array(items.into_iter().map(strip).collect()),
-            other => other,
-        }
-    }
     let system = gj::get(payload, "system");
     if !system.exists() {
         return String::new();
     }
-    let Some(value) = GoValue::parse_f64(system.raw()) else {
+    let Some(mut value) = GoValue::parse_f64(system.raw()) else {
         return String::new();
     };
-    hex(&Sha256::digest(strip(value).marshal())[..16])
+    value.visit_mut(|v| {
+        if let GoValue::Object(map) = v {
+            map.retain(|key, _| !key.trim().go_eq_fold("cache_control"));
+        }
+    });
+    hex(&Sha256::digest(value.marshal())[..16])
 }
 
 /// `antigravityReasoningReplayClientSessionKey`: an explicit downstream session, which

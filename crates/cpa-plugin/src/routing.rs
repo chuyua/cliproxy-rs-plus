@@ -173,7 +173,7 @@ pub fn normalize_route_response(router_id: &str, mut resp: ModelRouteResponse) -
     resp.target = match resp.target_kind.as_str() {
         ROUTE_TARGET_SELF => router_id.trim().to_owned(),
         ROUTE_TARGET_EXECUTOR => resp.target.trim().to_owned(),
-        ROUTE_TARGET_PROVIDER => resp.target.trim().to_lowercase(),
+        ROUTE_TARGET_PROVIDER => crate::host::normalize_provider(&resp.target),
         _ => return None,
     };
     (!resp.target.is_empty()).then_some(resp)
@@ -247,6 +247,14 @@ mod tests {
                 .unwrap()
                 .target,
             "claude"
+        );
+        // A provider target names the key core registers: Go lowercases both with
+        // strings.ToLower, so U+0130 becomes a plain `i` on each side.
+        assert_eq!(
+            normalize_route_response("r", resp("provider", "openai-compatible-HİGH"))
+                .unwrap()
+                .target,
+            cpa_core::config::credentials::openai_compat_provider("HİGH")
         );
         assert!(normalize_route_response("r", resp("executor", " ")).is_none());
         assert!(normalize_route_response("r", resp("other", "x")).is_none());

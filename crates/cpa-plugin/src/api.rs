@@ -904,6 +904,8 @@ go_struct! {
         "Model" => model: String,
         "Alias" => alias: String,
         "APIKey" => api_key: String,
+        "IsNativeKey" => is_native_key: bool,
+        "AccessProvider" => access_provider: String,
         "SessionID" => session_id: String,
         "ParentSessionID" => parent_session_id: String,
         "AuthID" => auth_id: String,

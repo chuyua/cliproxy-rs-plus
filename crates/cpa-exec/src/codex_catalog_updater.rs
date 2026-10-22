@@ -24,11 +24,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 3600);
 
 static ETAGS: Etags = Etags::new();
 
+static STARTED: Once = Once::new();
+
 /// `StartCodexClientModelsUpdater`: one background refresh loop per process, starting
 /// with an immediate fetch. Call from inside the Tokio runtime; later calls do nothing.
 pub fn start_codex_client_models_updater() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
+    STARTED.call_once(|| {
         tokio::spawn(async {
             let client = crate::proxy::default_client();
             let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
@@ -39,6 +40,11 @@ pub fn start_codex_client_models_updater() {
             }
         });
     });
+}
+
+/// Whether this process started the refresh loop.
+pub fn codex_client_models_updater_started() -> bool {
+    STARTED.is_completed()
 }
 
 /// `tryRefreshCodexClientModels`: whether a fetched catalog replaced the current one.

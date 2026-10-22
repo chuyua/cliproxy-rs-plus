@@ -3,6 +3,7 @@
 //! normalized quota, directly or through a gjson path mapping. `quota/fetch` uses it
 //! when no plugin quota provider handles the credential.
 
+use cpa_core::gostr::GoStr;
 use std::time::SystemTime;
 
 use axum::body::Bytes;
@@ -30,7 +31,7 @@ pub(super) async fn execute(
     if url.is_empty() {
         return None;
     }
-    let method = match go_to_upper(text("method").trim()) {
+    let method = match text("method").trim().go_upper() {
         m if m.is_empty() => "GET".to_owned(),
         m => m,
     };
@@ -168,20 +169,6 @@ pub(super) async fn execute(
     fail("upstream probe response does not match normalized quota shape or declared mapping".into())
 }
 
-/// Go `strings.ToUpper`: simple per-rune case mapping (a rune whose uppercase is
-/// several runes, like `ß`, stays as it is).
-fn go_to_upper(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            let mut upper = c.to_uppercase();
-            match (upper.next(), upper.next()) {
-                (Some(u), None) => u,
-                _ => c,
-            }
-        })
-        .collect()
-}
-
 /// `http.ParseTime(date).Sub(time.Now()).Milliseconds()`.
 fn server_offset_ms(date: &str) -> Option<i64> {
     let parsed = [
@@ -286,7 +273,7 @@ fn usable_summary(raw: &[u8]) -> Vec<QuotaMetric> {
                 "currency" => {
                     let currency = metric.get("currency");
                     if currency.kind == Kind::String {
-                        let code = currency.str().trim().to_uppercase();
+                        let code = currency.str().trim().go_upper();
                         if super::iso_currency::CODES.binary_search(&code.as_str()).is_ok() {
                             m.format = "currency".into();
                             m.currency = code;

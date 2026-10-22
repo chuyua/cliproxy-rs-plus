@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use cpa_core::config::Config;
+use cpa_core::credential::Credential;
 use cpa_core::exec::{
     ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
 };
@@ -39,6 +41,7 @@ use crate::codex_json::{set_raw, set_str};
 use crate::codex_quota::{self, QuotaSignals};
 use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, OutputItems};
+use crate::proxy::Proxy;
 
 /// `codexResponsesWebsocketIdleTimeout`: read deadline renewed before every read.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -75,11 +78,50 @@ const MAX_HANDSHAKE_BODY: usize = 64 * 1024;
 // bounded while fitting image-bearing output items.
 const MAX_UPSTREAM_MESSAGE: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct Target {
     pub(crate) credential: String,
     pub(crate) url: String,
-    pub(crate) proxy: crate::proxy::Proxy,
+    /// The proxy to dial with, parsed from `setting`.
+    pub(crate) proxy: Proxy,
+    /// The trimmed effective setting: the credential's own, else `requests.proxy-url`.
+    /// Go compares these strings (`websocketSessionTargetMatches`), not parsed proxies:
+    /// `direct` and `none` are different targets.
+    setting: String,
+    /// The trimmed `requests.proxy-url` when the target was resolved.
+    global: String,
+    /// Whether `setting` came from `requests.proxy-url` (the credential sets none).
+    inherited: bool,
+}
+
+impl Target {
+    pub(crate) fn new(credential: &Credential, url: String, cfg: &Config) -> Self {
+        let own = Proxy::own_url(credential);
+        let global = Proxy::global_url(cfg);
+        let setting = own.map_or_else(|| global.clone(), str::to_owned);
+        Self {
+            credential: credential.id.clone(),
+            url,
+            proxy: Proxy::parse(&setting),
+            setting,
+            global,
+            inherited: own.is_none(),
+        }
+    }
+
+    /// `websocketSessionTargetMatches` under the current config.
+    pub(crate) fn same(&self, want: &Target) -> bool {
+        self.credential == want.credential && self.url == want.url && self.setting == want.setting
+    }
+
+    /// Whether the live socket dialed for `self` still serves `want`. Go 1e37b52b
+    /// (`effectiveConfig`): for the same credential, the global proxy is the one the
+    /// socket dialed with, so a reload that changes only `requests.proxy-url` keeps the
+    /// socket. New sockets dial with the new setting.
+    pub(crate) fn serves(&self, want: &Target) -> bool {
+        let setting = if want.inherited { &self.global } else { &want.setting };
+        self.credential == want.credential && self.url == want.url && self.setting == *setting
+    }
 }
 
 pub(crate) enum Read {
@@ -96,6 +138,47 @@ pub(crate) struct Link {
     active: Option<mpsc::Sender<Read>>,
     /// Why the reader stopped (`upstreamDisconnectError`); set once when it exits.
     pub(crate) lost: Option<ExecError>,
+    /// Response IDs this socket already finished (`terminalResponseIDs`): a late
+    /// `response.interrupt` for one is done, not an error and not forwarded.
+    // ponytail: grows by one ID per finished response for the socket's life, as Go's
+    // does; bound it if sockets ever outlive thousands of turns.
+    terminal: std::collections::HashSet<String>,
+}
+
+/// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
+/// without `error`) with a non-empty string `response.id`.
+fn terminal_response_id(payload: &str) -> Option<String> {
+    let kind = gjson::get(payload, "type");
+    if !matches!(
+        kind.str(),
+        "response.completed" | "response.done" | "response.incomplete" | "response.failed"
+    ) {
+        return None;
+    }
+    let id = gjson::get(payload, "response.id");
+    (id.kind() == Kind::String && !id.str().is_empty()).then(|| id.str().to_owned())
+}
+
+/// Go `ErrNoActiveUpstreamWebsocket`.
+pub const NO_ACTIVE_UPSTREAM: &str = "no active upstream websocket for response.interrupt";
+
+/// Why [`CodexExecutor::interrupt`] did not deliver a `response.interrupt`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterruptError {
+    /// No turn is reading on the session's current socket ([`NO_ACTIVE_UPSTREAM`]): an
+    /// HTTP turn may still cancel locally.
+    NoActive,
+    /// The socket was lost, the credential is disabled, or the write failed.
+    Rejected(String),
+}
+
+impl std::fmt::Display for InterruptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActive => f.write_str(NO_ACTIVE_UPSTREAM),
+            Self::Rejected(text) => f.write_str(text),
+        }
+    }
 }
 
 pub(crate) struct Upstream {
@@ -161,11 +244,28 @@ impl Upstream {
     /// socket, so a partly written frame is never followed by another. Cost: one timer
     /// entry while a write is in flight.
     pub(crate) async fn send(&self, frame: String) -> Result<(), ExecError> {
-        let deadline = self.write.deadline(frame.len());
-        let sent = tokio::time::timeout(deadline, async {
-            self.sink.lock().await.send(Message::text(frame)).await
-        })
-        .await;
+        let len = frame.len();
+        self.write_message(Message::text(frame), len).await
+    }
+
+    /// [`Self::send`] for a client's own bytes: one text frame holding them unchanged,
+    /// UTF-8 or not, as gorilla writes a `TextMessage`.
+    pub(crate) async fn send_raw(&self, payload: Bytes) -> Result<(), ExecError> {
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        };
+        let len = payload.len();
+        self.write_message(
+            Message::Frame(Frame::message(payload, OpCode::Data(Data::Text), true)),
+            len,
+        )
+        .await
+    }
+
+    async fn write_message(&self, message: Message, len: usize) -> Result<(), ExecError> {
+        let deadline = self.write.deadline(len);
+        let sent = tokio::time::timeout(deadline, async { self.sink.lock().await.send(message).await }).await;
         match sent {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(write_error(
@@ -262,9 +362,21 @@ pub(crate) struct Session {
     closed: watch::Sender<Option<ExecError>>,
     /// The downstream connection's client frames when response steering is configured.
     steering: Mutex<Option<Arc<SteeringInput>>>,
+    /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
+    /// is gone, and removing that credential still ends the session).
+    credential: Mutex<String>,
 }
 
 impl Session {
+    /// Makes `conn` the session's socket.
+    pub(crate) fn publish(&self, conn: Arc<Upstream>) {
+        let mut slot = self.conn.lock().expect("session conn");
+        conn.target
+            .credential
+            .clone_into(&mut self.credential.lock().expect("session credential"));
+        *slot = Some(conn);
+    }
+
     pub(crate) fn current(&self) -> Option<Arc<Upstream>> {
         self.conn.lock().expect("session conn").clone()
     }
@@ -342,9 +454,15 @@ impl Pool {
                     conn: Mutex::default(),
                     closed: watch::channel(None).0,
                     steering: Mutex::default(),
+                    credential: Mutex::default(),
                 })
             })
             .clone()
+    }
+
+    /// The session, without creating one.
+    fn get(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().expect("sessions").get(id).cloned()
     }
 
     /// `WithWebsocketInput`: binds the downstream connection's frames to its session.
@@ -360,10 +478,104 @@ impl Pool {
         }
     }
 
+    /// `closeCodexWebsocketSessionsInStoreForAuthID`: ends the sessions whose last socket
+    /// was dialed for `credential` (a removed credential), like [`Self::close`] for each,
+    /// and leaves every other session open.
+    pub(crate) fn close_credential(&self, credential: &str) {
+        self.close_credential_with(credential, |_| {});
+    }
+
+    /// [`Self::close_credential`]; `detached(id)` runs under the pool lock as each session
+    /// leaves it, so state keyed by the session id goes with it before the id can be
+    /// reused (Go deletes xAI's ID state under the session-store mutex). Sockets shut down
+    /// after the lock is released.
+    pub(crate) fn close_credential_with(&self, credential: &str, mut detached: impl FnMut(&str)) {
+        let sessions: Vec<_> = {
+            let sessions = self.sessions.lock().expect("sessions");
+            sessions.iter().map(|(id, s)| (id.clone(), s.clone())).collect()
+        };
+        let matching: Vec<_> = sessions
+            .into_iter()
+            .filter(|(_, s)| *s.credential.lock().expect("session credential") == credential)
+            .collect();
+        let mut closing = Vec::new();
+        {
+            let mut sessions = self.sessions.lock().expect("sessions");
+            for (id, session) in matching {
+                // A session closed or replaced since the snapshot is not this one.
+                if !sessions.get(&id).is_some_and(|s| Arc::ptr_eq(s, &session)) {
+                    continue;
+                }
+                sessions.remove(&id);
+                detached(&id);
+                closing.push(session);
+            }
+        }
+        for session in closing {
+            if let Some(conn) = session.conn.lock().expect("session conn").take() {
+                conn.shutdown();
+            }
+        }
+    }
+
     /// The error that lost the session's upstream socket, if it was lost.
     pub fn loss(&self, id: &str) -> Option<ExecError> {
-        let session = self.sessions.lock().expect("sessions").get(id).cloned()?;
+        let session = self.get(id)?;
         session.closed.borrow().clone()
+    }
+
+    /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
+    /// to the socket of the session's turn in progress. It never dials, replays or
+    /// selects another credential. `enabled(credential_id)` is the live account check,
+    /// called without holding a session lock.
+    pub async fn interrupt(
+        &self,
+        id: &str,
+        payload: &[u8],
+        enabled: impl FnOnce(&str) -> bool,
+    ) -> Result<(), InterruptError> {
+        let session = Some(id.trim())
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.get(id))
+            .ok_or(InterruptError::NoActive)?;
+        let conn = session.current().ok_or(InterruptError::NoActive)?;
+        let auth_enabled = enabled(&conn.target.credential);
+        let response_id = cpa_common::json::get(payload, "response_id").bytes();
+        {
+            // One snapshot of the socket's state: a completion landing between the
+            // checks would otherwise turn a late interrupt into a stale error.
+            let current = session.conn.lock().expect("session conn");
+            if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
+                return Err(InterruptError::NoActive);
+            }
+            let link = conn.link.lock().expect("link");
+            if let Some(lost) = &link.lost {
+                return Err(InterruptError::Rejected(
+                    String::from_utf8_lossy(&lost.body).into_owned(),
+                ));
+            }
+            if std::str::from_utf8(&response_id).is_ok_and(|id| link.terminal.contains(id)) {
+                return Ok(());
+            }
+            // A socket kept from an earlier turn is not the current upstream.
+            if link.active.is_none() {
+                return Err(InterruptError::NoActive);
+            }
+        }
+        if !auth_enabled {
+            return Err(InterruptError::Rejected(
+                "websocket credential is no longer enabled".into(),
+            ));
+        }
+        // A failed or timed-out write may leave a partial frame: the socket is dropped
+        // like after any failed turn write (Go leaves that to its reader).
+        if let Err(error) = conn.send_raw(Bytes::copy_from_slice(payload)).await {
+            session.invalidate(&conn, &error, true);
+            return Err(InterruptError::Rejected(
+                String::from_utf8_lossy(&error.body).into_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolves with the error that lost the session's upstream socket.
@@ -495,6 +707,15 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(url.into())
 }
 
+/// `applyCodexSIWCWebsocketBodyRules` after `SanitizeCodexInputItemIDs`, in Go's order:
+/// the id pass sees the `configuration_update` items the SIWC rules then drop.
+pub(crate) fn siwc_turn_body(view: &View<'_>, req: &ExecRequest, body: String) -> String {
+    if !view.siwc {
+        return body;
+    }
+    request::siwc_request_body(request::sanitize_input_ids(body), req, Call::Websocket)
+}
+
 /// `buildCodexWebsocketRequestBody`: every turn is a `response.create`.
 fn request_frame(body: String) -> String {
     let body = request::sanitize_input_ids(body);
@@ -602,7 +823,10 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     ]
     .iter()
     .any(|p| gjson::get(payload, p).str().trim() == "websocket_connection_limit_reached");
+    // Go `statusErrWithHeaders`: the frame's headers reach the client under passthrough.
+    let addon = (!headers.is_empty()).then(|| Box::new(headers.clone()));
     let mut error = response::status_error_raw(status, &out, headers, model_level_cooling);
+    error.addon = addon;
     if error.retry_after.is_none() && connection_limit {
         error.retry_after = Some(Duration::ZERO);
     }
@@ -634,7 +858,9 @@ struct Turn {
     rx: mpsc::Receiver<Read>,
     conn: Arc<Upstream>,
     session: Arc<Session>,
-    _turn: OwnedMutexGuard<()>,
+    _turn: Option<OwnedMutexGuard<()>>,
+    /// The observation of the message being read, while it runs.
+    observing: Option<crate::ws_observation::Observation>,
     items: OutputItems,
     saw_delta: bool,
     native: bool,
@@ -659,7 +885,10 @@ struct Turn {
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        self.conn.deactivate();
+        // An abandoned turn keeps its session until an observation it started returns,
+        // as Go's executor holds the session lock through the synchronous observer.
+        let conn = self.conn.clone();
+        crate::ws_observation::release_after(self.observing.take(), self._turn.take(), move || conn.deactivate());
     }
 }
 
@@ -704,7 +933,7 @@ impl Turn {
             return Frame::Skip;
         }
         self.observe(payload);
-        self.wire.ws_response(payload.as_bytes());
+        crate::ws_observation::observe(&mut self.observing, self.wire.ws_response_observation(payload)).await;
         let raw_len = payload.len();
         let payload = response::restore(payload, self.restore);
         let payload = payload.as_ref();
@@ -896,7 +1125,7 @@ impl CodexExecutor {
         wire: Option<&crate::codex_capture::Wire>,
     ) -> Result<(Arc<Upstream>, Option<HeaderMap>), ExecError> {
         if let Some(current) = session.current() {
-            if current.target == *target {
+            if current.target.serves(target) {
                 return Ok((current, None));
             }
             // target_changed: another credential, URL or proxy now serves this session.
@@ -914,7 +1143,7 @@ impl CodexExecutor {
         // socket current and invalidates it; holding the handle slot keeps a concurrent
         // shutdown from missing the abort handle.
         let mut reader = conn.reader.lock().expect("reader handle");
-        *session.conn.lock().expect("session conn") = Some(conn.clone());
+        session.publish(conn.clone());
         let task = tokio::spawn(read_loop(stream, Arc::downgrade(session), conn.clone(), self.ws.idle));
         *reader = Some(task.abort_handle());
         drop(reader);
@@ -1003,6 +1232,7 @@ impl CodexExecutor {
         settings: &Settings,
         req: ExecRequest,
         exec_session: &ExecSession,
+        cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         let model = request::base_model(&req.model).to_owned();
         let request::Shaped {
@@ -1013,13 +1243,10 @@ impl CodexExecutor {
         let (body, replay) = Replay::apply(&self.replay, &req, body).await;
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
+        let body = siwc_turn_body(view, &req, body);
         let native = request::is_native(&req);
         let headers = request::ws_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), native);
-        let target = Target {
-            credential: view.credential.id.clone(),
-            url: ws_url(&format!("{}/responses", view.base_url))?,
-            proxy: view.proxy.clone(),
-        };
+        let target = Target::new(view.credential, ws_url(&format!("{}/responses", view.base_url))?, cfg);
         let session = self.ws.session(&exec_session.id);
         // `WebsocketInputFromContext(ctx) != nil && cfg.Codex.ResponseSteering`.
         let steering = settings
@@ -1033,10 +1260,11 @@ impl CodexExecutor {
             });
         let guard = session.turn.clone().lock_owned().await;
         let frame = request_frame(body);
-        let wire = crate::codex_capture::Wire::new(req.capture(), view.credential);
+        let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
+            .with_websocket(req.websocket_emitter("codex", view.credential));
         wire.ws_request(&target.url, &headers, frame.as_bytes());
         let (mut conn, mut handshake) = if exec_session.continuation {
-            match session.current().filter(|c| c.target == target) {
+            match session.current().filter(|c| c.target.serves(&target)) {
                 Some(conn) => (conn, None),
                 None => return Err(ExecError::replay_required()),
             }
@@ -1105,7 +1333,8 @@ impl CodexExecutor {
             rx,
             conn,
             session,
-            _turn: guard,
+            _turn: Some(guard),
+            observing: None,
             items: OutputItems::default(),
             saw_delta: false,
             native,
@@ -1202,7 +1431,16 @@ pub(crate) async fn read_loop(
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }
         };
-        let active = conn.link.lock().expect("link").active.clone();
+        // Terminal IDs are recorded before delivery: the handler may still be forwarding
+        // the turn after its read channel was released.
+        let terminal = terminal_response_id(text.trim());
+        let active = {
+            let mut link = conn.link.lock().expect("link");
+            if let Some(id) = terminal {
+                link.terminal.insert(id);
+            }
+            link.active.clone()
+        };
         if let Some(tx) = active {
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
             let _ = tx.send(Read::Text(text)).await;

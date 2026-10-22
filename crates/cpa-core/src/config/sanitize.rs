@@ -5,6 +5,8 @@ use std::collections::HashSet;
 
 use serde_yaml_ng::{Mapping, Value};
 
+use crate::gostr::GoStr;
+
 fn s(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.trim().to_owned(),
@@ -23,7 +25,7 @@ fn list(v: Option<&Value>) -> Vec<String> {
 fn channels(map: &Value, mut each: impl FnMut(&Value) -> Option<Value>) -> Value {
     let mut out = Mapping::new();
     for (channel, entries) in map.as_mapping().into_iter().flatten() {
-        let channel = s(Some(channel)).to_lowercase();
+        let channel = s(Some(channel)).go_lower();
         if channel.is_empty() {
             continue;
         }
@@ -40,7 +42,7 @@ fn excluded_models(map: &Value) -> Value {
         let mut seen = HashSet::new();
         let clean: Vec<Value> = list(Some(models))
             .into_iter()
-            .map(|m| m.to_lowercase())
+            .map(|m| m.go_lower())
             .filter(|m| seen.insert(m.clone()))
             .map(Value::from)
             .collect();
@@ -58,10 +60,10 @@ fn model_alias(map: &Value) -> Value {
             .flatten()
             .filter_map(|e| {
                 let (name, alias) = (s(e.get("name")), s(e.get("alias")));
-                if name.is_empty() || alias.is_empty() || name.eq_ignore_ascii_case(&alias) {
+                if name.is_empty() || alias.is_empty() || name.go_eq_fold(&alias) {
                     return None;
                 }
-                if !seen.insert(alias.to_lowercase()) {
+                if !seen.insert(alias.go_lower()) {
                     return None;
                 }
                 let mut out = Mapping::new();
@@ -91,7 +93,7 @@ fn settings(map: &Value) -> Value {
         let mut reversed: Vec<Value> = Vec::new();
         for e in entries.as_sequence().into_iter().flatten().rev() {
             let (name, alias) = (s(e.get("name")), s(e.get("alias")));
-            if name.is_empty() || !seen.insert(format!("{}->{}", name.to_lowercase(), alias.to_lowercase())) {
+            if name.is_empty() || !seen.insert(format!("{}->{}", name.go_lower(), alias.go_lower())) {
                 continue;
             }
             let mut out = Mapping::new();
@@ -118,7 +120,7 @@ fn request_scoped_errors(map: &Value) -> Value {
             .flatten()
             .filter_map(|r| {
                 let status = r.get("status").and_then(Value::as_i64).unwrap_or(0);
-                let action = s(r.get("action")).to_lowercase();
+                let action = s(r.get("action")).go_lower();
                 let (m, re) = (list(r.get("match")), list(r.get("match-regexr")));
                 if status <= 0 || (m.is_empty() && re.is_empty()) || action.is_empty() {
                     return None;

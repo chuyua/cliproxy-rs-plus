@@ -97,7 +97,7 @@ impl OAuth {
         match &self.source {
             Source::Fixed(client) => Ok(client.clone()),
             Source::Transport(t) => t
-                .clients(&self.proxy)
+                .clients(&self.proxy, None)
                 .map(|c| c.oauth.clone())
                 .map_err(|_| ExecError::local(502, FailureScope::Transport, "OAuth transport failed")),
         }
@@ -115,7 +115,7 @@ impl OAuth {
         };
         // Never expose a control-plane body: providers may echo tokens in errors.
         let response = into_response(response).await.map_err(|error| {
-            let mut safe = ExecError::local(error.status, error.scope, "Claude OAuth acquisition failed");
+            let mut safe = ExecError::local(error.status, error.scope, HTTP_FAILURE);
             safe.retry_after = backoff.or(error.retry_after);
             safe
         })?;
@@ -235,9 +235,21 @@ impl OAuth {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(attempt)).await;
             }
-            // isClaudeRefreshRetryable: 5xx and transport failures; never a 429.
+            // Go `isClaudeRefreshRetryable` (c163bae4): only a 5xx answer, never a 429. A
+            // transport, body-read, decompression or decoding failure is ambiguous:
+            // Anthropic may have spent the single-use refresh token, and a replay would
+            // turn it into invalid_grant. Only an error status is Credential-scoped with
+            // the HTTP_FAILURE text; read and decompression failures are Transport or
+            // Request, and the timeout and missing-field errors carry other text.
             match self.refresh_once(refresh).await {
-                Err(error) if error.status >= 500 && attempt < 2 => continue,
+                Err(error)
+                    if error.status >= 500
+                        && error.scope == FailureScope::Credential
+                        && error.body == HTTP_FAILURE
+                        && attempt < 2 =>
+                {
+                    continue;
+                }
                 result => return result,
             }
         }
@@ -610,6 +622,9 @@ pub(crate) fn random_hex(n: usize) -> Result<String, ExecError> {
     getrandom::fill(&mut bytes).map_err(|_| acquisition_error("secure random source unavailable"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
+
+/// The error text for a token endpoint that answered with an error status.
+const HTTP_FAILURE: &str = "Claude OAuth acquisition failed";
 
 fn acquisition_error(message: &str) -> ExecError {
     ExecError::local(502, FailureScope::Credential, message)

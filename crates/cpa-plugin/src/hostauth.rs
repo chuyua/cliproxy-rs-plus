@@ -6,6 +6,7 @@
 //! plugin host uses it); without one, listing reads the auth directory and lookups
 //! report the manager unavailable, as Go's host does before `SetAuthManager`.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -137,7 +138,7 @@ impl Host {
         let files = match self.auth_manager() {
             Some(manager) => {
                 let mut entries: Vec<HostAuthFileEntry> = manager.list().iter().filter_map(build_entry).collect();
-                entries.sort_by_key(|e| e.name.to_lowercase());
+                entries.sort_by_key(|e| e.name.go_lower());
                 entries
             }
             None => self.list_auth_files_from_disk()?,
@@ -161,7 +162,7 @@ impl Host {
                 continue;
             }
             let name = dirent.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().ends_with(".json") {
+            if !name.go_lower().ends_with(".json") {
                 continue;
             }
             let full = dir.join(&name);
@@ -209,7 +210,7 @@ impl Host {
             }
             files.push(entry);
         }
-        files.sort_by_key(|e| e.name.to_lowercase());
+        files.sort_by_key(|e| e.name.go_lower());
         Ok(files)
     }
 
@@ -292,7 +293,7 @@ impl Host {
         if name.is_empty() || name.contains(['/', '\\']) || (cfg!(windows) && has_volume_name(name)) {
             return Err(err("invalid auth file name"));
         }
-        if !name.to_lowercase().ends_with(".json") {
+        if !name.go_lower().ends_with(".json") {
             return Err(err("auth file name must end with .json"));
         }
         let data = trim_space(&req.json.0).to_vec();
@@ -391,7 +392,7 @@ impl Host {
         {
             id = rel;
         }
-        if cfg!(windows) { id.to_lowercase() } else { id }
+        if cfg!(windows) { id.go_lower() } else { id }
     }
 
     /// `host.affinity.lookup`.

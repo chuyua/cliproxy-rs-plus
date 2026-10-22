@@ -4,6 +4,7 @@
 //! heartbeat is lost. Reconnection belongs to the caller, which starts each retry on a
 //! fresh [`Client::new_lifetime`].
 
+use cpa_core::gostr::GoStr;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{CHANNEL_CLUSTER, CHANNEL_CONFIG, Client, Recovery};
@@ -228,7 +229,7 @@ impl Client {
                     if payload.is_empty() {
                         continue;
                     }
-                    let applied = match channel.trim().to_lowercase().as_str() {
+                    let applied = match channel.trim().go_lower().as_str() {
                         CHANNEL_CONFIG => on_config(payload).is_ok(),
                         CHANNEL_CLUSTER => self.update_cluster_nodes(payload).is_ok(),
                         _ => true,

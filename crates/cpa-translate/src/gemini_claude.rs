@@ -3,7 +3,7 @@
 
 use crate::{
     Error, Registered, RequestCtx,
-    common::{self, go_lower, sanitize_function_name, trim_space},
+    common::{self, UserTurnDrops, go_lower, sanitize_function_name, trim_space},
     gemini::{self, attach_default_safety_settings},
     gemini_chat_request::content_node,
     gemini_claude_response as response, openai_claude,
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 pub static PAIR: Registered = registered!(
     Claude -> Gemini,
-    request: |ctx, body| Ok(convert(ctx.model, body, false)),
+    request: |ctx, body| convert(ctx.model, body, false),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: Some(openai_claude::claude_input_tokens),
@@ -22,7 +22,7 @@ pub static PAIR: Registered = registered!(
 /// ConvertClaudeRequestToGeminiWithCompat: compatibility endpoints keep assistant
 /// thinking blocks (as thought parts) even without a Gemini signature.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, true))
+    convert(ctx.model, body, true)
 }
 
 const SKIP_SIGNATURE: &str = "skip_thought_signature_validator";
@@ -48,7 +48,9 @@ fn tool_name_from_id(id: &[u8]) -> Vec<u8> {
     }
 }
 
-fn convert(model: &str, raw: &[u8], preserve_thinking: bool) -> Vec<u8> {
+/// A user turn left empty because its only attachment cannot be inlined is refused.
+fn convert(model: &str, raw: &[u8], preserve_thinking: bool) -> Result<Vec<u8>, Error> {
+    let mut drops = UserTurnDrops::default();
     let mut out = br#"{"contents":[]}"#.to_vec();
     gj::set_str(&mut out, "model", model);
 
@@ -80,7 +82,14 @@ fn convert(model: &str, raw: &[u8], preserve_thinking: bool) -> Vec<u8> {
         let mut names: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut pending: Vec<Vec<u8>> = vec![];
         messages.each(|_, message| {
-            message_contents(&message, preserve_thinking, &mut names, &mut pending, &mut contents);
+            message_contents(
+                &message,
+                preserve_thinking,
+                &mut names,
+                &mut pending,
+                &mut contents,
+                &mut drops,
+            );
             true
         });
         if let Some(last) = contents.last() {
@@ -198,7 +207,8 @@ fn convert(model: &str, raw: &[u8], preserve_thinking: bool) -> Vec<u8> {
             gj::set_f64(&mut out, to, v.num);
         }
     }
-    attach_default_safety_settings(out, "safetySettings")
+    drops.result()?;
+    Ok(attach_default_safety_settings(out, "safetySettings"))
 }
 
 /// A Claude tool as a Gemini function declaration (only tools with an object
@@ -238,6 +248,7 @@ fn message_contents(
     names: &mut HashMap<Vec<u8>, Vec<u8>>,
     pending: &mut Vec<Vec<u8>>,
     contents: &mut Vec<Vec<u8>>,
+    drops: &mut UserTurnDrops,
 ) {
     let role_res = message.get("role");
     if role_res.kind != Kind::String {
@@ -339,14 +350,15 @@ fn message_contents(
                     parts.push(inline_part(mime, data));
                 }
             }
-            b"image" => {
+            kind @ (b"image" | b"document" | b"container_upload") => {
                 let source = block.get("source");
-                if source.get("type").bytes().as_ref() != b"base64" {
-                    continue;
-                }
                 let (mime, data) = (source.get("media_type").bytes(), source.get("data").bytes());
-                if !mime.is_empty() && !data.is_empty() {
+                if source.get("type").bytes().as_ref() == b"base64" && !mime.is_empty() && !data.is_empty() {
                     parts.push(inline_part(&mime, &data));
+                } else if original == b"user" {
+                    // A url or file source cannot be inlined; the turn is refused only
+                    // if nothing else is left.
+                    drops.drop_part(&String::from_utf8_lossy(kind));
                 }
             }
             _ => {}
@@ -355,5 +367,28 @@ fn message_contents(
     if role == b"user" {
         parts = gemini::reorder_user_parts(parts);
     }
-    contents.push(content_node(&role, &parts));
+    if original == b"user" {
+        drops.end_turn(parts.iter().filter(|p| gemini_part_is_sendable(p)).count());
+    }
+    if !parts.is_empty() {
+        contents.push(content_node(&role, &parts));
+    }
+}
+
+/// GeminiPartIsSendable: blank text is forwarded but gives the model nothing to read.
+fn gemini_part_is_sendable(part: &[u8]) -> bool {
+    let part = gj::parse(part);
+    let text = part.get("text");
+    !text.exists()
+        || !trim_space(&text.bytes()).is_empty()
+        || [
+            "functionCall",
+            "functionResponse",
+            "inlineData",
+            "inline_data",
+            "fileData",
+            "file_data",
+        ]
+        .iter()
+        .any(|key| part.get(key).exists())
 }

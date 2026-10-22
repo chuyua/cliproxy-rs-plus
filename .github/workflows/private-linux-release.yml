@@ -15,6 +15,11 @@ on:
         description: New immutable preview tag (vX.Y.Z-linux-preview.YYYYMMDD)
         required: true
         type: string
+      confirm_public_release:
+        description: Explicitly allow publishing this preview from a public repository
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -34,15 +39,27 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       RUN_ID: ${{ inputs.build_run_id }}
       TAG: ${{ inputs.release_tag }}
+      PUBLIC_RELEASE_CONFIRMED: ${{ inputs.confirm_public_release }}
     steps:
-      - name: Verify private repository and successful exact CI source
+      - name: Verify repository visibility and successful exact CI source
         shell: bash
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "invalid source SHA"; exit 1; }
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "invalid CI run ID"; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-linux-preview\.[0-9]{8}$ ]] || { echo "invalid preview tag"; exit 1; }
-          test "$(gh api "repos/$REPO" --jq .private)" = true
+          repo_private="$(gh api "repos/$REPO" --jq .private)"
+          case "$repo_private" in
+            true) ;;
+            false)
+              if [[ "$PUBLIC_RELEASE_CONFIRMED" != true ]]; then
+                echo "Public repository release requires explicit confirm_public_release=true"
+                exit 1
+              fi
+              ;;
+            *) echo "Cannot verify repository visibility"; exit 1 ;;
+          esac
+          test "$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .name)" = "Private Rust build (Linux x64)"
           test "$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .conclusion)" = success
           test "$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .head_sha)" = "$SOURCE_SHA"
           if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
@@ -83,7 +100,7 @@ jobs:
           ## Linux x86_64 preview
 
           Source commit: \`$SOURCE_SHA\`
-          Verified private Ubuntu 24.04 CI run: https://github.com/$REPO/actions/runs/$RUN_ID
+          Verified Ubuntu 24.04 CI run: https://github.com/$REPO/actions/runs/$RUN_ID
 
           Assets:
           - \`cliproxy-linux-x86_64\`: Linux x86_64 ELF executable

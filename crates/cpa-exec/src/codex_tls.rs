@@ -30,11 +30,14 @@ pub(crate) const CHROME_IDLE_PER_HOST: usize = 2;
 /// How long an idle chatgpt.com connection is kept.
 const CHROME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+type ChromeKey = (Proxy, bool, Option<std::time::Duration>);
+
 pub(crate) struct Transport {
     standard: GoClients,
     hooks: Hooks,
-    /// Chrome clients by effective proxy and keep-alive setting, most recent first.
-    chrome: Mutex<Vec<((Proxy, bool), wreq::Client)>>,
+    /// Chrome clients by effective proxy, keep-alive setting and TLS handshake bound,
+    /// most recent first.
+    chrome: Mutex<Vec<(ChromeKey, wreq::Client)>>,
 }
 
 impl Transport {
@@ -56,10 +59,17 @@ impl Transport {
     }
 
     /// The client for one request to `url` (`fallbackRoundTripper.RoundTrip`).
-    /// `keep_alive` is `chatgpt-keep-alive` and only affects chatgpt.com.
-    pub fn for_url(&self, url: &str, proxy: &Proxy, keep_alive: bool) -> wreq::Client {
+    /// `keep_alive` is `chatgpt-keep-alive` and `handshake` the TLS handshake bound
+    /// ([`crate::tls::handshake_timeout`]); both only affect chatgpt.com.
+    pub fn for_url(
+        &self,
+        url: &str,
+        proxy: &Proxy,
+        keep_alive: bool,
+        handshake: Option<std::time::Duration>,
+    ) -> wreq::Client {
         if is_chatgpt(url) {
-            self.chrome(proxy, keep_alive)
+            self.chrome(&(proxy.clone(), keep_alive, handshake))
         } else {
             self.standard.get(proxy)
         }
@@ -70,15 +80,17 @@ impl Transport {
         self.standard.get(proxy)
     }
 
-    fn chrome(&self, proxy: &Proxy, keep_alive: bool) -> wreq::Client {
+    fn chrome(&self, key: &ChromeKey) -> wreq::Client {
+        let (proxy, keep_alive, handshake) = key;
+        let keep_alive = *keep_alive;
         let mut cache = self.chrome.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !keep_alive {
             // Keep-alive is off for this request, so it was turned off (or never on): retire
             // every pooled client. Requests in flight hold their own clone and finish; when
             // the last clone goes, its pool closes the idle sockets and its timer stops.
-            cache.retain(|((_, pooled), _)| !pooled);
+            cache.retain(|((_, pooled, _), _)| !pooled);
         }
-        if let Some(i) = cache.iter().position(|((p, k), _)| p == proxy && *k == keep_alive) {
+        if let Some(i) = cache.iter().position(|(k, _)| k == key) {
             let entry = cache.remove(i);
             let client = entry.1.clone();
             cache.insert(0, entry);
@@ -86,16 +98,21 @@ impl Transport {
         }
         // Go logs an unusable proxy dialer and dials directly.
         let client = self
-            .build_chrome(proxy, keep_alive)
-            .or_else(|_| self.build_chrome(&Proxy::Direct, keep_alive))
+            .build_chrome(proxy, keep_alive, *handshake)
+            .or_else(|_| self.build_chrome(&Proxy::Direct, keep_alive, *handshake))
             .expect("Chrome TLS client");
-        cache.insert(0, ((proxy.clone(), keep_alive), client.clone()));
+        cache.insert(0, (key.clone(), client.clone()));
         cache.truncate(CACHE_CAPACITY);
         client
     }
 
-    fn build_chrome(&self, proxy: &Proxy, keep_alive: bool) -> wreq::Result<wreq::Client> {
-        let builder = wreq::Client::builder()
+    fn build_chrome(
+        &self,
+        proxy: &Proxy,
+        keep_alive: bool,
+        handshake: Option<std::time::Duration>,
+    ) -> wreq::Result<wreq::Client> {
+        let builder = crate::tls::bound_handshake(wreq::Client::builder(), handshake)
             .redirect(wreq::redirect::Policy::none())
             .tls_options(chrome_options());
         let builder = if keep_alive {

@@ -262,6 +262,15 @@ fn legacy_matching_follows_go_identity_rules() {
     )
     .unwrap();
     assert_eq!(legacy_credential(&dir, &account_name, &account_target), None);
+    // File names compare with Go's EqualFold, which folds non-ASCII letters too.
+    let greek_target: BTreeMap<String, Value> = [("email", "δ@example.invalid"), ("account_uuid", "acct-1")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), json!(v)))
+        .collect();
+    let greek_file = dir.join("claude-Δ@example.invalid.json");
+    std::fs::write(&greek_file, r#"{"type":"claude","account_uuid":"acct-1"}"#).unwrap();
+    let greek_name = credential_file_name("δ@example.invalid", "", "acct-1");
+    assert_eq!(legacy_credential(&dir, &greek_name, &greek_target), Some(greek_file));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

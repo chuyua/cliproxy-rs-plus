@@ -111,7 +111,7 @@ async fn capture() -> Vec<u8> {
     });
     let url = format!("https://chatgpt.com:{}/backend-api/codex/responses", address.port());
     // The default (keep-alive off), as Go dials it.
-    let client = transport.for_url(&url, &Proxy::Inherit, false);
+    let client = transport.for_url(&url, &Proxy::Inherit, false, None);
     assert!(client.post(&url).send().await.is_err(), "the listener never answers");
     capture.await.unwrap()
 }
@@ -368,7 +368,12 @@ async fn get_ok(transport: &Transport, url: &str, proxy: &Proxy) {
 }
 
 async fn get_ok_with(transport: &Transport, url: &str, proxy: &Proxy, keep_alive: bool) {
-    let response = transport.for_url(url, proxy, keep_alive).get(url).send().await.unwrap();
+    let response = transport
+        .for_url(url, proxy, keep_alive, None)
+        .get(url)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap(), "ok");
 }
@@ -404,7 +409,7 @@ async fn chatgpt_keep_alive_switch_applies_per_request() {
     let ((a, a_tunnels), (b, b_tunnels)) = (counting_proxy(up.addr).await, counting_proxy(up.addr).await);
     let pooled = || {
         let cache = transport.chrome.lock().unwrap();
-        cache.iter().filter(|((_, keep_alive), _)| *keep_alive).count()
+        cache.iter().filter(|((_, keep_alive, _), _)| *keep_alive).count()
     };
     for proxy in [&a, &b, &a, &b] {
         get_ok_with(&transport, &url, proxy, true).await;

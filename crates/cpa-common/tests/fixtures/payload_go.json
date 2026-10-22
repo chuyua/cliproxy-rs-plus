@@ -312,7 +312,7 @@
         ]
       ],
       "tracked": null,
-      "out": "{\"tools\":[{\"type\":\"function\",\"name\":\"exec_command\",\"parameters\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\"},\"cmd\":{\"type\":\"string\"},\"yield_time_ms\":{\"type\":[\"integer\",\"null\"]}}}},{\"type\":\"function\",\"name\":\"other\",\"parameters\":{\"properties\":{\"timeout_ms\":{\"type\":\"number\"}}}},{\"type\":\"namespace\",\"tools\":[{\"name\":\"collab__wait_agent\",\"input_schema\":{\"properties\":{\"timeout_ms\":{\"type\":\"integer\"}}}}]}],\"input\":[{\"type\":\"additional_tools\",\"tools\":[{\"function\":{\"name\":\"functions__sleep\",\"parameters\":{\"properties\":{\"duration_ms\":{\"type\":\"integer\"}}}}}]}]}",
+      "out": "{\"tools\":[{\"type\":\"function\",\"name\":\"exec_command\",\"parameters\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\"},\"cmd\":{\"type\":\"string\"},\"yield_time_ms\":{\"type\":[\"integer\",\"null\"]}}}},{\"type\":\"function\",\"name\":\"other\",\"parameters\":{\"properties\":{\"timeout_ms\":{\"type\":\"number\"}}}},{\"type\":\"namespace\",\"tools\":[{\"name\":\"collab__wait_agent\",\"input_schema\":{\"properties\":{\"timeout_ms\":{\"type\":\"number\"}}}}]}],\"input\":[{\"type\":\"additional_tools\",\"tools\":[{\"function\":{\"name\":\"functions__sleep\",\"parameters\":{\"properties\":{\"duration_ms\":{\"type\":\"integer\"}}}}}]}]}",
       "touched": []
     },
     {

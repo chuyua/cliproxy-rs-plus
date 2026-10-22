@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use cpa_common::json::{self as gj, Kind, Res};
 
 use crate::common::{
-    format_rfc3339_utc, go_lower, normalize_claude_tool_input_schema, now_nanos, now_unix,
-    sanitize_claude_function_name, sanitize_claude_tool_id, sse_event, trim_space,
+    UserRun, format_rfc3339_utc, go_lower, interactions_attachment_type, is_http_url, is_interactions_instruction_step,
+    normalize_claude_tool_input_schema, now_nanos, now_unix, sanitize_claude_function_name, sanitize_claude_tool_id,
+    sse_event, trim_space,
 };
 use crate::gemini_interactions::first_existing;
 use crate::stream::GoStream;
@@ -16,7 +17,7 @@ use crate::{Error, Registered, ResponseCtx};
 
 pub static PAIR: Registered = registered!(
     Interactions -> Claude,
-    request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream)),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: None,
@@ -119,8 +120,9 @@ fn content_parts(content: &Res<'_>) -> Vec<Vec<u8>> {
     parts
 }
 
-/// ConvertInteractionsRequestToClaude.
-fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
+/// ConvertInteractionsRequestToClaude. A user turn left empty because its only media
+/// part has no Claude equivalent is refused.
+fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
     let root = gj::parse(raw);
     let mut out = br#"{"model":"","max_tokens":32000,"messages":[]}"#.to_vec();
     gj::set_str(&mut out, "model", model);
@@ -133,22 +135,25 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
     }
     copy_generation_config(&mut out, &root);
     let mut messages = Accumulator::default();
+    let mut run = UserRun::default();
     let input = root.get("input");
     if input.kind == Kind::String {
         let mut step = br#"{"type":"user_input","content":[{"type":"text","text":""}]}"#.to_vec();
         gj::set_str(&mut step, "content.0.text", input.bytes());
-        step_to_message(&mut messages, &gj::parse(&step), "user");
+        step_to_message(&mut messages, &gj::parse(&step), "user", false, &mut run);
     } else if input.is_object() {
-        input_item(&mut messages, &input);
+        input_item(&mut messages, &input, &mut run);
     } else {
         input.each(|_, step| {
-            input_item(&mut messages, &step);
+            input_item(&mut messages, &step, &mut run);
             true
         });
     }
+    run.end();
     gj::set_items(&mut out, "messages", &messages.into_messages());
     copy_tools(&mut out, &root);
-    out
+    run.result()?;
+    Ok(out)
 }
 
 fn copy_raw(out: &mut Vec<u8>, root: &Res<'_>, from: &str, to: &str) {
@@ -258,15 +263,16 @@ fn copy_tool_choice(out: &mut Vec<u8>, choice: &Res<'_>) {
 }
 
 /// appendInteractionsInputItemToClaude.
-fn input_item(messages: &mut Accumulator, step: &Res<'_>) {
+fn input_item(messages: &mut Accumulator, step: &Res<'_>, run: &mut UserRun) {
     let steps = step.get("steps");
     if steps.is_array() {
         let role = match step.get("role").bytes().as_ref() {
             b"model" | b"assistant" => "assistant",
             _ => "user",
         };
+        let instruction = is_interactions_instruction_step(step, false);
         steps.each(|_, nested| {
-            step_to_message(messages, &nested, role);
+            step_to_message(messages, &nested, role, instruction, run);
             true
         });
         return;
@@ -278,7 +284,8 @@ fn input_item(messages: &mut Accumulator, step: &Res<'_>) {
             gj::set_str(&mut wrapped, "type", "model_output");
         }
         gj::set_raw(&mut wrapped, "content", &parts.raw);
-        step_to_message(messages, &gj::parse(&wrapped), "user");
+        let instruction = is_interactions_instruction_step(step, false);
+        step_to_message(messages, &gj::parse(&wrapped), "user", instruction, run);
         return;
     }
     match step.get("type").bytes().as_ref() {
@@ -296,6 +303,7 @@ fn input_item(messages: &mut Accumulator, step: &Res<'_>) {
             }
             let mut message = br#"{"role":"assistant","content":[]}"#.to_vec();
             gj::set_raw(&mut message, "content", gj::join(&[tool_use]));
+            run.end();
             messages.append(&message);
         }
         b"function_result" => {
@@ -308,7 +316,7 @@ fn input_item(messages: &mut Accumulator, step: &Res<'_>) {
             if value.is_array() {
                 let mut items = vec![];
                 value.each(|_, part| {
-                    items.extend(content_to_claude(&part, "user"));
+                    items.extend(content_to_claude(&part, "tool_result"));
                     true
                 });
                 gj::set_raw(&mut result, "content", gj::join(&items));
@@ -319,40 +327,73 @@ fn input_item(messages: &mut Accumulator, step: &Res<'_>) {
             }
             let mut message = br#"{"role":"user","content":[]}"#.to_vec();
             gj::set_raw(&mut message, "content", gj::join(&[result]));
+            // A tool result is content the model reads, so it keeps the user turn.
+            run.add();
             messages.append(&message);
         }
-        b"model_output" | b"thought" => step_to_message(messages, step, "assistant"),
-        _ => step_to_message(messages, step, "user"),
+        b"model_output" | b"thought" => step_to_message(messages, step, "assistant", false, run),
+        _ => step_to_message(messages, step, "user", false, run),
     }
 }
 
-/// appendInteractionsStepToClaude.
-fn step_to_message(messages: &mut Accumulator, step: &Res<'_>, default_role: &str) {
+/// appendInteractionsStepToClaude. `instruction` says the step sits in a developer or
+/// system wrapper: that content is sent as user content but is not the user's own
+/// turn, so it closes the open user turn and never keeps an emptied one alive.
+fn step_to_message(
+    messages: &mut Accumulator,
+    step: &Res<'_>,
+    default_role: &str,
+    instruction: bool,
+    run: &mut UserRun,
+) {
     let role = match step.get("role").bytes().as_ref() {
         b"user" => "user",
         b"assistant" => "assistant",
         _ => default_role,
+    };
+    let user_content = role == "user" && !is_interactions_instruction_step(step, instruction);
+    let mut items = vec![];
+    let mut append = |part: &Res<'_>| {
+        let Some(converted) = content_to_claude(part, role) else {
+            let dropped = dropped_part(part);
+            if user_content && !dropped.is_empty() {
+                run.drop_part(&dropped);
+            }
+            return;
+        };
+        let block = gj::parse(&converted);
+        if user_content
+            && (&*block.get("type").bytes() != b"text" || !trim_space(&block.get("text").bytes()).is_empty())
+        {
+            run.add();
+        }
+        items.push(converted);
     };
     let text_part = |text: &[u8]| {
         let mut part = br#"{"type":"text","text":""}"#.to_vec();
         gj::set_str(&mut part, "text", text);
         part
     };
-    let mut items = vec![];
     let content = step.get("content");
     let text = step.get("text");
     if content.kind == Kind::String {
-        items.push(text_part(&content.bytes()));
+        append(&gj::parse(&text_part(&content.bytes())));
     } else if content.is_array() {
         content.each(|_, part| {
-            items.extend(content_to_claude(&part, role));
+            append(&part);
             true
         });
     } else if text.exists() {
-        items.push(text_part(&text.bytes()));
+        append(&gj::parse(&text_part(&text.bytes())));
+    } else if dropped_media(step).is_some() {
+        // A bare media content object stands for a step of its own.
+        append(step);
     }
     if items.is_empty() {
         return;
+    }
+    if !user_content {
+        run.end();
     }
     let mut message = br#"{"role":"","content":[]}"#.to_vec();
     gj::set_str(&mut message, "role", role);
@@ -388,12 +429,37 @@ fn content_to_claude(part: &Res<'_>, role: &str) -> Option<Vec<u8>> {
             if !text.is_empty() {
                 return Some(text_part(&text));
             }
-            if !part.get("data").bytes().is_empty() || !part.get("file_data").bytes().is_empty() {
+            // A user attachment Claude cannot carry is never replaced by placeholder
+            // text; assistant and tool result content only echoes earlier output.
+            if role != "user" && (!part.get("data").bytes().is_empty() || !part.get("file_data").bytes().is_empty()) {
                 return Some(text_part(&[&b"["[..], &kind, b" content omitted]"].concat()));
             }
             None
         }
     }
+}
+
+/// interactionsClaudeDroppedMedia: the media type of a part, if it is media.
+fn dropped_media(part: &Res<'_>) -> Option<&'static str> {
+    match part.get("type").bytes().as_ref() {
+        b"image" => Some("image"),
+        b"audio" => Some("audio"),
+        b"video" => Some("video"),
+        b"document" | b"file" => Some("document"),
+        _ => None,
+    }
+}
+
+/// interactionsClaudeDroppedPart: the reported type of a user part that did not
+/// convert, or empty when it holds nothing to report.
+fn dropped_part(part: &Res<'_>) -> String {
+    if let Some(media) = dropped_media(part) {
+        return media.into();
+    }
+    if !part.get("data").bytes().is_empty() || !part.get("file_data").bytes().is_empty() {
+        return interactions_attachment_type(part);
+    }
+    String::new()
 }
 
 /// interactionsClaudeMediaPart.
@@ -412,14 +478,25 @@ fn media_part(part: &Res<'_>, kind: &str) -> Option<Vec<u8>> {
             data = string(&source.get("data"));
         }
     }
-    if mime.is_empty() || data.is_empty() {
-        return None;
+    if !mime.is_empty() && !data.is_empty() {
+        let mut out = br#"{"type":"","source":{"type":"base64","media_type":"","data":""}}"#.to_vec();
+        gj::set_str(&mut out, "type", kind);
+        gj::set_str(&mut out, "source.media_type", &mime);
+        gj::set_str(&mut out, "source.data", &data);
+        return Some(out);
     }
-    let mut out = br#"{"type":"","source":{"type":"base64","media_type":"","data":""}}"#.to_vec();
-    gj::set_str(&mut out, "type", kind);
-    gj::set_str(&mut out, "source.media_type", &mime);
-    gj::set_str(&mut out, "source.data", &data);
-    Some(out)
+    // An http(s) uri becomes a url source.
+    for path in ["uri", "file_uri", "fileUri", "url"] {
+        let uri = part.get(path).bytes();
+        let uri = trim_space(&uri);
+        if is_http_url(uri) {
+            let mut out = br#"{"type":"","source":{"type":"url","url":""}}"#.to_vec();
+            gj::set_str(&mut out, "type", kind);
+            gj::set_str(&mut out, "source.url", uri);
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// copyInteractionsToolsToClaude.

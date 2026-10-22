@@ -6,6 +6,7 @@
 //! A replacement lifetime comes from [`Client::new_lifetime`], which keeps the cluster
 //! failover state and the membership identity.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -231,7 +232,7 @@ pub fn set_args(key: &str, value: &[u8], opts: SetOptions) -> Result<Vec<Vec<u8>
 pub fn lower_map<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> BTreeMap<String, String> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, value) in pairs {
-        let name = name.trim().to_lowercase();
+        let name = name.trim().go_lower();
         if name.is_empty() {
             continue;
         }
@@ -1215,7 +1216,7 @@ const PLUGIN_SYNC_UNSUPPORTED: &str = "plugin_sync_unsupported";
 
 /// Go `pluginSyncUnsupportedMessage`.
 fn plugin_sync_unsupported_message(message: &str) -> Option<String> {
-    let lowered = message.trim().to_lowercase();
+    let lowered = message.trim().go_lower();
     let lowered = lowered.strip_prefix("err ").unwrap_or(&lowered).trim().to_owned();
     matches!(
         lowered.as_str(),

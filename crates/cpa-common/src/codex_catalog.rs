@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use cpa_core::registry::ThinkingSupport;
 
+use crate::gostr::GoStr;
 use crate::json::GoValue;
 
 type Map = BTreeMap<String, GoValue>;
@@ -96,12 +97,6 @@ pub fn validate(data: &[u8]) -> Result<(), String> {
             return Err(format!("Codex client model catalog contains duplicate slug {slug:?}"));
         }
         validate_model(model).map_err(|e| format!("Codex client model catalog model {slug:?}: {e}"))?;
-    }
-    if !seen.contains("gpt-5.5") {
-        return Err(format!(
-            "Codex client model catalog is missing default template {:?}",
-            "gpt-5.5"
-        ));
     }
     Ok(())
 }
@@ -202,23 +197,24 @@ fn templates() -> Option<Arc<Templates>> {
         return templates.clone();
     }
     let parsed = GoValue::parse_f64(&raw).and_then(|root| {
-        let GoValue::Object(mut root) = root else {
-            return None;
-        };
-        let GoValue::Array(models) = root.remove("models")? else {
-            return None;
-        };
+        let mut root = root.into_object().ok()?;
+        let models = root.remove("models")?.into_array().ok()?;
         let mut by_slug = HashMap::new();
+        let mut default = None;
         for model in models {
-            let GoValue::Object(model) = model else {
+            let Ok(model) = model.into_object() else {
                 continue;
             };
             let slug = string(&model, "slug");
             if !slug.is_empty() {
+                // `gpt-5.5`, else the catalog's first model.
+                if default.is_none() || slug == "gpt-5.5" {
+                    default = Some(model.clone());
+                }
                 by_slug.insert(slug, model);
             }
         }
-        let default = by_slug.get("gpt-5.5")?.clone();
+        let default = default?;
         Some(Arc::new(Templates { by_slug, default }))
     });
     *cache = Some((revision, parsed.clone()));
@@ -443,7 +439,7 @@ fn apply_capabilities(
         return;
     }
     let providers = providers(id, registry);
-    let alias = !metadata_id.is_empty() && !id.eq_ignore_ascii_case(metadata_id);
+    let alias = !metadata_id.is_empty() && !id.go_eq_fold(metadata_id);
     let provider_info = |provider: &str| {
         registry
             .lookup(id, Some(provider))
@@ -515,7 +511,7 @@ fn intersect(a: &[String], b: &[String]) -> Vec<String> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    let key = |s: &String| s.trim().to_lowercase();
+    let key = |s: &String| s.trim().go_lower();
     let b: HashSet<String> = b.iter().map(key).collect();
     let mut seen = HashSet::new();
     a.iter()
@@ -564,11 +560,15 @@ fn apply_provider_capabilities(entry: &mut Map, id: &str, template: bool, regist
     apply_search_tool(entry, id, true, registry);
 }
 
-/// `nullCodexClientRequiredOptions`: keys Codex requires, cleared for non-Codex models.
+/// `nullCodexClientRequiredOptions`: keys Codex requires, cleared for non-Codex models,
+/// which also get direct tool calls without Responses lite or effort updates.
 fn null_required_options(entry: &mut Map) {
     for key in ["apply_patch_tool_type", "upgrade", "availability_nux"] {
         entry.insert(key.into(), GoValue::Null);
     }
+    entry.insert("tool_mode".into(), GoValue::String("direct".into()));
+    entry.insert("use_responses_lite".into(), GoValue::Bool(false));
+    entry.insert("supports_reasoning_effort_updates".into(), GoValue::Bool(false));
 }
 
 /// `useCompactCodexClientInstructions`.
@@ -689,7 +689,7 @@ fn thinking_support(model: &Map) -> Option<ThinkingSupport> {
     }
 }
 
-/// `codexClientImageOrVideoModel` IDs, always hidden.
+/// `isCodexClientImageOrVideoModel` IDs (image, video and speech models), always hidden.
 fn image_or_video(id: &str) -> bool {
     let target = base_of(id).unwrap_or(id.trim());
     matches!(
@@ -705,6 +705,8 @@ fn image_or_video(id: &str) -> bool {
             | "grok-imagine-video"
             | "grok-imagine-video-1.5"
             | "grok-imagine-video-1.5-preview"
+            | "grok-tts"
+            | "grok-voice-tts-1.0"
     )
 }
 
@@ -719,7 +721,7 @@ fn filter_modalities(modalities: &[String]) -> Vec<GoValue> {
     let mut seen = HashSet::new();
     modalities
         .iter()
-        .map(|m| m.trim().to_lowercase())
+        .map(|m| m.trim().go_lower())
         .filter(|m| (m == "text" || m == "image") && seen.insert(m.clone()))
         .map(GoValue::String)
         .collect()
@@ -811,7 +813,7 @@ fn sanitize_reasoning(entry: &mut Map, version: &str) {
 }
 
 fn normalize_level(raw: &str, version: &str) -> String {
-    let level = raw.trim().to_lowercase();
+    let level = raw.trim().go_lower();
     let allowed: &[&str] = if extended_levels(version) {
         &LEVELS
     } else {
@@ -878,7 +880,7 @@ fn apply_devin_display_name(entry: &mut Map, id: &str, model: &Map, registry: &d
     if trimmed.ends_with(" (Devin)") {
         return;
     }
-    let lower = trimmed.to_lowercase();
+    let lower = trimmed.go_lower();
     let renamed = if lower.ends_with(" (devin)") {
         format!("{} (Devin)", &trimmed[..trimmed.len() - " (devin)".len()])
     } else if lower.ends_with("(devin)") {
@@ -892,7 +894,7 @@ fn apply_devin_display_name(entry: &mut Map, id: &str, model: &Map, registry: &d
 /// `isCodexClientDevinModel`.
 fn is_devin(id: &str, model: &Map, entry: &Map, registry: &dyn Registry) -> bool {
     let devin_path = |s: &str| {
-        let s = s.trim().to_lowercase();
+        let s = s.trim().go_lower();
         s.starts_with("devin/") || s.find('/').is_some_and(|i| s[i + 1..].starts_with("devin/"))
     };
     let marked = |m: &Map| {
@@ -904,7 +906,7 @@ fn is_devin(id: &str, model: &Map, entry: &Map, registry: &dyn Registry) -> bool
     let devin_info = |info: &ModelFacts| {
         info.kind.eq_ignore_ascii_case("devin")
             || info.owned_by.eq_ignore_ascii_case("cognition")
-            || info.id.to_lowercase().starts_with("devin/")
+            || info.id.go_lower().starts_with("devin/")
     };
     match registry.lookup(id, None) {
         Some(info) => {
@@ -926,13 +928,11 @@ fn is_devin(id: &str, model: &Map, entry: &Map, registry: &dyn Registry) -> bool
 }
 
 /// `applyCodexClientApplyPatchCapability`: `freeform` only for text models every route
-/// supports.
+/// supports, or without `enable-apply-patch`, for templates that declare it.
 fn apply_patch_capability(entry: &mut Map, id: &str, capability: Option<&dyn Fn(&str) -> bool>) {
+    let template_supported = matches!(entry.get("apply_patch_tool_type"), Some(GoValue::String(s)) if s == "freeform");
     entry.insert("apply_patch_tool_type".into(), GoValue::Null);
-    let Some(capability) = capability else {
-        return;
-    };
-    let lower = id.trim().to_lowercase();
+    let lower = id.trim().go_lower();
     let base = lower.rfind('/').map_or(lower.as_str(), |i| lower[i + 1..].trim());
     if image_or_video(base) {
         return;
@@ -948,6 +948,12 @@ fn apply_patch_capability(entry: &mut Map, id: &str, capability: Option<&dyn Fn(
     if !text && (declared || hidden) {
         return;
     }
+    let Some(capability) = capability else {
+        if template_supported {
+            entry.insert("apply_patch_tool_type".into(), GoValue::String("freeform".into()));
+        }
+        return;
+    };
     if capability(id.trim()) {
         entry.insert("apply_patch_tool_type".into(), GoValue::String("freeform".into()));
     }
@@ -975,7 +981,7 @@ fn apply_non_template_priorities(result: &mut [Map], templates: &Templates, regi
             Some((index, display, slug))
         })
         .collect();
-    pending.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.2.cmp(&b.2)));
+    pending.sort_by(|a, b| a.1.go_lower().cmp(&b.1.go_lower()).then_with(|| a.2.cmp(&b.2)));
     for (rank, (index, _, _)) in pending.into_iter().enumerate() {
         result[index].insert("priority".into(), number(base + 100 * (rank as i64 + 1)));
     }

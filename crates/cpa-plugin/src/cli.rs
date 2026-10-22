@@ -5,6 +5,7 @@
 //! [`Host::set_command_line_flag`]. When any plugin flag was given,
 //! [`Host::execute_command_line`] runs the owning plugins instead of the server.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -49,7 +50,7 @@ pub fn valid_flag_name(name: &str) -> bool {
 
 /// Go `normalizeCommandLineFlagType`.
 pub fn normalize_flag_type(kind: &str) -> Option<&'static str> {
-    Some(match kind.trim().to_lowercase().as_str() {
+    Some(match kind.trim().go_lower().as_str() {
         "" | "bool" => "bool",
         "string" => "string",
         "int" => "int",

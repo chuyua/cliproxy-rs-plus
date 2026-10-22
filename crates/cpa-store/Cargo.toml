@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+cpa-core.workspace = true
 cpa-server.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -27,4 +28,5 @@ tokio-postgres = { version = "0.7.18", default-features = false, features = ["ru
 
 [dev-dependencies]
 axum.workspace = true
+bcrypt = "0.19"
 tokio = { workspace = true, features = ["test-util"] }

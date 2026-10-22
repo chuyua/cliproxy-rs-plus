@@ -2,7 +2,7 @@
 //! (internal/client/codex/optimize-multi-agent-v2: optimize_multi_agent_v2.go and
 //! orphan_delegation.go, and normalizeCodexInstructions).
 //!
-//! - Orphan delegation: with `oauth.providers.codex.orphan-delegation-compatibility` and
+//! - Orphan delegation: with `upstream.codex.orphan-delegation-compatibility` and
 //!   `X-Openai-Subagent: collab_spawn`, `codex_app` delegation outputs without a matching
 //!   call become user messages.
 //! - Multi-agent v2 (`client.codex.optimize-multi-agent-v2`, official Codex clients only):
@@ -13,6 +13,7 @@
 //!
 //! Edits go through [`crate::json`], so untouched bytes stay as the client sent them.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{HashMap, HashSet};
 
 use cpa_core::config::Config;
@@ -37,8 +38,8 @@ pub const CLIENT_MODELS_JSON: &str = include_str!("codex_client_models.json");
 pub struct Settings {
     /// `client.codex.optimize-multi-agent-v2`.
     pub optimize_multi_agent_v2: bool,
-    /// `oauth.providers.codex.orphan-delegation-compatibility` (Go `cfg.Codex`). API-key
-    /// credentials read it from `Config::for_api_key`.
+    /// `upstream.codex.orphan-delegation-compatibility` (Go `cfg.Codex`), shared by every
+    /// credential kind.
     pub orphan_delegation: bool,
 }
 
@@ -52,22 +53,10 @@ impl Settings {
         };
         Self {
             optimize_multi_agent_v2: flag(&["client", "codex", "optimize-multi-agent-v2"]),
-            orphan_delegation: flag(&["oauth", "providers", "codex", ORPHAN_PATH]),
+            orphan_delegation: flag(&["upstream", "codex", "orphan-delegation-compatibility"]),
         }
-    }
-
-    /// The Responses API boundary's view (Go's handler `Cfg`): orphan delegation written in
-    /// v8 form under `oauth.providers.codex` is OAuth-only and does not apply there.
-    pub fn for_responses_handler(cfg: &Config) -> Self {
-        let mut settings = Self::from_config(cfg);
-        if cfg.oauth_only.contains(&format!("oauth.providers.codex.{ORPHAN_PATH}")) {
-            settings.orphan_delegation = false;
-        }
-        settings
     }
 }
-
-const ORPHAN_PATH: &str = "orphan-delegation-compatibility";
 
 /// Go's Responses handlers (`prepareCodexMultiAgentV2Tools`, then
 /// `prepareCodexOrphanDelegation`) on a request body before dispatch.
@@ -453,7 +442,8 @@ fn restore_value(value: &mut crate::json::GoValue) -> bool {
                 map.insert("namespace".into(), GoValue::String(NAMESPACE.into()));
                 changed = true;
             }
-            if let Some(GoValue::String(name)) = map.get("name").cloned() {
+            if let Some(GoValue::String(name)) = map.get("name") {
+                let name = name.clone();
                 if name == OPTIMIZED_NAMESPACE && item_type == "namespace" {
                     map.insert("name".into(), GoValue::String(NAMESPACE.into()));
                     changed = true;
@@ -525,7 +515,7 @@ fn catalog_int(model: &Res<'_>, key: &str) -> i64 {
 }
 
 fn normalize_effort(effort: &str) -> String {
-    let effort = effort.trim().to_lowercase();
+    let effort = effort.trim().go_lower();
     match effort.as_str() {
         "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => effort,
         _ => String::new(),
@@ -581,12 +571,13 @@ fn from_template(id: &str, template: &Res<'_>) -> SpawnModel {
 }
 
 /// `codexSpawnAgentModelsFromTemplates` over the current catalog: catalog models by
-/// priority, then other served models by display name with the `gpt-5.5` template's
+/// priority, then other served models by display name with the default template's
 /// reasoning efforts (or the registry's thinking levels) and no service tiers.
 fn spawn_models(available: &[AvailableModel], lookup: &dyn Fn(&str) -> Option<ModelFacts>) -> Vec<SpawnModel> {
     let (raw, _) = crate::codex_catalog::snapshot();
     let catalog = gj::get(raw.as_slice(), "models");
     let mut templates: HashMap<String, Res<'_>> = HashMap::new();
+    let mut default_template = None;
     if catalog.is_array() {
         for model in catalog.array() {
             if !model.is_object() {
@@ -594,11 +585,15 @@ fn spawn_models(available: &[AvailableModel], lookup: &dyn Fn(&str) -> Option<Mo
             }
             let slug = catalog_string(&model, "slug");
             if !slug.is_empty() {
+                // `gpt-5.5`, else the catalog's first model (e240bd84).
+                if default_template.is_none() || slug == "gpt-5.5" {
+                    default_template = Some(model.clone());
+                }
                 templates.insert(slug, model);
             }
         }
     }
-    let Some(default_template) = templates.get("gpt-5.5") else {
+    let Some(default_template) = default_template.as_ref() else {
         return Vec::new();
     };
     let mut seen = HashSet::new();
@@ -633,8 +628,8 @@ fn spawn_models(available: &[AvailableModel], lookup: &dyn Fn(&str) -> Option<Mo
     from_catalog.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
     synthesized.sort_by(|a, b| {
         a.display_name
-            .to_lowercase()
-            .cmp(&b.display_name.to_lowercase())
+            .go_lower()
+            .cmp(&b.display_name.go_lower())
             .then_with(|| a.id.cmp(&b.id))
     });
     from_catalog.extend(synthesized);

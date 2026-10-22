@@ -583,46 +583,60 @@ pub(crate) type GoMap = BTreeMap<String, GoValue>;
 /// error). `None` when Go leaves the map nil: invalid JSON or a non-object.
 pub(crate) fn go_map_from_json(raw: &[u8]) -> Option<(GoMap, bool)> {
     check_valid(raw).ok()?;
-    match GoValue::parse(raw)? {
-        GoValue::Object(map) => {
+    match GoValue::parse(raw)?.into_object() {
+        Ok(map) => {
             // Go keeps decoding after an overflow and keeps the error even when a later
             // duplicate key overwrites the value, so every number in the document counts.
-            let mut clean = all_numbers_finite(&gj::parse(raw));
-            let map = map.into_iter().map(|(k, v)| (k, as_float64(v, &mut clean))).collect();
-            Some((map, clean))
+            let mut clean = all_numbers_finite(raw);
+            let mut value = GoValue::Object(map);
+            value.visit_mut(|v| {
+                if let GoValue::Number(literal) = v {
+                    *v = match go_float(literal) {
+                        Some(number) => GoValue::Number(number),
+                        None => {
+                            clean = false;
+                            GoValue::Null
+                        }
+                    };
+                }
+            });
+            Some((value.into_object().ok()?, clean))
         }
         _ => None,
     }
 }
 
-fn all_numbers_finite(value: &gj::Res<'_>) -> bool {
-    match value.kind {
-        gj::Kind::Number => go_float(&String::from_utf8_lossy(&value.raw)).is_some(),
-        gj::Kind::Json => {
-            let mut ok = true;
-            value.each(|_, item| {
-                ok = all_numbers_finite(&item);
-                ok
-            });
-            ok
-        }
-        _ => true,
-    }
-}
-
-fn as_float64(value: GoValue, clean: &mut bool) -> GoValue {
-    match value {
-        GoValue::Number(literal) => match go_float(&literal) {
-            Some(number) => GoValue::Number(number),
-            None => {
-                *clean = false;
-                GoValue::Null
+/// Whether every number literal in valid JSON `raw` fits a float64, in one scan: outside
+/// strings, a number is the only token that starts with `-` or a digit.
+fn all_numbers_finite(raw: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&c) = raw.get(i) {
+        match c {
+            b'"' => {
+                i += 1;
+                while let Some(&c) = raw.get(i) {
+                    i += if c == b'\\' { 2 } else { 1 };
+                    if c == b'"' {
+                        break;
+                    }
+                }
             }
-        },
-        GoValue::Array(items) => GoValue::Array(items.into_iter().map(|v| as_float64(v, clean)).collect()),
-        GoValue::Object(map) => GoValue::Object(map.into_iter().map(|(k, v)| (k, as_float64(v, clean))).collect()),
-        other => other,
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while raw
+                    .get(i)
+                    .is_some_and(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+                {
+                    i += 1;
+                }
+                if go_float(&String::from_utf8_lossy(&raw[start..i])).is_none() {
+                    return false;
+                }
+            }
+            _ => i += 1,
+        }
     }
+    true
 }
 
 /// Go's encoding of a float64 decoded from `literal`, or `None` when the literal
@@ -916,6 +930,31 @@ pub(crate) async fn login_with(auth: MetaAuth, auth_dir: &Path, no_browser: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An existing credential at encoding/json's depth limit converts its numbers to
+    /// float64 on a 2 MiB stack; an overflowing literal anywhere marks it unclean.
+    #[test]
+    fn go_map_from_json_handles_the_depth_limit() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let deep = |leaf: &str| format!(r#"{{"a":{}{leaf}{}}}"#, r#"[{"d":"#.repeat(4_999), "}]".repeat(4_999));
+                let (map, clean) = go_map_from_json(deep("1.50").as_bytes()).unwrap();
+                assert!(clean);
+                assert_eq!(GoValue::Object(map).marshal(), deep("1.5").into_bytes());
+                let (map, clean) = go_map_from_json(deep(r#"["x\"1e400",1e400]"#).as_bytes()).unwrap();
+                assert!(!clean);
+                assert_eq!(
+                    GoValue::Object(map).marshal(),
+                    deep(r#"["x\"1e400",null]"#).into_bytes()
+                );
+                let (_, clean) = go_map_from_json(deep(r#""-1e400""#).as_bytes()).unwrap();
+                assert!(clean, "a number inside a string does not count");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn go_float_matches_strconv() {

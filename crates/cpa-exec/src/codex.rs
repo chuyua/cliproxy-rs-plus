@@ -25,7 +25,7 @@ use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
-pub use crate::codex_ws::{ClientFrames, SteeringInput};
+pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput};
 
 pub struct CodexExecutor {
     /// Chrome profile for chatgpt.com, Go's standard transport elsewhere, per proxy.
@@ -33,7 +33,7 @@ pub struct CodexExecutor {
     oauth: CodexOAuth,
     quota: Arc<QuotaSignals>,
     /// Upstream Responses WebSocket sockets per downstream session.
-    pub(crate) ws: crate::codex_ws::Pool,
+    pub(crate) ws: Arc<crate::codex_ws::Pool>,
     /// Claude clients' reasoning replay (process-wide in Go).
     pub(crate) replay: Arc<crate::codex_replay::Cache>,
     /// Base for OAuth Alpha Search, which Go never derives from credential attributes.
@@ -106,10 +106,11 @@ impl CodexExecutor {
         session: &ExecSession,
     ) -> Result<ExecResponse, ExecError> {
         check_response_format(&req)?;
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         if view.websockets() {
-            return self.stream_ws(&view, &settings, req, session).await;
+            return self.stream_ws(&view, &settings, req, session, cfg).await;
         }
         if session.continuation {
             return Err(ExecError::replay_required());
@@ -123,21 +124,10 @@ impl CodexExecutor {
         View::new(credential).websockets()
     }
 
-    /// `codex.response-steering` as the Responses WebSocket handler reads it (Go
-    /// `SDKConfig.CodexResponseSteering`): the configured value, OAuth-only scope ignored.
+    /// `upstream.codex.response-steering` as the Responses WebSocket handler reads it
+    /// (Go `SDKConfig.CodexResponseSteering`), shared by every credential kind.
     pub fn response_steering_configured(cfg: &Config) -> bool {
         request::response_steering(cfg)
-    }
-
-    /// Whether WebSocket turns on `credential` run full duplex: the executor's view of
-    /// `response-steering`, where API keys see Go's `ForAPIKey` (the v8 OAuth-only form
-    /// does not apply to them).
-    pub fn response_steering(credential: &Credential, cfg: &Config) -> bool {
-        if View::new(credential).api_key {
-            request::response_steering(&cfg.for_api_key())
-        } else {
-            request::response_steering(cfg)
-        }
     }
 
     /// Binds a downstream connection's later client frames to its session (Go
@@ -145,6 +135,17 @@ impl CodexExecutor {
     /// reads them after its first `response.created`; [`Self::close_session`] releases them.
     pub fn attach_steering(&self, session: &str, input: SteeringInput) {
         self.ws.attach_steering(session, input);
+    }
+
+    /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the
+    /// session's upstream socket while a turn reads on it (see `codex_ws::Pool::interrupt`).
+    pub async fn interrupt_session(
+        &self,
+        session: &str,
+        payload: &[u8],
+        enabled: impl FnOnce(&str) -> bool,
+    ) -> Result<(), InterruptError> {
+        self.ws.interrupt(session, payload, enabled).await
     }
 
     /// The error that lost the session's upstream socket, once it is lost (what Go's
@@ -163,30 +164,35 @@ impl CodexExecutor {
         self.ws.close(id);
     }
 
-    /// Refresh due under Go's 24h Codex lead. Cheap and side-effect free.
+    /// Refresh due: the outer tokens under Go's 96h Codex lead, or the Sign in with
+    /// ChatGPT partition under its 5-minute lead (Go `shouldRefresh`). Cheap and side-effect free.
     pub fn needs_prepare(&self, credential: &Credential, cfg: &Config) -> bool {
         self.needs_prepare_at(credential, cfg, Utc::now())
     }
 
     pub fn needs_prepare_at(&self, credential: &Credential, _cfg: &Config, now: chrono::DateTime<Utc>) -> bool {
-        codex_oauth::refresh_due(credential, now)
+        codex_oauth::refresh_due(credential, now) || crate::codex_siwc::refresh_due(credential, now) == Some(true)
     }
 
-    /// Refreshes tokens. Go refreshes Codex only in the background and never blocks a
-    /// request on it, so a failed refresh while the access token is still valid keeps the
-    /// credential usable; the failure is cached for five minutes by the OAuth service.
+    /// Refreshes the due partitions. Go refreshes Codex only in the background and never
+    /// blocks a request on it, so a failed refresh while the token requests use is still
+    /// valid keeps the credential usable; the failure is cached for five minutes by the
+    /// OAuth service.
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
         let now = Utc::now();
-        if !codex_oauth::refresh_due(credential, now) {
+        let outer = codex_oauth::refresh_due(credential, now);
+        let siwc = crate::codex_siwc::refresh_due(credential, now) == Some(true);
+        if !outer && !siwc {
             return Ok(MetadataPatch::default());
         }
-        // `NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)`: the credential's proxy, then the
-        // global one, on Go's standard transport.
-        let proxy = crate::proxy::Proxy::effective(credential, cfg);
-        let oauth = self.oauth.with_client(self.transport.standard(&proxy));
-        match oauth.refresh_patch(codex_oauth::refresh_token(credential)).await {
+        let usable = if crate::codex_siwc::enabled(credential) {
+            crate::codex_siwc::access_usable(credential, now)
+        } else {
+            codex_oauth::access_usable(credential, now)
+        };
+        match self.refresh_partitions(credential, cfg, outer, siwc).await {
             Ok(patch) => Ok(patch),
-            Err(error) if codex_oauth::access_usable(credential, now) => {
+            Err(error) if usable => {
                 tracing::warn!(
                     credential = %credential.id,
                     status = error.status,
@@ -196,6 +202,93 @@ impl CodexExecutor {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Refreshes after an upstream rejected the token requests use (Go marks it
+    /// `RejectedAccessToken`): that partition (the Sign in with ChatGPT one when
+    /// `use_siwc` is on) and any due one. With neither able to refresh, every partition
+    /// that can (Go's explicit unscheduled refresh). Nothing without a refresh token.
+    pub async fn refresh_now(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        let now = Utc::now();
+        let has_outer = !codex_oauth::refresh_token(credential).is_empty();
+        let siwc_due = crate::codex_siwc::refresh_due(credential, now);
+        let active_siwc = crate::codex_siwc::enabled(credential);
+        let mut outer = has_outer && (!active_siwc || codex_oauth::refresh_due(credential, now));
+        let mut siwc = siwc_due.is_some_and(|due| due || active_siwc);
+        if !outer && !siwc {
+            (outer, siwc) = (has_outer, siwc_due.is_some());
+        }
+        self.refresh_partitions(credential, cfg, outer, siwc).await
+    }
+
+    /// A management refresh (Go `IsForceRefreshContext`): every partition that can refresh.
+    pub async fn refresh_all(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        let has_outer = !codex_oauth::refresh_token(credential).is_empty();
+        let has_siwc = crate::codex_siwc::refresh_due(credential, Utc::now()).is_some();
+        self.refresh_partitions(credential, cfg, has_outer, has_siwc).await
+    }
+
+    /// Go `refreshLocked`: the outer tokens, then the Sign in with ChatGPT partition, one
+    /// after the other. A partition that fails while the other refreshes is logged and
+    /// the other's patch kept; with neither refreshed, the outer error comes first.
+    async fn refresh_partitions(
+        &self,
+        credential: &Credential,
+        cfg: &Config,
+        outer: bool,
+        siwc: bool,
+    ) -> Result<MetadataPatch, ExecError> {
+        if !outer && !siwc {
+            return Ok(MetadataPatch::default());
+        }
+        // `NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)`: the credential's proxy, then the
+        // global one, on Go's standard transport.
+        let proxy = crate::proxy::Proxy::effective(credential, cfg);
+        let oauth = self.oauth.with_client(self.transport.standard(&proxy));
+        let outer = if outer {
+            Some(oauth.refresh_patch(codex_oauth::refresh_token(credential)).await)
+        } else {
+            None
+        };
+        let siwc = if siwc {
+            let (token, client, device) = crate::codex_siwc::refresh_inputs(credential);
+            Some(
+                oauth
+                    .refresh_siwc(token, client, device)
+                    .await
+                    .map(|tokens| crate::codex_siwc::refresh_patch(credential, &tokens)),
+            )
+        } else {
+            None
+        };
+        let mut patch = MetadataPatch::default();
+        let (mut refreshed, mut failures) = (false, Vec::new());
+        for (partition, result) in [("outer", outer), ("SIWC", siwc)] {
+            match result {
+                Some(Ok(part)) => {
+                    refreshed = true;
+                    patch.set.extend(part.set);
+                    patch.remove.extend(part.remove);
+                }
+                Some(Err(error)) => failures.push((partition, error)),
+                None => {}
+            }
+        }
+        if !refreshed {
+            return match failures.into_iter().next() {
+                Some((_, error)) => Err(error),
+                None => Ok(patch),
+            };
+        }
+        for (partition, error) in failures {
+            tracing::warn!(
+                credential = %credential.id,
+                partition,
+                status = error.status,
+                "codex token refresh failed for one partition; the other refreshed"
+            );
+        }
+        Ok(patch)
     }
 
     pub async fn execute(
@@ -208,6 +301,7 @@ impl CodexExecutor {
             return count_tokens(&req, cfg);
         }
         check_response_format(&req)?;
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         match (req.alt.as_deref(), req.stream) {
@@ -233,10 +327,10 @@ impl CodexExecutor {
         body: Bytes,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         let transport = &self.transport;
-        let (proxy, keep_alive) = (&view.proxy, view.chatgpt_keep_alive);
+        let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
         let route = |hop: &url::Url| {
             Ok(crate::proxy::Route {
-                client: transport.for_url(hop.as_str(), proxy, keep_alive),
+                client: transport.for_url(hop.as_str(), proxy, keep_alive, handshake),
                 order: None,
             })
         };
@@ -348,9 +442,9 @@ impl CodexExecutor {
             ..
         } = request::shape(&req, view, settings, Call::Stream)?;
         let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
-        report_request(&req, Format::Codex, &body);
         let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
         let body = request::sanitize_input_ids(body);
+        report_request(&req, Format::Codex, &body);
         let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let started = Instant::now();
@@ -414,9 +508,9 @@ impl CodexExecutor {
             ..
         } = request::shape(&req, view, settings, Call::NonStream)?;
         let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
-        report_request(&req, Format::Codex, &body);
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = request::sanitize_input_ids(body);
+        report_request(&req, Format::Codex, &body);
         let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
@@ -478,9 +572,9 @@ impl CodexExecutor {
             optimized: restore,
             ..
         } = request::shape(&req, view, settings, Call::Compact)?;
-        report_request(&req, Format::OpenAIResponse, &body);
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = request::sanitize_input_ids(body);
+        report_request(&req, Format::OpenAIResponse, &body);
         let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), false);
         let url = format!("{}/responses/compact", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
@@ -582,6 +676,8 @@ impl CodexExecutor {
         if view.api_key && !upstream_model.trim().is_empty() {
             body = rewrite_alpha_search_model(body, upstream_model.trim());
         }
+        // `PrepareRequest` (inside `NewHttpRequest`): Sign in with ChatGPT needs its token.
+        crate::codex_siwc::require_token(credential)?;
         let mut headers = HeaderMap::new();
         let mut set = |name: &'static str, value: &str| {
             if let Ok(value) = http::HeaderValue::from_str(value) {
@@ -679,10 +775,10 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
         model: &model,
         stream: false,
     };
-    let body = crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.body, &client)
+    let translated = crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.body, &client)
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?;
     let body = cpa_common::thinking::apply_request_thinking(&cpa_common::thinking::RequestThinking {
-        body: &body,
+        body: &translated.body,
         payload: &req.body,
         original: &req.original_body,
         model: &req.model,
@@ -691,7 +787,7 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
         provider: "codex",
         resolved: caps.as_ref().map(Some),
         has_request_transformer: cpa_translate::pair(req.source_format, Format::Codex).is_some(),
-        updates_changed: false,
+        updates_changed: translated.configuration_updates_changed,
     })
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
     let mut body = String::from_utf8_lossy(&body).into_owned();
@@ -809,8 +905,8 @@ fn go_headers(headers: &HeaderMap) -> crate::proxy::GoHeaders {
     out
 }
 
-/// Go `SetTranslatedReasoningEffort`: the upstream payload, for the usage record's
-/// reasoning effort.
+/// Go `SetTranslatedReasoningEffort`: the finalized upstream payload (prompt-cache key
+/// set, input IDs sanitized), for the usage record's reasoning effort (c7b4d573).
 pub(crate) fn report_request(req: &ExecRequest, upstream: Format, body: &str) {
     if req.usage.enabled() {
         req.usage.request(upstream, body.as_bytes());
@@ -916,7 +1012,7 @@ fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -
         original_request: &req.original_body,
         translated_request: translated.as_bytes(),
     };
-    let translator = (pair.stream)(&ctx);
+    let translator = crate::translate::stream(pair, &ctx, req);
     let original = if req.original_body.is_empty() {
         req.body.clone()
     } else {

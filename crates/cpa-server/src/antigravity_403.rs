@@ -5,6 +5,8 @@
 //! currently consumes its model-specific cooldown decisions; the separate
 //! health-probe and rebind workflow is not yet connected.
 
+use cpa_core::gostr::GoStr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     ProxyDrift,
@@ -17,6 +19,7 @@ pub enum Category {
 }
 
 impl Category {
+    #[cfg(test)]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProxyDrift => "proxy_drift",
@@ -116,7 +119,7 @@ const ACCOUNT_PERMISSION: &[&str] = &[
 pub fn classify(error_text: &str, binding_status: Option<&str>, eligibility_status: Option<&str>) -> Decision {
     let binding = binding_status.unwrap_or("unchecked").to_ascii_lowercase();
     let eligibility = eligibility_status.unwrap_or("unchecked").to_ascii_lowercase();
-    let normalized = error_text.to_lowercase();
+    let normalized = error_text.go_lower();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
 
     match binding.as_str() {

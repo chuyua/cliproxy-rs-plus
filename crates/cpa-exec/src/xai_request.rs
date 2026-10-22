@@ -61,7 +61,7 @@ pub(crate) fn original(req: &ExecRequest) -> &[u8] {
 }
 
 /// `helps.PayloadRequestedModel`.
-fn requested_model(req: &ExecRequest) -> &str {
+pub(crate) fn requested_model(req: &ExecRequest) -> &str {
     if req.requested_model.trim().is_empty() {
         req.model.trim()
     } else {
@@ -69,12 +69,10 @@ fn requested_model(req: &ExecRequest) -> &str {
     }
 }
 
-/// `oauth.providers.xai.inject-x-search` as this credential sees it (Go binds
-/// `cfg.ForAPIKey()` for API-key credentials).
+/// `upstream.xai.inject-x-search`, shared by OAuth and API-key credentials.
 pub(crate) fn inject_x_search(cfg: &Config) -> bool {
     cfg.document
-        .get("oauth")
-        .and_then(|o| o.get("providers"))
+        .get("upstream")
         .and_then(|p| p.get("xai"))
         .and_then(|x| x.get("inject-x-search"))
         .and_then(serde_yaml_ng::Value::as_bool)
@@ -83,8 +81,8 @@ pub(crate) fn inject_x_search(cfg: &Config) -> bool {
 
 /// `TranslateRequestWithAPIKeyModelCompatibility(AndUpdateIntent)ForExecutor` with
 /// target executor xai (Codex-client rewrites, then the pair or its compat variant).
-// ponytail: the configuration-update intent is not exposed by crate::codex_client
-// (owner: Codex), so thinking always sees `updates_changed: false`.
+// ponytail: the configuration-update intent crate::codex_client reports is not read
+// here yet, so thinking always sees `updates_changed: false`; xAI's port reads it.
 fn translate(
     req: &ExecRequest,
     client: &crate::codex_client::Client<'_>,
@@ -94,6 +92,7 @@ fn translate(
     body: &[u8],
 ) -> Result<Vec<u8>, ExecError> {
     crate::codex_client::translate_request(req.source_format, to, &RequestCtx { model, stream }, body, client)
+        .map(|t| t.body)
         .map_err(|e| bad_request(e.to_string()))
 }
 

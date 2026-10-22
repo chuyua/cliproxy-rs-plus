@@ -5,12 +5,12 @@ use crate::{
     Error, ResponseCtx, apply_patch,
     claude_responses::{qualify_namespace_name, tool_descriptors, tool_winners},
     codex_chat_request::{request_tool_names, short_name_map},
-    common::{now_unix, trim_space},
+    common::{go_runes, now_unix, trim_space},
     stream::GoStream,
 };
 use cpa_common::json::{self as gj, Kind, Res};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// buildReverseMapFromOriginalOpenAI: short name -> declared name.
 fn reverse_names(original: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
@@ -172,6 +172,8 @@ struct State {
     tool_keys: HashMap<Vec<u8>, usize>,
     current: Option<usize>,
     image_hashes: HashMap<Vec<u8>, [u8; 32]>,
+    citation_keys: HashSet<Vec<u8>>,
+    emitted_text_runes: i64,
 }
 
 impl State {
@@ -250,6 +252,22 @@ impl State {
         call
     }
 
+    /// The event's new URL citations as `choices.0.delta.annotations`, offset by the text
+    /// streamed so far; false when there are none.
+    fn push_citations(&mut self, t: &mut Vec<u8>, event: &Res<'_>) -> bool {
+        let citations = url_citations(
+            &event_annotations(event),
+            self.emitted_text_runes,
+            &mut self.citation_keys,
+        );
+        if citations.is_empty() {
+            return false;
+        }
+        gj::set_str(t, "choices.0.delta.role", "assistant");
+        gj::set_raw(t, "choices.0.delta.annotations", gj::join(&citations));
+        true
+    }
+
     fn convert(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         let root = gj::parse(payload);
         let mut t = br#"{"id":"","object":"chat.completion.chunk","created":12345,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":null,"native_finish_reason":null}]}"#.to_vec();
@@ -297,8 +315,15 @@ impl State {
             b"response.output_text.delta" => {
                 let delta = root.get("delta");
                 if delta.exists() {
+                    let delta = delta.bytes();
                     gj::set_str(&mut t, "choices.0.delta.role", "assistant");
-                    gj::set_str(&mut t, "choices.0.delta.content", delta.bytes());
+                    gj::set_str(&mut t, "choices.0.delta.content", &delta);
+                    self.emitted_text_runes += go_runes(&delta).count() as i64;
+                }
+            }
+            b"response.output_text.annotation.added" | b"response.output_text.done" | b"response.content_part.done" => {
+                if !self.push_citations(&mut t, &root) {
+                    return None;
                 }
             }
             b"response.image_generation_call.partial_image" => {
@@ -386,6 +411,9 @@ impl State {
                     return None;
                 }
                 let item_kind = item.get("type").bytes().into_owned();
+                if item_kind == b"message" {
+                    return self.push_citations(&mut t, &root).then_some(t);
+                }
                 if item_kind == b"image_generation_call" {
                     let b64 = item.get("result").bytes();
                     if b64.is_empty() || !self.new_image(&item.get("id").bytes(), &b64) {
@@ -451,6 +479,78 @@ impl GoStream for State {
     }
 }
 
+/// codexAnnotationResults: an array's items, or the value itself.
+fn annotation_results<'a>(value: Res<'a>) -> Vec<Res<'a>> {
+    if !value.exists() {
+        vec![]
+    } else if value.is_array() {
+        // Go collects with ForEach, which stops at a malformed element where Array() would not.
+        let mut out = vec![];
+        value.each(|_, item| {
+            out.push(item);
+            true
+        });
+        out
+    } else {
+        vec![value]
+    }
+}
+
+/// codexAnnotationsFromEvent.
+fn event_annotations<'a>(event: &Res<'a>) -> Vec<Res<'a>> {
+    let mut out = vec![];
+    for path in ["annotation", "annotations", "part.annotations"] {
+        out.extend(annotation_results(event.get(path)));
+    }
+    let item = event.get("item");
+    if item.exists() {
+        out.extend(annotation_results(item.get("annotations")));
+        let content = item.get("content");
+        if content.is_array() {
+            for part in content.array() {
+                out.extend(annotation_results(part.get("annotations")));
+            }
+        }
+    }
+    out
+}
+
+/// buildCodexURLCitations: `url_citation` annotations as Chat Completions citations,
+/// their rune indexes shifted by `offset`. A citation already seen (same URL, or ID when
+/// the URL is empty, and raw start; or same ID) is dropped.
+fn url_citations(annotations: &[Res<'_>], offset: i64, seen: &mut HashSet<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    for annotation in annotations {
+        if annotation.get("type").bytes().as_ref() != b"url_citation" {
+            continue;
+        }
+        let raw_start = annotation.get("start_index").int();
+        let start = raw_start.wrapping_add(offset);
+        let end = annotation.get("end_index").int().wrapping_add(offset);
+        if start < 0 || end < start {
+            continue;
+        }
+        let url = annotation.get("url").bytes();
+        let id = annotation.get("id").bytes();
+        let key_source: &[u8] = if url.is_empty() { &id } else { &url };
+        let mut keys = vec![[key_source, b"\0", raw_start.to_string().as_bytes()].concat()];
+        if !id.is_empty() {
+            keys.push([&b"id\0"[..], &id].concat());
+        }
+        if keys.iter().any(|k| seen.contains(k)) {
+            continue;
+        }
+        seen.extend(keys);
+        let mut citation = br#"{"type":"url_citation","url":"","title":"","start_index":0,"end_index":0}"#.to_vec();
+        gj::set_str(&mut citation, "url", &url);
+        gj::set_str(&mut citation, "title", annotation.get("title").bytes());
+        gj::set_int(&mut citation, "start_index", start);
+        gj::set_int(&mut citation, "end_index", end);
+        out.push(citation);
+    }
+    out
+}
+
 /// ConvertCodexResponseToOpenAINonStream: a terminal Codex event as one chat completion.
 pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
     let root = gj::parse(raw);
@@ -488,6 +588,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
     if output.is_array() {
         let (mut text, mut reasoning) = (vec![], vec![]);
         let mut images = vec![];
+        let (mut annotations, mut annotation_keys, mut text_runes) = (vec![], HashSet::new(), 0i64);
         for item in output.array() {
             match item.get("type").bytes().as_ref() {
                 b"reasoning" => {
@@ -510,14 +611,22 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
                     }
                 }
                 b"message" => {
+                    // Every output_text part, with its URL citations (16d98881).
                     let content = item.get("content");
-                    if content.is_array()
-                        && let Some(first) = content
-                            .array()
-                            .into_iter()
-                            .find(|c| c.get("type").bytes().as_ref() == b"output_text")
-                    {
-                        text.extend_from_slice(&first.get("text").bytes());
+                    if content.is_array() {
+                        for part in content.array() {
+                            if part.get("type").bytes().as_ref() != b"output_text" {
+                                continue;
+                            }
+                            let part_text = part.get("text").bytes();
+                            text.extend_from_slice(&part_text);
+                            annotations.extend(url_citations(
+                                &annotation_results(part.get("annotations")),
+                                text_runes,
+                                &mut annotation_keys,
+                            ));
+                            text_runes += go_runes(&part_text).count() as i64;
+                        }
                     }
                 }
                 b"function_call" | b"custom_tool_call" => {
@@ -563,6 +672,9 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
         if !reasoning.is_empty() {
             gj::set_str(&mut t, "choices.0.message.reasoning_content", reasoning);
         }
+        if !annotations.is_empty() {
+            gj::set_raw(&mut t, "choices.0.message.annotations", gj::join(&annotations));
+        }
         if !calls.is_empty() {
             gj::set_raw(&mut t, "choices.0.message.tool_calls", gj::join(&calls));
         }
@@ -592,4 +704,52 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go v8.0.35 `ConvertCodexResponseToOpenAI` and its non-stream form on URL citations
+    /// (16d98881): see tests/reference/codex_chat.
+    #[test]
+    fn url_citations_match_go() {
+        let go: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chat_go.json")).unwrap();
+        let ctx = ResponseCtx {
+            model: "gpt-5.5",
+            original_request: b"",
+            translated_request: b"",
+        };
+        for case in go["streams"].as_array().unwrap() {
+            let mut stream = go_stream(&ctx);
+            for (line, want) in case["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(case["out"].as_array().unwrap())
+            {
+                let got: Vec<String> = stream
+                    .line(line.as_str().unwrap().as_bytes())
+                    .unwrap()
+                    .iter()
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect();
+                let want: Vec<&str> = want.as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+                assert_eq!(got, want, "{}: {}", case["name"], line);
+            }
+        }
+        for case in go["non_stream"].as_array().unwrap() {
+            let ctx = ResponseCtx {
+                original_request: case["original"].as_str().unwrap_or_default().as_bytes(),
+                ..ctx
+            };
+            let out = non_stream(&ctx, case["in"].as_str().unwrap().as_bytes()).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                case["out"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
 }

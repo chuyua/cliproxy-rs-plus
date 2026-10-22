@@ -4,6 +4,7 @@
 
 use super::cloak::{self, FABLE_REPORTING};
 use crate::rawjson;
+use cpa_core::gostr::GoStr;
 
 /// `claudeCodeSystemPlacementState`: only the `role: system` turns CPA itself inserted
 /// while cloaking a current model.
@@ -211,7 +212,7 @@ pub(crate) fn fable(
         }
         return body;
     }
-    let model = rawjson::string(&body, "model").trim().to_lowercase();
+    let model = rawjson::string(&body, "model").trim().go_lower();
     if state.fallbacks && !touched_fallbacks {
         let want = if cloak::is_fable51(&model) {
             "claude-opus-5"
@@ -265,7 +266,7 @@ pub(crate) fn fable(
     if cloak::is_opus55(&model) && !exists(&body, "fallbacks") && !touched_fallbacks {
         body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-4-8"}]"#);
     }
-    let kind = rawjson::string(&body, "thinking.type").trim().to_lowercase();
+    let kind = rawjson::string(&body, "thinking.type").trim().go_lower();
     let active = kind == "adaptive" || kind == "enabled";
     // Payload rules can disable thinking without touching display: only CPA's injected
     // value goes.

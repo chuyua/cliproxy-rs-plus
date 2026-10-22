@@ -11,7 +11,7 @@ import (
 func main() {
 	f := os.Stdout
 	fmt.Fprintln(f, "// @generated from Go "+goVersion()+" unicode.CaseRanges, unicode caseOrbit and strconv.IsPrint")
-	fmt.Fprintln(f, "// by tests/reference/unicode/main.go. Do not edit.")
+	fmt.Fprintln(f, "// by crates/cpa-common/tests/reference/unicode/main.go. Do not edit.")
 	fmt.Fprintln(f, "")
 	fmt.Fprintln(f, "/// `unicode.CaseRanges`: (lo, hi, upper delta, lower delta, title delta); `UPPER_LOWER` marks alternating ranges.")
 	fmt.Fprintf(f, "pub(crate) static CASE_RANGES: [(u32, u32, i32, i32, i32); %d] = [\n", len(unicode.CaseRanges))

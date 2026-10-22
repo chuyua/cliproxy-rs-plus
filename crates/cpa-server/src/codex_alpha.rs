@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -82,6 +83,7 @@ fn allowed(c: &Credential) -> bool {
 
 async fn alpha_search(
     State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<cpa_core::exec::Caller>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -119,8 +121,9 @@ async fn alpha_search(
     if primary.is_empty() {
         (primary, parent) = cpa_common::session::session_ids(&selection_headers, &body, &meta);
     }
-    // Go's Alpha Search context holds only the request ID and this session hierarchy
-    // (it never passes `GetContextWithCancel`); Home's canonical session replaces it.
+    // Go's Alpha Search context holds the request ID, this session hierarchy (it never
+    // passes `GetContextWithCancel`; Home's canonical session replaces it) and the
+    // authenticated caller.
     let client = crate::usage_record::Client {
         session_id: primary.clone(),
         parent_session_id: if parent == primary {
@@ -129,6 +132,8 @@ async fn alpha_search(
             parent.clone()
         },
         request_id: crate::observability::current_request_id().unwrap_or_default(),
+        api_key: caller.principal,
+        access_provider: caller.provider,
         ..Default::default()
     };
     let bound = |s: String| (!s.is_empty()).then(|| cpa_common::session::bound_session_identity(&s));
@@ -139,17 +144,27 @@ async fn alpha_search(
         session_parent: bound(parent),
         session_fork: fork,
         exclude,
+        scheduler: crate::plugins::provider_scheduler_context(
+            &rt,
+            "codex",
+            &selection_headers,
+            if policy.session_affinity { &model } else { "" },
+            &[],
+        ),
         ..Selection::default()
     };
     // ponytail: one selection, no failover or outcome recording, as in Go; plugin model
     // routing is not ported.
     if let Some(remote) = rt.remote_dispatch() {
-        let lease = match home_lease(&rt, remote.as_ref(), selection, &headers).await {
-            Ok(lease) => lease,
+        let (lease, home_key) = match home_lease(&rt, remote.as_ref(), selection, &headers).await {
+            Ok(picked) => picked,
             Err(response) => return *response,
         };
         let facts = crate::usage_record::Facts {
-            client,
+            client: crate::usage_record::Client {
+                api_key: crate::usage_record::home_unauthorized_key(&client.api_key, &home_key),
+                ..client
+            },
             format: cpa_core::format::Format::OpenAIResponse,
             alias: String::new(),
             reasoning_effort: String::new(),
@@ -203,6 +218,15 @@ async fn alpha_search(
         Err(AcquireError::Prepare { error: e, .. }) => {
             return error(e.status, &String::from_utf8_lossy(&e.body));
         }
+        // A plugin scheduler's answer: Go returns the error as is, and a statusless one
+        // answers 503 (`HTTPStatusFromErrorOr`).
+        Err(AcquireError::Rejected { code, message }) => {
+            return error(503, &format!("{code}: {message}"));
+        }
+        Err(AcquireError::Scheduler(e)) => {
+            let status = if e.status > 0 { e.status } else { 503 };
+            return error(status, &crate::classify::error_text(&e));
+        }
     };
     search(&rt, lease, &body, &headers, &model, &cfg, &capture, None).await
 }
@@ -214,7 +238,7 @@ async fn home_lease(
     remote: &dyn crate::remote::RemoteDispatch,
     selection: Selection,
     headers: &HeaderMap,
-) -> Result<crate::runtime::Lease, Box<Response>> {
+) -> Result<(crate::runtime::Lease, String), Box<Response>> {
     let request = crate::remote::RemoteRequest {
         model: selection.model.clone(),
         session_id: selection.session.clone().unwrap_or_default(),

@@ -80,6 +80,7 @@ pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
         headers: Box::default(),
         retry_after: None,
         direct: false,
+        addon: None,
     }
 }
 
@@ -149,7 +150,7 @@ pub(crate) fn translate(
     let ctx = RequestCtx { model, stream };
     let client = crate::codex_client::Client::new(&req.headers, cfg, "", compat);
     deep_stack(body, || {
-        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client)
+        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client).map(|t| t.body)
     })
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
@@ -206,12 +207,13 @@ fn translate_pair(
     model: &str,
     compat: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), ExecError> {
-    let working = translate(req, cfg, target, model, &req.body, req.stream, compat)?;
+    // Go translates the original first; equal payloads once.
     let source = original_request(req);
-    if *source == req.body {
-        return Ok((working.clone(), working));
-    }
     let original = translate(req, cfg, target, model, source, req.stream, compat)?;
+    if *source == req.body {
+        return Ok((original.clone(), original));
+    }
+    let working = translate(req, cfg, target, model, &req.body, req.stream, compat)?;
     Ok((original, working))
 }
 
@@ -450,17 +452,16 @@ pub(crate) fn translate_non_stream(
     data: &[u8],
 ) -> Result<Bytes, ExecError> {
     let response = req.response_format;
+    let ctx = ResponseCtx {
+        model: &req.model,
+        original_request: original_request(req),
+        translated_request: translated,
+    };
     let mut out = match cpa_translate::pair(response, upstream) {
-        Some(pair) => (pair.non_stream)(
-            &ResponseCtx {
-                model: &req.model,
-                original_request: original_request(req),
-                translated_request: translated,
-            },
-            data,
-        )
-        .map_err(|_| bad_gateway())?,
-        None => data.to_vec(),
+        Some(pair) => (pair.non_stream)(&ctx, data).map_err(|_| bad_gateway())?,
+        // Go's TranslateNonStream still runs the plugin response hooks.
+        None => cpa_translate::hooks::unregistered_non_stream(upstream.as_str(), response.as_str(), &ctx, data)
+            .unwrap_or_else(|| data.to_vec()),
     };
     if out.is_empty() {
         return Err(bad_gateway());
@@ -726,20 +727,27 @@ impl Emit {
 /// Only Gemini upstreams reach it (a Codex client); every client format that takes the
 /// native Interactions path has a registered Interactions pair. Executors that pass
 /// scanned lines as [`line_event`]s get the line back without the terminator.
-#[derive(Default)]
-struct Unregistered(cpa_translate::stream::StreamOptions);
+/// With plugin response hooks active, each payload goes through them (`hooks`).
+struct Unregistered {
+    options: cpa_translate::stream::StreamOptions,
+    hooks: Option<Box<dyn cpa_translate::stream::GoStream>>,
+}
 
 impl StreamTranslator for Unregistered {
     fn event(&mut self, event: &[u8]) -> Result<Vec<Bytes>, cpa_translate::Error> {
-        let line = if self.0.whole_events {
+        let line = if self.options.whole_events {
             event
         } else {
             event.strip_suffix(LINE_END).unwrap_or(event)
         };
-        Ok(vec![match self.0.chunk {
-            Some(hook) => Bytes::from(hook(line)),
-            None => Bytes::copy_from_slice(line),
-        }])
+        let emit = |chunk: &[u8]| match self.options.chunk {
+            Some(hook) => Bytes::from(hook(chunk)),
+            None => Bytes::copy_from_slice(chunk),
+        };
+        match &mut self.hooks {
+            Some(hooks) => Ok(hooks.line(line)?.iter().map(|c| emit(c)).collect()),
+            None => Ok(vec![emit(line)]),
+        }
     }
 
     fn finish(&mut self) -> Result<Vec<Bytes>, cpa_translate::Error> {
@@ -753,6 +761,7 @@ pub(crate) struct Output {
     client: Format,
     /// A Gemini client asked for `alt`: chunks are written bare.
     raw: bool,
+    executor_chunks: bool,
     claude: ClaudeInputTokens,
     /// The attempt's usage reporter; stream loops feed it what Go's reporter sees.
     pub(crate) usage: UsageSink,
@@ -783,12 +792,20 @@ impl Output {
             original_request: original_request(req),
             translated_request: translated,
         };
-        let translator = cpa_translate::stream_with(client, upstream, &ctx, options)
-            .unwrap_or_else(|| Box::new(Unregistered(options)));
+        let mut translator = cpa_translate::stream_with(client, upstream, &ctx, options).unwrap_or_else(|| {
+            Box::new(Unregistered {
+                options,
+                hooks: cpa_translate::hooks::wrap_stream(upstream.as_str(), client.as_str(), &ctx, None),
+            })
+        });
+        if req.stream_payloads {
+            translator.executor_chunks();
+        }
         Self {
             translator,
             client,
             raw: alt(req).is_some(),
+            executor_chunks: req.stream_payloads,
             claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
             usage: req.usage.clone(),
             capture: req.capture().clone(),
@@ -883,7 +900,7 @@ impl Output {
     /// Gemini clients: translators frame chunks as SSE `data:` events; with `alt` the Go
     /// handler writes the chunk itself.
     fn frame(&self, out: &mut Vec<Bytes>) {
-        if self.client == Format::Gemini {
+        if self.client == Format::Gemini && !self.executor_chunks {
             for chunk in out.iter_mut() {
                 let bare = chunk
                     .strip_prefix(b"data: ")

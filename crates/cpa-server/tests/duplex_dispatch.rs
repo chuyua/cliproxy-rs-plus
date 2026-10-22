@@ -208,6 +208,7 @@ impl Conductor {
             caller: Caller {
                 principal: "client-key".into(),
                 source: "authorization",
+                provider: String::new(),
             },
             forced_provider: None,
             selection_model: None,

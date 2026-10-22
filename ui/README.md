@@ -7,6 +7,13 @@ The management dashboard for cliproxy-rs, written in Svelte 5 with plain CSS. It
 
 Product rules are in [PRODUCT.md](PRODUCT.md) and the visual system in [DESIGN.md](DESIGN.md).
 
+The shell and account-connection experience have a Chinese/English language
+selector. Chinese is the initial UI language, with the user's explicit choice
+persisted in `localStorage` under `cliproxy-language`. Other pages currently
+fall back to their existing English text. Only presentation strings are
+translated: configuration paths, OAuth parameters, log fields and API payloads
+remain unchanged.
+
 ## Commands
 
 Requires Node 22.12 or newer.
@@ -15,11 +22,11 @@ Requires Node 22.12 or newer.
 npm ci
 npm run dev      # Vite on :5173, proxies /v8 to 127.0.0.1:8317 (override with CPA_BACKEND=...)
 npm run check    # svelte-check, 0 errors and 0 warnings expected
-npm test         # unit tests for src/core.ts
+npm test         # unit tests for core and presentation translations
 npm run build    # dist/, dist-panel/, then the size budget
 ```
 
-`npm run build` runs `vite build`, then `scripts/panel.mjs` (inlines JS, CSS, font and favicon into `dist-panel/management.html`, writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md), then `scripts/size.mjs`, which fails the build if gzip JavaScript exceeds 49,500 B or CSS exceeds 6,853 B. The ceilings began as the sizes of the dashboard this one replaced (42,642 B and 6,853 B); JavaScript was raised twice: for the beginner onboarding, then for the Claude usage parser and plan limits.
+`npm run build` runs `vite build`, then `scripts/panel.mjs` (inlines JS, CSS, font and favicon into `dist-panel/management.html`, writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md), then `scripts/size.mjs`, which fails the build if gzip JavaScript exceeds 52,000 B or CSS exceeds 6,853 B. The ceilings began as the sizes of the dashboard this one replaced (42,642 B and 6,853 B); JavaScript was raised for onboarding, the Claude usage parser, and then bilingual shell and account connection.
 
 Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checked in and embedded at compile time.
 

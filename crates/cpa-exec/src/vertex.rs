@@ -12,6 +12,7 @@
 //! does not cap `maxOutputTokens`, strips Responses tool-call IDs, sends Imagen models to
 //! `:predict`, and hands every scanned stream line to the translator unfiltered.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -158,7 +159,7 @@ fn go_string(value: &gj::Res<'_>) -> String {
 
 /// `isImagenModel`.
 fn is_imagen(model: &str) -> bool {
-    model.to_lowercase().contains("imagen")
+    model.go_lower().contains("imagen")
 }
 
 /// `convertToImagenRequest`: the prompt from `contents.0.parts.0.text`, the first

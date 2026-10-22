@@ -7,6 +7,7 @@
 //! relay messages. Every translated chunk and body is re-encoded the way Go's
 //! `ensureColonSpacedJSON` writes JSON.
 
+use cpa_core::gostr::GoStr;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -106,7 +107,7 @@ fn normalize_thinking_level(body: Vec<u8>) -> Vec<u8> {
         return body;
     }
     let current = level.str().into_owned();
-    let upper = current.to_uppercase();
+    let upper = current.go_upper();
     if !matches!(upper.as_str(), "MINIMAL" | "LOW" | "MEDIUM" | "HIGH") || upper == current {
         return body;
     }

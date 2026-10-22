@@ -16,11 +16,21 @@ import (
 // harvested fixtures differ from mined ones only in where the input came from.
 
 type harvestArg struct {
-	S    *string `json:"s"`
-	SB   *string `json:"sb"`
-	B    *string `json:"b"`
-	Bool *bool   `json:"bool"`
-	P    string  `json:"p"`
+	S        *string          `json:"s"`
+	SB       *string          `json:"sb"`
+	B        *string          `json:"b"`
+	Bool     *bool            `json:"bool"`
+	P        string           `json:"p"`
+	Envelope *harvestEnvelope `json:"envelope"`
+}
+
+// harvestEnvelope is a recorded sdk/translator.RequestEnvelope.
+type harvestEnvelope struct {
+	Format    string `json:"format"`
+	Model     string `json:"model"`
+	Stream    bool   `json:"stream"`
+	Body      string `json:"body"`
+	ModelInfo bool   `json:"model_info"`
 }
 
 type harvestCall struct {
@@ -86,7 +96,16 @@ func (a harvestArg) str() string {
 }
 
 // The request_compat converters run() can call, by pair.
-var compatPairs = map[string]bool{"openai:claude": true, "claude:openai": true, "claude:gemini": true, "claude:codex": true, "claude:interactions": true}
+var compatPairs = map[string]bool{"openai:claude": true, "openai-response:claude": true, "claude:openai": true, "claude:gemini": true, "claude:codex": true, "claude:interactions": true}
+
+// envelopeByteForm reports an exported byte-form request converter of a pair whose
+// request is registered as an envelope (init.go passes nil to Register): tests call it
+// directly, and run() records its output through TranslateRequestEnvelope.
+func envelopeByteForm(r registration, fn, pkg string) bool {
+	name, ok := strings.CutPrefix(fn, pkg)
+	return ok && r.request == "nil" && strings.HasPrefix(name, "Convert") && strings.Contains(name, "RequestTo") &&
+		!strings.Contains(name, "Envelope") && !strings.HasSuffix(name, "WithCompat") && !strings.HasSuffix(name, "Context")
+}
 
 func fixtureKey(f fixture) string {
 	return strings.Join([]string{f.Path, f.Model, f.Input, fmt.Sprint(f.Stream), f.Original, f.Translated, strings.Join(f.Lines, "\x00")}, "\x01")
@@ -154,7 +173,7 @@ func harvested(root string, r registration, existing []fixture) []fixture {
 		name := fmt.Sprintf("%s:%d", c.Test, c.Line)
 		a := c.Args
 		switch {
-		case c.Fn == pkg+r.request && len(a) == 3:
+		case (c.Fn == pkg+r.request || envelopeByteForm(r, c.Fn, pkg)) && len(a) == 3:
 			add(c.Test, fixture{Name: name, Path: "request", Model: a[0].str(), Input: a[1].str(), Stream: a[2].Bool != nil && *a[2].Bool})
 		case strings.HasPrefix(c.Fn, pkg) && strings.HasSuffix(c.Fn, "WithCompat") && compatPairs[pair] && len(a) == 3:
 			add(c.Test, fixture{Name: name + ":compat", Path: "request_compat", Model: a[0].str(), Input: a[1].str(), Stream: a[2].Bool != nil && *a[2].Bool})
@@ -164,6 +183,14 @@ func harvested(root string, r registration, existing []fixture) []fixture {
 			add(c.Test, fixture{Name: name, Path: "non_stream", Model: a[1].str(), Original: a[2].str(), Translated: a[3].str(), Input: a[4].str()})
 		case c.Fn == "sdk/translator.TranslateRequest" && len(a) == 5 && a[0].str() == r.client && a[1].str() == r.upstream:
 			add(c.Test, fixture{Name: name, Path: "request", Model: a[2].str(), Input: a[3].str(), Stream: a[4].Bool != nil && *a[4].Bool})
+		case c.Fn == "sdk/translator.TranslateRequestEnvelope" && len(a) == 4 && a[1].str() == r.client && a[2].str() == r.upstream &&
+			a[3].Envelope != nil && !a[3].Envelope.ModelInfo:
+			e := a[3].Envelope
+			body, err := base64.StdEncoding.DecodeString(e.Body)
+			if err != nil {
+				panic(err)
+			}
+			add(c.Test, fixture{Name: name + ":envelope", Path: "request", Model: e.Model, Input: string(body), Stream: e.Stream})
 		case c.Fn == "sdk/translator.TranslateStream" && len(a) == 8 && a[1].str() == r.upstream && a[2].str() == r.client:
 			stream(c, a[3].str(), a[4].str(), a[5].str(), a[6].str(), a[7].P)
 		case c.Fn == "sdk/translator.TranslateNonStream" && len(a) == 8 && a[1].str() == r.upstream && a[2].str() == r.client:

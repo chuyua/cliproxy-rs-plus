@@ -10,6 +10,7 @@
 //! In Home mode the entry lives in Home KV (`cpa:codex:reasoning-replay:*`) as Go's
 //! `json.Marshal([][]byte)`, appended by compare-and-swap.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -892,7 +893,7 @@ fn align_call_ids(inputs: &[Res<'_>], items: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 /// `codexReplayMessageRole`.
 fn message_role(item: &Res<'_>) -> Option<String> {
     let kind = field(item, "type");
-    let role = field(item, "role").to_lowercase();
+    let role = field(item, "role").go_lower();
     (!role.is_empty() && (kind.is_empty() || kind == "message")).then_some(role)
 }
 

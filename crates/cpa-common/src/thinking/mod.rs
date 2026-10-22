@@ -16,7 +16,9 @@ mod summary;
 mod validate;
 
 pub use apply::*;
-pub use providers::apply_provider;
+pub use providers::{
+    PluginApplier, apply_provider, clear_plugin_providers, register_plugin_provider, unregister_plugin_providers,
+};
 pub use summary::*;
 pub use validate::validate_config;
 

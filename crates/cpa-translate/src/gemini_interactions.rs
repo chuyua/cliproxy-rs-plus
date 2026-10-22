@@ -589,10 +589,7 @@ fn unmarshal_object(raw: &[u8]) -> Option<BTreeMap<String, GoValue>> {
     if !gj::std_valid(raw) {
         return None;
     }
-    match GoValue::parse_f64(raw)? {
-        GoValue::Object(map) => Some(map),
-        _ => None,
-    }
+    GoValue::parse_f64(raw)?.into_object().ok()
 }
 
 /// copyInteractionsTools.

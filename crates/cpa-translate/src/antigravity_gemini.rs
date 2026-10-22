@@ -585,7 +585,7 @@ enum PartFate {
 
 fn sanitize_part(part: &Res<'_>, model_turn: bool) -> PartFate {
     // A json.Decoder into map[string]any: anything but an object fails and is kept.
-    let Some(GoValue::Object(mut map)) = GoValue::parse(&part.raw) else {
+    let Some(Ok(mut map)) = GoValue::parse(&part.raw).map(GoValue::into_object) else {
         return PartFate::Keep;
     };
     let signature = SIGNATURE_PATHS.iter().find_map(|p| string_at(&map, p));

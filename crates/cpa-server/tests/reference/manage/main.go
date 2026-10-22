@@ -747,7 +747,6 @@ type output struct {
 	YAMLMerges   []yamlMergeCase   `json:"yaml_merges"`
 	OAuthOnly    []oauthOnlyCase   `json:"oauth_only"`
 	Credentials  []credScenario    `json:"credentials"`
-	Materialized any               `json:"materialized_defaults"`
 	Config       []configScenario  `json:"config_writes"`
 	IPBytes      []ipBytesCase     `json:"client_ip_bytes"`
 	Routes       []routeScenario   `json:"routes"`
@@ -929,10 +928,6 @@ func main() {
 	} {
 		out.IPBytes = append(out.IPBytes, runIPBytes(c))
 	}
-	// Keys Go's saver adds to an otherwise untouched v8 document on any PUT/PATCH.
-	base := runConfig(configScenario{Name: "materialized", YAML: "config-version: 8\nmanagement:\n  secret-key: '$HASH'\n",
-		Steps: []configStep{{Method: http.MethodPatch, Path: "/config", Body: "{}"}}})
-	out.Materialized = base.Steps[0].File
 	out.YAMLBools = yamlBoolCases()
 	out.YAMLMerges = yamlMergeCases()
 	out.TypedScalars = typedScalarCases()
@@ -1412,6 +1407,7 @@ func configScenarios() []configScenario {
 			put("/config/routing/retry/request-retry", `3`),
 			put("/config/routing/session-affinity-subagents", `"off"`),
 			put("/config/observability/logs/request-log", `"YES"`),
+			put("/config/upstream/xai/inject-x-search", `"on"`),
 			put("/config/routing/force-model-prefix", `"yEs"`),
 			put("/config/routing/force-model-prefix", `"true"`),
 			get("/config"),
@@ -1459,6 +1455,37 @@ func configScenarios() []configScenario {
 			put("/config.yaml", "config-version: 8\nmanagement: &m\n  secret-key: fake-secret\nrouting:\n  retry: &r {request-retry: 3}\n  <<: {strategy: fill-first}\n"),
 			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nrouting:\n  <<: 5\n"),
 			get("/config"),
+		}},
+		// JSON keys are quoted, so `<<` in a JSON body is a plain key until Go parses its
+		// own save, which writes it plain: a map then merges and a scalar is a 422 at any
+		// depth (a YAML upload's scalar merge is a 400 above).
+		// v8.0.35 7c41cd05: server.github-token, legacy root github-token. Go reads,
+		// migrates and writes it like any setting; v0 GET /config omits it (json:"-").
+		{Name: "server_github_token", YAML: "github-token: ' fake-legacy-token '\nremote-management:\n  secret-key: '$HASH'\n", Steps: []configStep{
+			get("/config"), get("/config/server/github-token"),
+			put("/config/routing/strategy", `"fill-first"`),
+			patch("/config/server/github-token", `"fake-patched"`), get("/config/server"),
+			put("/config/server/github-token", `5`), get("/config/server/github-token"),
+			put("/config/server/github-token", `{"a":1}`),
+			patch("/config", `{"server":{"github-token":null}}`),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nserver:\n  github-token: fake-yaml-token\n"),
+			get("/config.yaml"), del("/config/server/github-token"),
+		}},
+		{Name: "merge_keys_in_json_bodies", YAML: "config-version: 8\nmanagement:\n  secret-key: '$HASH'\n", Steps: []configStep{
+			put("/config/plugins/configs/x", `{"<<":5}`),
+			put("/config/plugins/configs/x", `{"<<":{"a":1},"b":2}`),
+			get("/config/plugins"),
+			patch("/config", `{"<<":{"server":{"port":3}}}`),
+			patch("/config", `{"<<":5}`),
+			put("/config", `{"management":{"secret-key":"fake-secret"},"<<":{"server":{"port":4}}}`),
+			get("/config"),
+			// Keys already in the entry win over merged ones.
+			put("/config/plugins/configs/x", `{"a":1}`),
+			patch("/config/plugins/configs/x", `{"<<":{"a":2,"c":3}}`),
+			get("/config/plugins"),
+			// The root shape is checked before any merge.
+			put("/config", `[{"<<":5}]`),
+			patch("/config", `[{"<<":5}]`),
 		}},
 	}
 }

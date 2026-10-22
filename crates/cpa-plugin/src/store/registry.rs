@@ -1,6 +1,7 @@
 //! Store registries (internal/pluginstore/registry.go): sources, the registry
 //! document, and its validation.
 
+use cpa_core::gostr::GoStr;
 use sha2::{Digest, Sha256};
 
 use super::url;
@@ -258,7 +259,7 @@ pub fn validate_plugin_versions(plugin: &Plugin) -> Result<(), String> {
         }
         seen.push(v);
         let mut install = version.install.clone();
-        let mut install_type = install.install_type.trim().to_lowercase();
+        let mut install_type = install.install_type.trim().go_lower();
         if install_type.is_empty() {
             install_type = plugin_type.clone();
             install.install_type = install_type.clone();
@@ -277,7 +278,7 @@ pub fn validate_plugin_versions(plugin: &Plugin) -> Result<(), String> {
 
 /// Go `PluginInstallType`: the plan's type, GitHub releases by default.
 pub fn plugin_install_type(plugin: &Plugin) -> String {
-    match plugin.install.install_type.trim().to_lowercase() {
+    match plugin.install.install_type.trim().go_lower() {
         t if t.is_empty() => INSTALL_TYPE_GITHUB_RELEASE.into(),
         t => t,
     }
@@ -286,7 +287,7 @@ pub fn plugin_install_type(plugin: &Plugin) -> String {
 /// Go `NormalizeInstallPlan`.
 pub fn normalize_install_plan(plan: &InstallPlan) -> InstallPlan {
     let mut plan = plan.clone();
-    plan.install_type = plan.install_type.trim().to_lowercase();
+    plan.install_type = plan.install_type.trim().go_lower();
     for artifact in &mut plan.artifacts {
         normalize_artifact(artifact);
     }
@@ -297,7 +298,7 @@ fn normalize_artifact(artifact: &mut Artifact) {
     artifact.goos = normalize_goos(&artifact.goos);
     artifact.goarch = normalize_goarch(&artifact.goarch);
     artifact.url = artifact.url.trim().to_owned();
-    artifact.sha256 = artifact.sha256.trim().to_lowercase();
+    artifact.sha256 = artifact.sha256.trim().go_lower();
 }
 
 /// Go `ValidateInstallPlan`.
@@ -403,14 +404,14 @@ pub fn plugin_artifacts(plugin: &Plugin) -> Vec<Artifact> {
 }
 
 pub(super) fn normalize_goos(goos: &str) -> String {
-    match goos.trim().to_lowercase().as_str() {
+    match goos.trim().go_lower().as_str() {
         "mac" | "macos" | "osx" => "darwin".into(),
         other => other.into(),
     }
 }
 
 pub(super) fn normalize_goarch(goarch: &str) -> String {
-    match goarch.trim().to_lowercase().as_str() {
+    match goarch.trim().go_lower().as_str() {
         "x64" | "x86_64" => "amd64".into(),
         "aarch64" => "arm64".into(),
         other => other.into(),

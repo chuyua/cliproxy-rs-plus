@@ -1,17 +1,22 @@
 # Management and config goldens
 
-`../../fixtures/manage_go.json` holds outputs of CLIProxyAPI at `6fecc6e`, produced
-in-process by `main.go`. It runs real Go code only: gin `ClientIP`, the management
+`../../fixtures/manage_go.json` holds outputs of CLIProxyAPI v8.0.35 (`ae3ee3be`),
+produced in-process by `main.go`. Its second argument receives Go's static model
+definitions by channel, which `src/management/model_definitions.json` copies; update
+that file only together with the model catalog. It runs real Go code only: gin `ClientIP`, the management
 middleware, `config.LoadConfig`, the config/file credential synthesizers and a
 complete `api.NewServer` driven through `httptest`. It opens no sockets and calls no
 provider, GitHub or OAuth endpoint. Secrets are `fake-*` strings; bcrypt hashes are
 regenerated on every run, so tests hash the same plaintext themselves.
 
-Regenerate with a temporary module inside the reference module's internal-package
-boundary (the reference checkout is not modified):
+Record with Go 1.26.4, the toolchain of the v8.0.35 release build (`GO_VERSION` in the reference's `.github/workflows/release.yaml`); from 1.26.4 `textproto` quotes MIME header diagnostics with `%q`. Regenerate with a temporary module inside the reference module's internal-package
+boundary (the reference checkout is not modified). Copying the reference's `go.sum`
+pins its dependency versions; `-mod=mod` lets the temporary module record them.
+Between two runs only timestamps, OAuth state and PKCE values, bcrypt hashes and
+temporary-path auth indexes change, and the replay normalizes all of them:
 
 ```sh
-reference=/absolute/path/to/CLIProxyAPI   # at 6fecc6e
+reference=/absolute/path/to/CLIProxyAPI   # at ae3ee3be (v8.0.35)
 crate=/absolute/path/to/cliproxy-rs/crates/cpa-server
 tmp=$(mktemp -d)
 cp "$crate/tests/reference/manage/main.go" "$tmp/main.go"
@@ -20,8 +25,9 @@ cp "$crate/tests/reference/manage/main.go" "$tmp/main.go"
   go mod init github.com/router-for-me/CLIProxyAPI/v8/fixture
   go mod edit -require=github.com/router-for-me/CLIProxyAPI/v8@v8.0.0
   go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v8="$reference"
+  cp "$reference/go.sum" .
   go mod tidy
-  go run . "$crate/tests/fixtures/manage_go.json"
+  TZ=UTC GOFLAGS=-mod=mod GOTOOLCHAIN=local /path/to/go1.26.4/bin/go run . "$crate/tests/fixtures/manage_go.json" /tmp/model_definitions.json
 )
 rm -rf "$tmp"
 ```

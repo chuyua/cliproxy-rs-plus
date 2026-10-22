@@ -207,16 +207,12 @@ async fn drive() {
         "{auth}"
     );
 
-    // OAuth: this server has no Antigravity sign-in, so the menu says so and Enter
-    // starts nothing.
+    // OAuth: every provider, Antigravity included, is offered as in Go.
     keys(&mut app, &["tab", "tab"]).await;
     assert_eq!(app.active, app::OAUTH);
     let oauth = joined(&app.oauth.vp.text());
-    assert!(oauth.contains("Antigravity (not supported by this server)"), "{oauth}");
+    assert!(oauth.contains(" 🟪 Antigravity \n"), "{oauth}");
     assert!(oauth.contains(" Codex (OpenAI) \n"), "{oauth}");
-    keys(&mut app, &["down", "down", "enter"]).await;
-    assert_eq!(app.oauth.state, super::oauth::State::Idle);
-    assert!(joined(&app.oauth.vp.text()).contains("✗ Antigravity: not supported by this server"));
     keys(&mut app, &["shift+tab", "shift+tab"]).await;
 
     // `L` switches every tab to Chinese; `q` quits outside the logs tab.

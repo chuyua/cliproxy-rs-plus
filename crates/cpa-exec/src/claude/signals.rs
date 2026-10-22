@@ -2,6 +2,7 @@
 //! (helps/claude_diagnostics.go): quota probes, title helpers, subagents, 1h cache
 //! pools, prompt turns and billing continuity tags.
 
+use cpa_core::gostr::GoStr;
 use std::borrow::Cow;
 
 use http::HeaderMap;
@@ -263,7 +264,7 @@ pub(crate) fn billing_tags(body: &str) -> (String, String) {
     let prev = tag("cc_prev_req=").filter(|v| valid_request_id(v)).unwrap_or_default();
     let prompt = tag("cc_prompt_id=")
         .filter(|v| valid_prompt_id(v))
-        .map(|v| v.to_lowercase())
+        .map(|v| v.go_lower())
         .unwrap_or_default();
     (prev, prompt)
 }

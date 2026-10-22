@@ -6,6 +6,7 @@
 use cpa_common::codex_client::{self as cc, Settings};
 use cpa_core::config::Config;
 use cpa_core::format::Format;
+use cpa_core::gostr::GoStr;
 use cpa_translate::RequestCtx;
 use http::HeaderMap;
 
@@ -35,7 +36,7 @@ impl<'a> Client<'a> {
 /// `isCodexTargetExecutor`.
 fn codex_target(executor: &str) -> bool {
     matches!(
-        executor.trim().to_lowercase().as_str(),
+        executor.trim().go_lower().as_str(),
         "codex" | "codex-websockets" | "codex_websockets"
     )
 }
@@ -60,16 +61,18 @@ fn compat_translator(from: Format, to: Format) -> Option<cpa_translate::RequestF
 ///    targets, the multi-agent v2 input rewrite (portable messages; compat also strips
 ///    `author`, `recipient` and passthrough metadata).
 /// 3. An is-compat model uses its pair's `...WithCompat` translator between summary
-///    extraction and application; anything else goes through `translate_request`.
-// ponytail: plugin NormalizeRequest hooks after a compat translator are not ported
-// (cpa_translate has none either).
+///    extraction and application, then the plugin request normalizers; anything else
+///    goes through `translate_request_tracked`.
+///
+/// Whether a plugin normalizer changed the `configuration_update` items is reported
+/// only off the compat path (`...AndUpdateIntentForExecutor`).
 pub(crate) fn translate_request(
     from: Format,
     to: Format,
     ctx: &RequestCtx<'_>,
     body: &[u8],
     client: &Client<'_>,
-) -> Result<Vec<u8>, cpa_translate::Error> {
+) -> Result<cpa_translate::Translated, cpa_translate::Error> {
     let mut payload = if codex_target(client.target_executor) {
         body.to_vec()
     } else {
@@ -83,17 +86,18 @@ pub(crate) fn translate_request(
     }
     let compat = client.is_compat.then(|| compat_translator(from, to)).flatten();
     let Some(translate) = compat else {
-        return cpa_translate::translate_request(from, to, ctx, &payload);
+        let mut out = cpa_translate::translate_request_tracked(from, to, ctx, &payload)?;
+        out.configuration_updates_changed &= !client.is_compat || (to == Format::Codex && from != Format::Claude);
+        return Ok(out);
     };
     use cpa_common::thinking::{apply_summary_config_for_model, extract_translated_summary_config};
     let summary = extract_translated_summary_config(&payload, from.as_str(), to.as_str());
     let translated = translate(ctx, &payload)?;
-    Ok(apply_summary_config_for_model(
-        &translated,
-        to.as_str(),
-        ctx.model,
-        summary,
-    ))
+    let body = apply_summary_config_for_model(&translated, to.as_str(), ctx.model, summary);
+    Ok(cpa_translate::Translated {
+        body: cpa_translate::hooks::normalize_request(from.as_str(), to.as_str(), ctx.model, body, ctx.stream),
+        configuration_updates_changed: false,
+    })
 }
 
 /// `TranslateRequestEnvelopeWithCodexMultiAgentV2`: the Responses orphan-delegation and

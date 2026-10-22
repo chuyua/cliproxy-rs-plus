@@ -815,7 +815,7 @@ fn http_status_text(status: u16) -> &'static str {
 fn error_body(status: u16, text: &str) -> String {
     let trimmed = text.trim();
     if !trimmed.is_empty() && gjson::valid(trimmed) {
-        return trimmed.to_owned();
+        return crate::errors::compact_json(trimmed);
     }
     let (kind, code) = match status {
         401 => ("authentication_error", "invalid_api_key"),
@@ -834,9 +834,10 @@ fn error_body(status: u16, text: &str) -> String {
     body
 }
 
-/// `buildResponsesWebsocketErrorPayload`: `{"type":"error","status":S,"error":{...}}`.
-// ponytail: `headers` from the error's Addon are not copied into the payload.
-pub(crate) fn error_payload(status: u16, message: &str) -> String {
+/// `buildResponsesWebsocketErrorPayload`: `{"type":"error","status":S,"error":{...}}`,
+/// with the first value of each `addon` header under `headers` (Go sets them in map
+/// order, so only a single header has a fixed position).
+pub(crate) fn error_payload(status: u16, message: &str, addon: Option<&axum::http::HeaderMap>) -> String {
     let status = if status == 0 { 500 } else { status };
     let text = if message.trim().is_empty() {
         status_text(status).to_owned()
@@ -846,6 +847,18 @@ pub(crate) fn error_payload(status: u16, message: &str) -> String {
     let body = error_body(status, &text);
     let mut payload = set_str("{}", "type", "error");
     payload = set_raw(&payload, "status", &status.to_string());
+    if let Some(addon) = addon.filter(|h| !h.is_empty()) {
+        let mut headers = String::from("{}");
+        for name in addon.keys() {
+            let Some(value) = addon.get(name) else { continue };
+            // Go's escaping, verbatim (its `\\.` splits a dotted name).
+            let key = cpa_exec::proxy::canonical_header(name.as_str())
+                .replace(r"\\", r"\\\\")
+                .replace('.', r"\\.");
+            headers = set_str(&headers, &key, &String::from_utf8_lossy(value.as_bytes()));
+        }
+        payload = set_raw(&payload, "headers", &headers);
+    }
     if gjson::valid(&body) {
         let error = gjson::get(&body, "error");
         payload = if error.exists() {

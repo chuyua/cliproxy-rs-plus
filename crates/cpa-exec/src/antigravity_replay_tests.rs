@@ -45,6 +45,7 @@ fn request(r: &Value) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::parse(s(&r["source"])).unwrap_or(Format::Gemini),
         response_format: Format::Gemini,
+        stream_payloads: false,
         requested_model: s(&r["model"]).to_owned(),
         model: s(&r["model"]).to_owned(),
         original_body: Bytes::from(s(&r["original"]).to_owned()),
@@ -61,6 +62,7 @@ fn request(r: &Value) -> ExecRequest {
         caller: Caller {
             principal: String::new(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -224,4 +226,23 @@ fn invalid_signature_400_clears_the_entry_it_read() {
             "{status} {body:?}"
         );
     }
+}
+
+/// A system prompt at encoding/json's depth limit hashes on a 2 MiB stack, with its
+/// `cache_control` markers removed at every level.
+#[test]
+fn system_lane_handles_the_depth_limit() {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let deep = |level: &str| format!(r#"{{"system":{}1{}}}"#, level.repeat(4_999), "}]".repeat(4_999));
+            let marked = system_lane(deep(r#"[{"cache_control":{"type":"ephemeral"},"t":"#).as_bytes());
+            let plain = system_lane(deep(r#"[{"t":"#).as_bytes());
+            assert_eq!(marked.len(), 32);
+            assert_eq!(marked, plain);
+            assert_ne!(plain, system_lane(deep(r#"[{"u":"#).as_bytes()));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

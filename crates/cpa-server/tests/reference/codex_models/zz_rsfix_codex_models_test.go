@@ -2,7 +2,7 @@ package cliproxy
 
 // The Codex client catalog for one config, through Go's own config synthesis, model
 // registration and handler (/v1/models?client_version=). Copy into sdk/cliproxy/ of
-// CLIProxyAPI 6fecc6e and run with RSFIX_OUT=<dir>; it writes codex_models_go.json.
+// CLIProxyAPI v8.0.35 (ae3ee3be) and run with RSFIX_OUT=<dir>; it writes codex_models_go.json.
 // Nothing is sent upstream: catalogs are built locally.
 
 import (

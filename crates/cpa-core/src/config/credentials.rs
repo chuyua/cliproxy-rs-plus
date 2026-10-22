@@ -8,9 +8,9 @@
 //! `excluded_models` (Go: comma-joined `attributes.excluded_models`) and
 //! `model_aliases` (Go: the model registry). Config-backed metadata is never persisted.
 //!
-//! ponytail: the `models_hash`/`excluded_models_hash` change-detection attributes,
-//! plugin auth parsers and Kimi domain resolution are not reproduced; nothing in the
-//! management API exposes them. Port them with the registry/Kimi executors.
+//! ponytail: the `models_hash`/`excluded_models_hash` change-detection attributes and
+//! Kimi domain resolution are not reproduced; nothing in the management API exposes
+//! them. Port them with the registry/Kimi executors.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,16 @@ use sha2::{Digest, Sha256};
 
 use super::Config;
 use crate::credential::{Credential, Source};
+use crate::gostr::GoStr;
+
+mod plugin_auth;
+use plugin_auth::Ask;
+#[cfg(feature = "test-support")]
+pub use plugin_auth::with_thread_plugin_auth_parser;
+pub use plugin_auth::{
+    ParseRequest, Parsed, ParsedAuth, PluginAuthParser, note_plugin_auth_write, on_plugin_auth_change,
+    plugin_auth_epoch, plugin_auth_parser_active, preparse_auth_dir, set_plugin_auth_parser, set_plugin_auth_providers,
+};
 
 const WEIGHT_MAX: i64 = 1_000_000;
 
@@ -102,7 +112,7 @@ pub fn normalize_excluded(models: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     models
         .iter()
-        .map(|m| m.trim().to_lowercase())
+        .map(|m| m.trim().go_lower())
         .filter(|m| !m.is_empty() && seen.insert(m.clone()))
         .collect()
 }
@@ -307,12 +317,66 @@ fn sanitized(cfg: &Config, family: &str) -> Vec<Key> {
     keys
 }
 
+/// Go `ExtractExcludedModelsFromMetadata`: a credential file's own excluded models from
+/// `excluded_models`, else the `excluded-models` alias. A string is split on commas; an
+/// array keeps its string entries. Any other type, or a non-string entry, also returns
+/// the error a write entry point rejects (the valid entries are still returned).
+pub fn excluded_models_from_metadata(meta: &Map<String, Json>) -> (Vec<String>, Option<String>) {
+    let (key, raw) = match meta.get("excluded_models") {
+        Some(raw) => ("excluded_models", raw),
+        None => match meta.get("excluded-models") {
+            Some(raw) => ("excluded-models", raw),
+            None => return (Vec::new(), None),
+        },
+    };
+    let mut invalid = None;
+    let entries: Vec<&str> = match raw {
+        Json::Null => return (Vec::new(), None),
+        Json::String(s) => s.split(',').collect(),
+        Json::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if item.is_string() {
+                    return item.as_str();
+                }
+                invalid
+                    .get_or_insert_with(|| format!("metadata {key}[{index}] must be a string, got {}", go_type(item)));
+                None
+            })
+            .collect(),
+        other => {
+            let error = format!("metadata {key} must be a string array, got {}", go_type(other));
+            return (Vec::new(), Some(error));
+        }
+    };
+    let rules = entries
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (rules, invalid)
+}
+
+/// Go's `%T` of a decoded JSON value.
+fn go_type(value: &Json) -> &'static str {
+    match value {
+        Json::Null => "<nil>",
+        Json::Bool(_) => "bool",
+        Json::Number(_) => "float64",
+        Json::String(_) => "string",
+        Json::Array(_) => "[]interface {}",
+        Json::Object(_) => "map[string]interface {}",
+    }
+}
+
 /// Go `ApplyAuthExcludedModelsMeta`: lowercase de-duplicated sorted union.
 fn excluded_union(lists: &[&[String]]) -> Vec<String> {
     let mut set: Vec<String> = lists
         .iter()
         .flat_map(|l| l.iter())
-        .map(|m| m.trim().to_lowercase())
+        .map(|m| m.trim().go_lower())
         .filter(|m| !m.is_empty())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -445,7 +509,7 @@ fn base_draft(ids: &mut Ids, kind: &str, source: &str, k: &Key, parts: &[&str]) 
 
 /// Go `util.OpenAICompatibleProviderKey`.
 pub fn openai_compat_provider(name: &str) -> String {
-    let name = name.trim().to_lowercase();
+    let name = name.trim().go_lower();
     if name.is_empty() {
         "openai-compatibility".into()
     } else if name == "openai-compatibility" || name.starts_with("openai-compatible-") {
@@ -541,7 +605,7 @@ fn synthesize(cfg: &Config) -> Vec<(Credential, Option<KeyLocation>)> {
         if k.rebuild_mid_system_message {
             d.attrs.insert("rebuild_mid_system_message".into(), "true".into());
         }
-        let profile = k.fingerprint_profile.trim().to_lowercase();
+        let profile = k.fingerprint_profile.trim().go_lower();
         if !profile.is_empty() {
             d.attrs.insert("fingerprint_profile".into(), profile);
         }
@@ -647,6 +711,18 @@ fn synthesize(cfg: &Config) -> Vec<(Credential, Option<KeyLocation>)> {
     out
 }
 
+/// Lowercased names of the enabled `openai-compatibility` entries that
+/// `SanitizeOpenAICompatibility` keeps (a base URL is required).
+pub fn openai_compat_names(cfg: &Config) -> Vec<String> {
+    groups(cfg, "openai-compatibility")
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|g| !text(g.get("base-url")).trim().is_empty() && !boolean(g.get("disabled")).unwrap_or(false))
+        .map(|g| text(g.get("name")).trim().go_lower())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 fn openai_compat(cfg: &Config, ids: &mut Ids) -> Vec<Credential> {
     let mut out = Vec::new();
     let mut index = 0;
@@ -665,7 +741,7 @@ fn openai_compat(cfg: &Config, ids: &mut Ids) -> Vec<Credential> {
         let provider_name = if name.is_empty() {
             "openai-compatibility".to_owned()
         } else {
-            name.to_lowercase()
+            name.go_lower()
         };
         let provider = openai_compat_provider(&provider_name);
         let group_key = Key {
@@ -785,7 +861,7 @@ pub fn resolve_api_key_entry(cfg: &Config, family: &str, c: &Credential) -> Opti
         return None;
     }
     let attr = |k: &str| c.attributes.get(k).map(|v| v.trim()).unwrap_or_default();
-    let fold = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    let fold = |a: &str, b: &str| a.trim().go_eq_fold(b.trim());
     let (key, base) = (attr("api_key"), attr("base_url"));
     let matches = |e: &ApiKeyEntry| {
         let (k, b) = (e.api_key.trim(), e.base_url.trim());
@@ -828,7 +904,7 @@ pub fn resolve_api_key_entry(cfg: &Config, family: &str, c: &Credential) -> Opti
 /// matches; callers check that the credential is an API key.
 pub fn api_key_config_proxy(cfg: &Config, c: &Credential) -> String {
     let attr = |k: &str| c.attributes.get(k).map(|v| v.trim()).unwrap_or_default();
-    let fold = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    let fold = |a: &str, b: &str| a.go_eq_fold(b);
     let (key, base) = (attr("api_key"), attr("base_url"));
     let compat = attr("compat_name");
     if !compat.is_empty() || fold(c.provider.trim(), "openai-compatibility") {
@@ -860,7 +936,7 @@ pub fn api_key_config_proxy(cfg: &Config, c: &Credential) -> String {
         }
         return String::new();
     }
-    let family = match c.provider.trim().to_lowercase().as_str() {
+    let family = match c.provider.trim().go_lower().as_str() {
         "gemini" => "gemini",
         "gemini-interactions" => "interactions",
         "claude" => "claude",
@@ -955,8 +1031,35 @@ pub fn parse_weight(value: &Json) -> Result<i64, String> {
 }
 
 /// Builds one auth-file credential as Go's `FileSynthesizer` does. `Ok(None)` is a
-/// silently ignored file; `Err` is a skipped file worth a warning.
-pub fn from_file(cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<Credential>, String> {
+/// silently ignored file; `Err` is a skipped file worth a warning. The config (Go's
+/// synthesis context) no longer shapes a file credential: global excluded models apply
+/// at registration (Go b015f208). Like Go's management upload synthesis, this does not
+/// ask plugin auth providers; only [`scan_auth_dir`] does.
+pub fn from_file(_cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<Credential>, String> {
+    Ok(match file_credentials(None, auth_dir, path, data)? {
+        Some(FileCredentials::One(c)) => Some(c),
+        Some(FileCredentials::Plugin(_) | FileCredentials::Unapplied(_) | FileCredentials::Deferred) | None => None,
+    })
+}
+
+/// What one auth file synthesizes to.
+enum FileCredentials {
+    One(Credential),
+    /// What a plugin parsed: possibly none (the plugin suppresses the file) or several.
+    Plugin(Vec<Credential>),
+    /// No cached plugin answer for these bytes yet ([`plugin_auth::Ask::Cached`]).
+    Deferred,
+    /// The answer of the parse whose own `host.auth.save` wrote these bytes: published,
+    /// but the plugin has yet to parse them.
+    Unapplied(Vec<Credential>),
+}
+
+fn file_credentials(
+    parser: Option<Ask<'_>>,
+    auth_dir: &Path,
+    path: &Path,
+    data: &[u8],
+) -> Result<Option<FileCredentials>, String> {
     if data.is_empty() {
         return Ok(None);
     }
@@ -973,7 +1076,14 @@ pub fn from_file(cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Res
         .and_then(Json::as_str)
         .unwrap_or_default()
         .trim()
-        .to_lowercase();
+        .go_lower();
+    // Go asks the plugin auth parser before the built-in synthesizer, which a plugin
+    // owning the type (or, without one, any auth provider) replaces.
+    if let Some(parser) = parser
+        && let Some(parsed) = plugin_auth::credentials(parser, &meta, &provider, path, data)
+    {
+        return parsed.map(Some);
+    }
     if provider.is_empty() || provider == "gemini" || provider == "gemini-cli" {
         return Ok(None);
     }
@@ -1016,18 +1126,15 @@ pub fn from_file(cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Res
     if let Some(aliases) = oauth_aliases(meta.get("model_aliases")) {
         attrs.insert("model_aliases".into(), aliases);
     }
-    let per_account: Vec<String> = match meta.get("excluded_models") {
-        Some(Json::Array(list)) => list
-            .iter()
-            .filter_map(Json::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect(),
-        _ => Vec::new(),
-    };
-    let global = oauth_excluded(cfg).remove(&provider).unwrap_or_default();
-    let combined = excluded_union(&[&per_account, &global]);
+    // Invalid rules must not drop the credential: keep the valid entries and warn (Go
+    // 1a28c61e). Only the credential's own rules are stored; the global
+    // `oauth-excluded-models` apply at registration when there are none (Go b015f208).
+    let (per_account, invalid) = excluded_models_from_metadata(&meta);
+    if let Some(error) = invalid {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        tracing::warn!(%error, "ignoring invalid excluded models in auth file {file}");
+    }
+    let combined = excluded_union(&[&per_account]);
     if !combined.is_empty() {
         attrs.insert("excluded_models".into(), combined.join(","));
     }
@@ -1035,7 +1142,7 @@ pub fn from_file(cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Res
     if let Some(p) = meta
         .get("fingerprint_profile")
         .and_then(Json::as_str)
-        .map(|s| s.trim().to_lowercase())
+        .map(|s| s.trim().go_lower())
         && !p.is_empty()
     {
         attrs.insert("fingerprint_profile".into(), p);
@@ -1083,7 +1190,7 @@ pub fn from_file(cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Res
         revision: 0,
     };
     cred.refresh_derived();
-    Ok(Some(cred))
+    Ok(Some(FileCredentials::One(cred)))
 }
 
 /// Go `buildAuthFromFileData`'s fallback for an uploaded file no synthesizer claims:
@@ -1136,9 +1243,9 @@ fn oauth_aliases(raw: Option<&Json>) -> Option<String> {
         .filter_map(|e| {
             let name = e.get("name")?.as_str()?.trim();
             let alias = e.get("alias")?.as_str()?.trim();
-            (!name.is_empty() && !alias.is_empty() && !name.eq_ignore_ascii_case(alias)).then_some((name, alias, e))
+            (!name.is_empty() && !alias.is_empty() && !name.go_eq_fold(alias)).then_some((name, alias, e))
         })
-        .filter(|(_, alias, _)| seen.insert(alias.to_lowercase()))
+        .filter(|(_, alias, _)| seen.insert(alias.go_lower()))
         .map(|(name, alias, e)| {
             let mut out = Map::new();
             out.insert("name".into(), name.into());
@@ -1196,7 +1303,7 @@ fn kimi_attributes(provider: &str, meta: &Map<String, Json>, attrs: &mut BTreeMa
 
 /// Go `IsKimiAIDomain` / `IsKimiComDomain`.
 fn kimi_domain(s: &str) -> Option<&'static str> {
-    let d = s.trim().to_lowercase();
+    let d = s.trim().go_lower();
     if matches!(d.as_str(), "kimi.ai" | "ai" | "kimi-ai") || d.ends_with(".kimi.ai") {
         Some(KIMI_AI)
     } else if matches!(d.as_str(), "kimi.com" | "com" | "kimi") || d.ends_with(".kimi.com") {
@@ -1208,7 +1315,7 @@ fn kimi_domain(s: &str) -> Option<&'static str> {
 
 /// Go `isKimiAIHost` / `isKimiComHost`: a URL Go cannot parse classifies as neither.
 fn kimi_url_domain(raw: &str) -> Option<&'static str> {
-    let host = super::go_url::parse(raw.trim())?.hostname().trim().to_lowercase();
+    let host = super::go_url::parse(raw.trim())?.hostname().trim().go_lower();
     if host == KIMI_AI || host.ends_with(".kimi.ai") {
         Some(KIMI_AI)
     } else if host == KIMI_COM || host.ends_with(".kimi.com") {
@@ -1254,7 +1361,7 @@ pub fn oauth_excluded(cfg: &Config) -> HashMap<String, Vec<String>> {
         .and_then(Value::as_mapping)
     {
         for (provider, models) in map {
-            let provider = text(Some(provider)).trim().to_lowercase();
+            let provider = text(Some(provider)).trim().go_lower();
             let models = normalize_excluded(&strings(Some(models)));
             if !provider.is_empty() && !models.is_empty() {
                 out.insert(provider, models);
@@ -1264,36 +1371,123 @@ pub fn oauth_excluded(cfg: &Config) -> HashMap<String, Vec<String>> {
     out
 }
 
-/// Every auth-dir JSON file (case-insensitive extension, top level only), sorted by ID.
+/// Every auth-dir JSON file (case-insensitive extension, top level only) that is or
+/// links to a regular file, sorted by ID.
 /// Like Go's `FileSynthesizer`, an unreadable or missing directory is an empty set:
 /// it must never block publishing the rest of a valid config.
 pub fn from_auth_dir(cfg: &Config) -> Vec<Credential> {
+    scan_auth_dir(cfg).credentials
+}
+
+/// What one read of the auth folder found.
+#[derive(Default)]
+pub struct AuthScan {
+    pub credentials: Vec<Credential>,
+    /// The files this read found empty or not valid JSON (Go v8.0.35
+    /// `SynthesisContext.IncompleteFiles`); a caller keeps their last good credentials.
+    pub incomplete: HashSet<PathBuf>,
+    /// The SHA-256 of every file read, so the watcher records what it applied rather than
+    /// what it observed before a later write. Deferred files are left out.
+    pub read: BTreeMap<PathBuf, [u8; 32]>,
+    /// The files no plugin auth provider has answered for yet ([`preparse_auth_dir`]).
+    /// Go's watcher asks the plugin before anything is published, so a caller keeps a
+    /// file's current credentials and publishes nothing new for it; the watcher reloads
+    /// the file again.
+    pub deferred: HashSet<PathBuf>,
+    /// Files published from the answer of a parse that wrote their current bytes itself
+    /// (`host.auth.save` from inside `auth.parse`): plugins have yet to parse these bytes,
+    /// so the watcher does not record them as applied and parses them on its next tick.
+    pub unapplied: HashSet<PathBuf>,
+}
+
+/// [`from_auth_dir`], with the files it found incomplete and the hashes of what it read.
+/// A file that cannot be read is skipped, as in Go's full scan.
+///
+/// While a plugin offers an auth provider, only answers [`preparse_auth_dir`] cached
+/// are used, so callers may hold locks a plugin waits on; other files are deferred.
+pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
+    scan_with(cfg, plugin_auth::current().map(|_| Ask::Cached))
+}
+
+fn scan_with(cfg: &Config, parser: Option<Ask<'_>>) -> AuthScan {
+    let mut scan = AuthScan::default();
     let entries = match std::fs::read_dir(&cfg.auth_dir) {
         Ok(entries) => entries,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot read auth dir");
             }
-            return Vec::new();
+            return scan;
         }
     };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
+    // With a plugin parser, Go's traversal: file-name order (`os.ReadDir`), and the last
+    // auth read under an ID wins. Without one, nothing changes.
+    let (mut plain, mut sorted);
+    let entries: &mut dyn Iterator<Item = std::fs::DirEntry> = if parser.is_some() {
+        let mut all: Vec<_> = entries.flatten().collect();
+        all.sort_by_key(std::fs::DirEntry::file_name);
+        sorted = all.into_iter();
+        &mut sorted
+    } else {
+        plain = entries.flatten();
+        &mut plain
+    };
+    for entry in entries {
         let path: PathBuf = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir())
-            || !entry.file_name().to_string_lossy().to_lowercase().ends_with(".json")
-        {
+        if !entry.file_name().to_string_lossy().go_lower().ends_with(".json") {
             continue;
         }
-        let Ok(data) = std::fs::read(&path) else { continue };
-        match from_file(cfg, &cfg.auth_dir, &path, &data) {
-            Ok(Some(c)) => out.push(c),
+        let Some(data) = read_regular(&path) else { continue };
+        scan.read.insert(path.clone(), Sha256::digest(&data).into());
+        if serde_json::from_slice::<serde::de::IgnoredAny>(&data).is_err() {
+            scan.incomplete.insert(path);
+            continue;
+        }
+        match file_credentials(parser, &cfg.auth_dir, &path, &data) {
+            Ok(Some(FileCredentials::One(c))) => scan.credentials.push(c),
+            Ok(Some(FileCredentials::Plugin(all))) => scan.credentials.extend(all),
+            Ok(Some(FileCredentials::Unapplied(all))) => {
+                scan.credentials.extend(all);
+                scan.unapplied.insert(path);
+            }
+            Ok(Some(FileCredentials::Deferred)) => {
+                scan.read.remove(&path);
+                scan.deferred.insert(path);
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping auth file"),
         }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    scan.credentials.sort_by(|a, b| a.id.cmp(&b.id));
+    if parser.is_some() {
+        // The sort is stable: of equal IDs, the last read is last.
+        let all = std::mem::take(&mut scan.credentials);
+        for c in all {
+            if scan.credentials.last().is_some_and(|last| last.id == c.id) {
+                scan.credentials.pop();
+            }
+            scan.credentials.push(c);
+        }
+    }
+    scan
+}
+
+/// The bytes of `path` when it is, or links to, a regular file: the rule the auth-folder
+/// watcher observes by, so a credential is never kept for an entry the watcher cannot
+/// see go away (a link to `/dev/null`, a FIFO, a folder). The type is checked before
+/// opening (a FIFO would block) and again on the opened file, which is the one read.
+pub fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).ok()?;
+    Some(data)
 }
 
 /// All runtime credentials for a config: auth files, then config API keys.
@@ -1353,7 +1547,7 @@ pub fn auth_index(c: &Credential) -> String {
     let seed = if !attr("auth_index_seed").is_empty() {
         format!("auth_index_seed:{}", attr("auth_index_seed"))
     } else {
-        let provider = c.provider.trim().to_lowercase();
+        let provider = c.provider.trim().go_lower();
         let mut file = match &c.source {
             Source::File(p) => p.display().to_string(),
             Source::Config { .. } | Source::Runtime => String::new(),
@@ -1366,11 +1560,11 @@ pub fn auth_index(c: &Credential) -> String {
         if file.is_empty() {
             file = c.id.trim().to_owned();
         }
-        if file.to_lowercase().ends_with(".json") {
+        if file.go_lower().ends_with(".json") {
             let abs = std::path::absolute(&file).unwrap_or_else(|_| PathBuf::from(&file));
             let kind = c
                 .str("type")
-                .map(|t| t.trim().to_lowercase())
+                .map(|t| t.trim().go_lower())
                 .filter(|t| !t.is_empty())
                 .unwrap_or(provider);
             format!("{kind}:{}", clean(&abs).display())
@@ -1492,5 +1686,107 @@ mod tests {
         assert_eq!(api_key_config_proxy(&cfg, second), "direct");
         let compat = creds.iter().find(|c| c.attributes.contains_key("compat_name")).unwrap();
         assert_eq!(api_key_config_proxy(&cfg, compat), "http://one.example.invalid:1");
+    }
+
+    /// Go `TestExtractExcludedModelsFromMetadata`.
+    #[test]
+    fn excluded_models_read_from_credential_metadata() {
+        let read = |json: &str| {
+            let meta: Map<String, Json> = serde_json::from_str(json).unwrap();
+            excluded_models_from_metadata(&meta)
+        };
+        let ok = |json: &str, want: &[&str]| {
+            assert_eq!(
+                read(json),
+                (want.iter().map(|s| s.to_string()).collect(), None),
+                "{json}"
+            )
+        };
+        ok("{}", &[]);
+        ok(r#"{"excluded_models":null}"#, &[]);
+        ok(r#"{"excluded_models":[" a ","","b"]}"#, &["a", "b"]);
+        ok(
+            r#"{"excluded_models":" gemini-pro-agent , ,gemini-3-flash"}"#,
+            &["gemini-pro-agent", "gemini-3-flash"],
+        );
+        ok(r#"{"excluded_models":"  "}"#, &[]);
+        ok(r#"{"excluded-models":"a,b"}"#, &["a", "b"]);
+        ok(r#"{"excluded_models":[],"excluded-models":["legacy"]}"#, &[]);
+        for (json, want, error) in [
+            (
+                r#"{"excluded_models":123}"#,
+                &[][..],
+                "metadata excluded_models must be a string array, got float64",
+            ),
+            (
+                r#"{"excluded-models":true}"#,
+                &[],
+                "metadata excluded-models must be a string array, got bool",
+            ),
+            (
+                r#"{"excluded_models":{}}"#,
+                &[],
+                "metadata excluded_models must be a string array, got map[string]interface {}",
+            ),
+            (
+                r#"{"excluded_models":["a",123," b ",false]}"#,
+                &["a", "b"],
+                "metadata excluded_models[1] must be a string, got float64",
+            ),
+            (
+                r#"{"excluded_models":[null]}"#,
+                &[],
+                "metadata excluded_models[0] must be a string, got <nil>",
+            ),
+        ] {
+            let want: Vec<String> = want.iter().map(|s: &&str| s.to_string()).collect();
+            assert_eq!(read(json), (want, Some(error.to_owned())), "{json}");
+        }
+    }
+
+    /// Go's synthesizer lowercases with `strings.ToLower`, which maps U+0130 (İ) to a
+    /// plain `i`; Rust's `to_lowercase` would give `i` plus a combining dot. Expected
+    /// values are Go's: `strings.ToLower("HİGH") == "high"`.
+    #[test]
+    fn file_type_and_exclusions_lowercase_like_go() {
+        let cfg = Config::default();
+        let raw = r#"{"type":"HİGH","excluded_models":["MİNİ"]}"#;
+        let c = from_file(&cfg, Path::new("/auth"), Path::new("/auth/a.json"), raw.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.provider, "high");
+        assert_eq!(c.attributes.get("excluded_models").map(String::as_str), Some("mini"));
+    }
+
+    /// Go `TestSynthesizeAuthFileKeepsCredentialWithInvalidExcludedModels` and
+    /// `TestSynthesizeAuthFileDoesNotPersistGlobalOAuthExclusions`: a file credential
+    /// stores only its own rules, normalized, and invalid rules never drop it.
+    #[test]
+    fn file_credentials_store_only_their_own_excluded_models() {
+        let cfg = Config::parse("oauth:\n  excluded-models:\n    claude: [global-model]\n").unwrap();
+        let rules = |raw: &str| {
+            let c = from_file(&cfg, Path::new("/auth"), Path::new("/auth/a.json"), raw.as_bytes())
+                .unwrap()
+                .expect("the credential still loads");
+            c.attributes.get("excluded_models").cloned()
+        };
+        for raw in [
+            r#"{"type":"claude"}"#,
+            r#"{"type":"claude","excluded_models":[]}"#,
+            r#"{"type":"claude","excluded_models":[" ","\t"]}"#,
+            r#"{"type":"claude","excluded_models":123}"#,
+            r#"{"type":"claude","excluded_models":{"x":1}}"#,
+            r#"{"type":"claude","excluded_models":[null]}"#,
+        ] {
+            assert_eq!(rules(raw), None, "{raw}: global rules apply at registration");
+        }
+        let own = |raw: &str, want: &str| assert_eq!(rules(raw).as_deref(), Some(want), "{raw}");
+        own(r#"{"type":"claude","excluded_models":["Own-Model"]}"#, "own-model");
+        own(r#"{"type":"claude","excluded_models":["Model-A",null,1]}"#, "model-a");
+        own(
+            r#"{"type":"claude","excluded_models":"Model-B,model-a, MODEL-B"}"#,
+            "model-a,model-b",
+        );
+        own(r#"{"type":"claude","excluded-models":["Alias-*"]}"#, "alias-*");
     }
 }

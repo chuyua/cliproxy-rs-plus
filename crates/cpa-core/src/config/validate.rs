@@ -75,14 +75,22 @@ fn in_flight(section: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
-/// `CodexLiveMediaRelayConfig.Validate`; only an enabled relay is checked. The UDP
-/// ports are Go `uint16` fields, so decoding rejects out-of-range values first.
-fn live_media_relay(section: Option<&Value>) -> Result<()> {
+/// The Codex Live media relay's UDP ports are Go `uint16` fields, so decoding rejects
+/// out-of-range values whether or not the relay is enabled.
+pub(super) fn decoded(doc: &Value) -> Result<()> {
+    let section = ["oauth", "providers", "codex", "live-media-relay"]
+        .iter()
+        .try_fold(doc, |node, part| node.get(*part));
     for key in ["udp-port-min", "udp-port-max"] {
         if !(0..=65_535).contains(&int(section, key, 0)) {
             bail!("codex.live-media-relay.{key} must be between 0 and 65535");
         }
     }
+    Ok(())
+}
+
+/// `CodexLiveMediaRelayConfig.Validate`; only an enabled relay is checked.
+fn live_media_relay(section: Option<&Value>) -> Result<()> {
     if !section
         .and_then(|s| s.get("enabled"))
         .and_then(Value::as_bool)

@@ -4,7 +4,7 @@
 //! `streamWithPluginExecutor`, and internal/pluginhost/adapters_executors.go's
 //! `executorAdapter` called without an auth).
 //!
-//! ponytail: usage records for plugin executors are not published; plugin response translators (`hasResponseTranslator`) are counted
+//! ponytail: plugin response translators (`hasResponseTranslator`) are counted
 //! in negotiation but not called, and the Responses SSE validation of plugin streams is
 //! the route's own.
 
@@ -55,11 +55,20 @@ pub(crate) fn query() -> String {
 struct Scope(RequestScope);
 
 impl Scope {
-    fn new(trace: &Trace) -> Self {
+    fn new(trace: &Trace, call: &Call) -> Self {
+        let inherited = super::model_callbacks::context().map(|c| c.scope).unwrap_or_default();
+        let (api_key, access_provider) = super::model_callbacks::usage_identity(Some(&call.caller), &inherited);
         Self(RequestScope {
             request_id: trace.request_id(),
             capture: trace.capture(),
-            ..Default::default()
+            cancel: inherited.cancel.child_token(),
+            headers: super::go_request_header(&call.headers),
+            query: super::go_values(&query()),
+            pinned_auth_id: call.pinned(),
+            execution_session: call.execution_session.clone(),
+            request_path: call.request_path.clone(),
+            api_key,
+            access_provider,
         })
     }
 }
@@ -75,6 +84,7 @@ pub(crate) fn handler_type(call: &Call) -> &'static str {
     match call.media.as_ref().map(|m| m.kind) {
         Some(crate::dispatch::MediaKind::Images) => "openai-image",
         Some(crate::dispatch::MediaKind::Videos) => "openai-video",
+        Some(crate::dispatch::MediaKind::Speech) => "openai-speech",
         None => call.entry.as_str(),
     }
 }
@@ -140,7 +150,8 @@ fn available_providers(rt: &Runtime) -> Vec<String> {
 /// target decides where it goes.
 pub(crate) async fn route(rt: &Runtime, call: &Call, query: &str, trace: &Trace) -> Option<Route> {
     let host = rt.plugins();
-    if !host.has_model_routers("") {
+    let skip = super::model_callbacks::skip_plugin();
+    if !host.has_model_routers(&skip) {
         return None;
     }
     let mut metadata = request_metadata(call);
@@ -155,9 +166,9 @@ pub(crate) async fn route(rt: &Runtime, call: &Call, query: &str, trace: &Trace)
         metadata,
         ..Default::default()
     };
-    let scope = Scope::new(trace);
+    let scope = Scope::new(trace, call);
     let resp = host
-        .route_model(request, "", &available_providers(rt), &scope.0)
+        .route_model(request, &skip, &available_providers(rt), &scope.0)
         .await?;
     Some(match resp.target_kind.as_str() {
         "provider" => Route::Provider {
@@ -195,7 +206,7 @@ pub(crate) async fn execute(
     }
     let mut call = call.clone();
     let model = call.model.clone();
-    let hooks = super::interceptors::start(rt, trace, &mut call, &model, false).await?;
+    let hooks = super::interceptors::start(rt, trace, &mut call, &model).await?;
     let result = run_executor(rt, &mut call, plugin_id, query, trace, hooks.as_deref()).await;
     let result = match hooks {
         Some(hooks) => {
@@ -206,7 +217,11 @@ pub(crate) async fn execute(
     };
     // The OpenAI handler frames each chunk after the stream interceptors saw it.
     match result {
-        Ok(Done::Stream { headers, first, rest }) if call.response == Format::OpenAI && call.media.is_none() => {
+        Ok(Done::Stream { headers, first, rest })
+            if call.response == Format::OpenAI
+                && call.media.is_none()
+                && super::model_callbacks::context().is_none() =>
+        {
             Ok(Done::Stream {
                 headers,
                 first: first.and_then(|f| openai_frame(&f)),
@@ -260,6 +275,7 @@ async fn run_executor(
             &call.body,
             stream,
         )
+        .map_err(Failure::Exec)?
     };
     let request = ExecutorRequest {
         model: call.model.clone(),
@@ -274,7 +290,7 @@ async fn run_executor(
         metadata: execution_metadata(call, &call.model),
         ..Default::default()
     };
-    let scope = Scope::new(trace);
+    let scope = Scope::new(trace, call);
     if !stream {
         let resp = if count {
             host.executor_count_tokens(&adapter, &request, &scope.0).await
@@ -291,7 +307,15 @@ async fn run_executor(
         .executor_execute_stream(&adapter, &request, &scope.0)
         .await
         .map_err(call_failure)?;
-    let mut rest = translate_stream(negotiated, request, opened.chunks, scope);
+    // Go creates no usage reporter without an auth.
+    let mut rest = translate_stream(
+        negotiated,
+        request,
+        opened.chunks,
+        scope,
+        |error| ExecError::local(0, FailureScope::Request, error),
+        None,
+    );
     let first = match rest.next().await {
         Some(Ok(event)) => Some(event),
         Some(Err(error)) => return Err(Failure::Exec(error)),
@@ -304,10 +328,197 @@ async fn run_executor(
     })
 }
 
-/// Go's execution metadata (`pluginExecutorRequest`, `executeWithAuthManager`): the
+/// Go `executorAdapter.Execute`, `ExecuteStream` and `CountTokens` with an auth: a
+/// credential whose provider a plugin executor registered, chosen by the ordinary
+/// selection loop. `adapter` is the registered executor; a plugin replaced since then
+/// does not serve it (Go `pluginIdentityCurrent`). The answer is in the client's
+/// format, as built-in executors give it.
+/// Usage goes through the attempt's reporter as Go's `NewExecutorUsageReporter` takes
+/// it: parsed from the plugin's own output format, not the client's.
+pub(crate) async fn execute_credential(
+    rt: &Runtime,
+    call: &Call,
+    adapter: &cpa_plugin::executor::Adapter,
+    credential: &cpa_core::credential::Credential,
+    private: &[String],
+    req: cpa_core::exec::ExecRequest,
+) -> Result<cpa_core::exec::ExecResponse, ExecError> {
+    let host = rt.plugins();
+    let count = req.operation == Operation::CountTokens;
+    let stream = req.stream && !count;
+    let source = handler_type(call);
+    let response = if count { source } else { response_type(call) };
+    // Go creates the attempt's reporter before `prepareExecutorCall`, so a failure to
+    // negotiate or translate is recorded as the plugin executor's; counting has none.
+    if !count {
+        req.usage.plugin_executor(&adapter.provider);
+    }
+    let negotiated = adapter
+        .negotiate(source, response, host.has_response_translator())
+        .map_err(|e| attempt_error(0, e))?;
+    let payload = if negotiated.input_requested == negotiated.input {
+        req.body.clone()
+    } else {
+        translate_request(
+            &negotiated.input_requested,
+            &negotiated.input,
+            &req.model,
+            &req.body,
+            stream,
+        )?
+    };
+    // Go `storageJSONFromAuth` without a plugin token storage: the metadata as JSON.
+    let auth_metadata: Metadata = credential.metadata.clone().into_iter().collect();
+    // Go `applyRequestAfterAuthInterceptor` rewrites only the path in the metadata; the
+    // handler's reasoning effort, service tier and generate facts stay.
+    let mut metadata = execution_metadata(call, &req.model);
+    if !req.request_path.trim().is_empty() {
+        metadata.insert("request_path".into(), Value::String(req.request_path.trim().to_owned()));
+    }
+    let request = ExecutorRequest {
+        auth_id: credential.id.clone(),
+        auth_provider: credential.provider.clone(),
+        model: req.model.clone(),
+        format: negotiated.output.clone(),
+        stream,
+        alt: req.alt.clone().unwrap_or_default(),
+        headers: super::go_request_header(&req.headers),
+        query: super::go_values(&query()),
+        original_request: req.original_body.clone(),
+        source_format: negotiated.input.clone(),
+        payload,
+        metadata,
+        storage_json: Bytes::from(cpa_plugin::gojson::to_vec(&auth_metadata)),
+        auth_metadata,
+        auth_attributes: plugin_attributes(credential, private),
+    };
+    // The router path's scope (`Scope::new`) with the post-auth headers and path, so
+    // nested `host.model.*` calls keep the pin, session and request context.
+    let inherited = super::model_callbacks::context().map(|c| c.scope).unwrap_or_default();
+    let (api_key, access_provider) = super::model_callbacks::usage_identity(Some(&call.caller), &inherited);
+    let scope = Scope(RequestScope {
+        request_id: crate::observability::current_request_id().unwrap_or_default(),
+        capture: req.capture().clone(),
+        cancel: inherited.cancel.child_token(),
+        headers: super::go_request_header(&req.headers),
+        query: super::go_values(&query()),
+        pinned_auth_id: call.pinned(),
+        execution_session: call.execution_session.clone(),
+        request_path: req.request_path.clone(),
+        api_key,
+        access_provider,
+    });
+    // Go `SetTranslatedReasoningEffort` and `StartResponseTTFT`; counting has no
+    // reporter.
+    if !count {
+        req.usage.request_for(&negotiated.input, &request.payload);
+        req.usage.round_trip_started();
+    }
+    if !stream {
+        let resp = if count {
+            host.executor_count_tokens(adapter, &request, &scope.0).await
+        } else {
+            host.executor_execute(adapter, &request, &scope.0).await
+        }
+        .map_err(|e| attempt_error(e.status(), e.to_string()))?;
+        if !count {
+            // Go `RecordFirstPacket`, `Publish` and `EnsurePublished`.
+            req.usage.token_event(false);
+            req.usage.plugin_response_body(&negotiated.output, &resp.payload);
+            req.usage.publish();
+        }
+        return Ok(cpa_core::exec::ExecResponse {
+            status: 200,
+            headers: header_map(&resp.headers),
+            body: cpa_core::exec::ResponseBody::Buffered(translate_response(&negotiated, &request, resp.payload)),
+        });
+    }
+    let opened = host
+        .executor_execute_stream(adapter, &request, &scope.0)
+        .await
+        .map_err(|e| attempt_error(e.status(), e.to_string()))?;
+    let headers = header_map(&opened.headers);
+    Ok(cpa_core::exec::ExecResponse {
+        status: 200,
+        headers,
+        body: cpa_core::exec::ResponseBody::Stream(translate_stream(
+            negotiated,
+            request,
+            opened.chunks,
+            scope,
+            |error| attempt_error(0, error),
+            Some(req.usage.clone()),
+        )),
+    })
+}
+
+/// A credential-bound plugin executor's failure as an attempt on that credential. Go's
+/// `rpcError` carries a status but neither `IsRequestScoped` nor `IsCredentialScoped`,
+/// and a plain error (an unavailable executor, a failed negotiation, an undecodable
+/// answer) carries neither; the auth manager classifies both by status and body. So
+/// the error is model-scoped with the plugin's status (0 when it gave none) and the
+/// shared classifier (`classify.rs`) decides failover, cooldown and retry rounds,
+/// including Go's message fallbacks for statusless errors.
+fn attempt_error(status: u16, message: impl Into<String>) -> ExecError {
+    ExecError::local(status, FailureScope::Model, message)
+}
+
+/// What a plugin scheduler learns about a handler request (Go `schedulerOptions` at
+/// `pickNextMixedLegacy`): the client headers, and the execution metadata with the
+/// session-affinity namespace `mixed` and, under session affinity, the route model.
+pub(crate) fn scheduler_context(
+    call: &Call,
+    model: &str,
+    session_affinity: bool,
+    derived: Option<&str>,
+) -> super::SchedulerContext {
+    let mut metadata = execution_metadata(call, model);
+    // Go `session.Enrich` (its branches, not the affinity resolver's): a client-named
+    // session (`hasExplicitSession`) is canonical with its parent; otherwise the
+    // execution session is; otherwise only the derived identity is named.
+    let bound = |s: &str| Value::String(cpa_common::session::bound_session_identity(s));
+    let execution = call
+        .execution_session
+        .as_deref()
+        .map(cpa_common::session::normalize_explicit_id)
+        .unwrap_or_default();
+    if cpa_common::session::has_explicit_session(&call.headers, &call.body) {
+        let execution = (!execution.is_empty()).then_some(execution.as_str());
+        if let Some(info) = cpa_common::session::extract_session_info(&call.headers, &call.body, execution)
+            .filter(|info| !info.session_id.is_empty())
+        {
+            metadata.insert("canonical_session_id".into(), bound(&info.session_id));
+            if !info.parent_session_id.is_empty() && info.parent_session_id != info.session_id {
+                metadata.insert("parent_session_id".into(), bound(&info.parent_session_id));
+            }
+        }
+    } else if !execution.is_empty() {
+        metadata.insert("canonical_session_id".into(), bound(&format!("execution:{execution}")));
+    } else if let Some(derived) = derived.filter(|d| !d.is_empty()) {
+        metadata.insert("derived_session_id".into(), Value::String(derived.to_owned()));
+    }
+    metadata.insert("session_affinity_provider".into(), Value::String("mixed".into()));
+    let affinity_model = if session_affinity {
+        model.to_owned()
+    } else {
+        String::new()
+    };
+    metadata.insert("session_affinity_model".into(), Value::String(affinity_model));
+    super::SchedulerContext {
+        stream: call.stream,
+        options: cpa_plugin::api::SchedulerOptions {
+            headers: super::go_request_header(&call.headers),
+            metadata,
+        },
+    }
+}
+
 /// request context plus the request's model facts; `model` is the resolved model.
 pub(crate) fn execution_metadata(call: &Call, model: &str) -> Metadata {
     let mut meta = request_metadata(call);
+    if super::model_callbacks::context().is_some() {
+        meta.insert("source".into(), Value::String("plugin_host_model_callback".into()));
+    }
     meta.insert("requested_model".into(), Value::String(call.model.clone()));
     if let Some(model) = call.selection_model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         meta.insert("auth_selection_model".into(), Value::String(model.to_owned()));
@@ -331,17 +542,14 @@ pub(crate) fn execution_metadata(call: &Call, model: &str) -> Metadata {
     meta
 }
 
-/// Go `sdktranslator.TranslateRequest` between two executor format names.
-/// ponytail: a format outside the built-in set passes the body through; Go would still
-/// rewrite a differing top-level `model`.
-fn translate_request(from: &str, to: &str, model: &str, body: &Bytes, stream: bool) -> Bytes {
-    let (Some(from), Some(to)) = (Format::parse(from), Format::parse(to)) else {
-        return body.clone();
-    };
+/// Go `sdktranslator.TranslateRequestEnvelope` between two executor format names
+/// (`prepareExecutorCall`). A refusal, such as an unsupported content part, is a
+/// request-scoped 400 and nothing is sent, as on the built-in path.
+fn translate_request(from: &str, to: &str, model: &str, body: &Bytes, stream: bool) -> Result<Bytes, ExecError> {
     let ctx = cpa_translate::RequestCtx { model, stream };
-    cpa_translate::translate_request(from, to, &ctx, body)
+    cpa_translate::translate_request_named(from, to, &ctx, body)
         .map(Bytes::from)
-        .unwrap_or_else(|_| body.clone())
+        .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
 
 /// The plugin's `http.Header` as response headers (invalid names or values dropped).
@@ -377,10 +585,6 @@ fn translate_response(n: &Negotiated, req: &ExecutorRequest, payload: Bytes) -> 
     let pair = Format::parse(&n.requested)
         .zip(Format::parse(&n.output))
         .and_then(|(to, from)| cpa_translate::pair(to, from));
-    let Some(pair) = pair else {
-        // Go's registry returns an unregistered pair's body unchanged.
-        return ensure_usage(responses, payload);
-    };
     let original = if req.original_request.is_empty() {
         &req.payload
     } else {
@@ -391,7 +595,13 @@ fn translate_response(n: &Negotiated, req: &ExecutorRequest, payload: Bytes) -> 
         original_request: original,
         translated_request: &req.payload,
     };
-    let out = (pair.non_stream)(&ctx, &payload).map(Bytes::from).unwrap_or(payload);
+    let out = match pair {
+        Some(pair) => (pair.non_stream)(&ctx, &payload).map(Bytes::from).unwrap_or(payload),
+        // Go's registry returns an unregistered pair's body unchanged, after the plugin
+        // response hooks.
+        None => cpa_translate::hooks::unregistered_non_stream(&n.output, &n.requested, &ctx, &payload)
+            .map_or(payload, Bytes::from),
+    };
     ensure_usage(responses, out)
 }
 
@@ -402,24 +612,39 @@ fn translate_stream(
     req: ExecutorRequest,
     chunks: BoxStream<'static, Chunk>,
     scope: Scope,
+    chunk_error: fn(String) -> ExecError,
+    usage: Option<cpa_core::exec::UsageSink>,
 ) -> ExecStream {
     let translating = !n.requested.is_empty() && n.output != n.requested;
-    let formats = Format::parse(&n.requested).zip(Format::parse(&n.output));
-    let translator = formats.filter(|_| translating).and_then(|(to, from)| {
-        let original = if req.original_request.is_empty() {
-            &req.payload
-        } else {
-            &req.original_request
-        };
-        let ctx = cpa_translate::ResponseCtx {
-            model: &req.model,
-            original_request: original,
-            translated_request: &req.payload,
-        };
-        cpa_translate::go_stream(to, from).map(|open| open(&ctx))
+    let native = translating
+        && Format::parse(&n.requested)
+            .zip(Format::parse(&n.output))
+            .is_some_and(|(to, from)| cpa_translate::go_stream(to, from).is_some());
+    let translator = translating
+        .then(|| {
+            let original = if req.original_request.is_empty() {
+                &req.payload
+            } else {
+                &req.original_request
+            };
+            let ctx = cpa_translate::ResponseCtx {
+                model: &req.model,
+                original_request: original,
+                translated_request: &req.payload,
+            };
+            cpa_translate::hooked_go_stream(&n.requested, &n.output, &ctx)
+        })
+        .flatten();
+    let usage = usage.map(|sink| StreamUsage {
+        sink,
+        protocol: n.output.clone(),
+        buffer: Vec::new(),
+        scan: JsonScan::default(),
+        ended: false,
     });
     let state = StreamState {
-        native: translator.is_some(),
+        usage,
+        native,
         translator,
         passthrough: n.requested.is_empty()
             || (n.output == n.requested && n.requested != Format::OpenAIResponse.as_str()),
@@ -428,6 +653,7 @@ fn translate_stream(
         chunks,
         ready: VecDeque::new(),
         done: false,
+        chunk_error,
         _scope: scope,
     };
     Box::pin(futures_util::stream::unfold(state, |mut s| async move {
@@ -440,18 +666,27 @@ fn translate_stream(
             }
             match s.chunks.next().await {
                 Some(chunk) => {
+                    if let Some(usage) = &mut s.usage {
+                        match &chunk.error {
+                            // Published before the error reaches the reader.
+                            Some(error) => usage.end(Some(error)),
+                            None => usage.chunk(&chunk.payload),
+                        }
+                    }
                     if !chunk.payload.is_empty() {
                         for frame in s.frames(&chunk.payload) {
                             s.push(frame);
                         }
                     }
                     if let Some(error) = chunk.error {
-                        s.ready
-                            .push_back(Err(ExecError::local(0, FailureScope::Request, error)));
+                        s.ready.push_back(Err((s.chunk_error)(error)));
                         s.done = true;
                     }
                 }
                 None => {
+                    if let Some(usage) = &mut s.usage {
+                        usage.end(None);
+                    }
                     // Go `emitTranslatedExecutorStreamTail`.
                     if s.openai_tail {
                         for frame in s.frames(b"data: [DONE]") {
@@ -465,7 +700,159 @@ fn translate_stream(
     }))
 }
 
+/// Go `observeAndTranslateExecutorStream`'s usage side for a credential-bound stream:
+/// usage from the plugin's output lines, published once when the stream ends, fails
+/// or is dropped (Go's canceled context).
+/// ponytail: TTFT is the first chunk (Go `RecordFirstPacket`); Go's per-protocol token
+/// detection (`Observe*TokenEvent`) is not ported, as for the built-in executors.
+struct StreamUsage {
+    sink: cpa_core::exec::UsageSink,
+    protocol: String,
+    /// The part of the last line not yet ended by a newline.
+    buffer: Vec<u8>,
+    /// Bracket and string state of `buffer`, advanced over each new byte only.
+    scan: JsonScan,
+    ended: bool,
+}
+
+/// Incremental bracket and string tracking over a partial line, so a line arriving in
+/// many pieces is scanned once rather than revalidated as each piece lands.
+#[derive(Default)]
+struct JsonScan {
+    /// Bytes of the buffer already scanned.
+    offset: usize,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    opened: bool,
+    /// The last non-whitespace byte scanned.
+    last: u8,
+    /// A close without an open, or a balanced value that failed validation: no
+    /// extension of the line can become one whole JSON value.
+    broken: bool,
+}
+
+impl JsonScan {
+    /// Scans the bytes added since the last call; true when the line may now hold one
+    /// whole object or array.
+    fn advance(&mut self, buffer: &[u8]) -> bool {
+        for &b in &buffer[self.offset..] {
+            if !b.is_ascii_whitespace() {
+                self.last = b;
+            }
+            if self.in_string {
+                match b {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => {
+                    self.depth += 1;
+                    self.opened = true;
+                }
+                b'}' | b']' => match self.depth.checked_sub(1) {
+                    Some(depth) => self.depth = depth,
+                    None => self.broken = true,
+                },
+                _ => {}
+            }
+        }
+        self.offset = buffer.len();
+        !self.broken && self.opened && self.depth == 0 && !self.in_string && matches!(self.last, b'}' | b']')
+    }
+}
+
+impl StreamUsage {
+    fn chunk(&mut self, payload: &[u8]) {
+        if payload.is_empty() || self.ended {
+            return;
+        }
+        self.sink.token_event(false);
+        let start = self.buffer.len();
+        self.buffer.extend_from_slice(payload);
+        if let Some(end) = payload.iter().rposition(|b| *b == b'\n') {
+            let rest = self.buffer.split_off(start + end + 1);
+            let lines = std::mem::replace(&mut self.buffer, rest);
+            self.lines(&lines);
+            // The remainder is part of this payload, so rescanning it stays linear.
+            self.scan = JsonScan::default();
+        }
+        // A complete JSON payload without its newline counts now, as Go's does. Go
+        // runs `json.Valid` on the whole remainder after every chunk (quadratic in a
+        // line split into many chunks); here each byte is scanned once, and the
+        // remainder is validated only when its outer brackets close: a valid one is
+        // consumed, an invalid one is never validated again.
+        // ponytail: a newline-free scalar remainder such as `data: null` is not flushed
+        // (Go flushes it, since `json.Valid("null")` holds), so the next chunk joins it
+        // into one invalid line and a usage line arriving that way is lost. Flushing
+        // would mean validating scalar prefixes; add it if a plugin emits scalars.
+        if self.scan.advance(&self.buffer) {
+            if extract_stream_json(&self.buffer).is_some_and(cpa_common::json::std_valid) {
+                let rest = std::mem::take(&mut self.buffer);
+                self.scan = JsonScan::default();
+                self.lines(&rest);
+            } else {
+                self.scan.broken = true;
+            }
+        }
+    }
+
+    /// Go `IterateStreamLines`.
+    fn lines(&self, payload: &[u8]) {
+        for line in payload.split(|b| *b == b'\n') {
+            let line = line.trim_ascii();
+            if !line.is_empty() {
+                self.sink.plugin_response_line(&self.protocol, line);
+            }
+        }
+    }
+
+    /// Go `publishResult`: the stream ended, cleanly or with `error`.
+    fn end(&mut self, error: Option<&str>) {
+        if std::mem::replace(&mut self.ended, true) {
+            return;
+        }
+        let rest = std::mem::take(&mut self.buffer);
+        self.lines(&rest);
+        match error {
+            // Go `HTTPStatusFromError` of a plugin chunk error carries no status.
+            Some(error) => self.sink.publish_failure_with_usage(0, error),
+            None => self.sink.publish(),
+        }
+    }
+}
+
+impl Drop for StreamUsage {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            let rest = std::mem::take(&mut self.buffer);
+            self.lines(&rest);
+            // Go: the request context was canceled (`StatusClientClosedRequest`).
+            self.sink.publish_failure_with_usage(499, "context canceled");
+        }
+    }
+}
+
+/// Go `ExtractStreamJSONPayload`.
+fn extract_stream_json(line: &[u8]) -> Option<&[u8]> {
+    let mut trimmed = line.trim_ascii();
+    if trimmed.is_empty() || trimmed == b"[DONE]" || trimmed.starts_with(b"event:") {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix(b"data:") {
+        trimmed = rest.trim_ascii();
+    }
+    (!trimmed.is_empty() && trimmed != b"[DONE]").then_some(trimmed)
+}
+
 struct StreamState {
+    usage: Option<StreamUsage>,
     translator: Option<Box<dyn cpa_translate::stream::GoStream>>,
     /// A built-in stream translator exists for the pair (Go
     /// `executorNativeStreamResponseTranslatorExists`).
@@ -476,6 +863,10 @@ struct StreamState {
     chunks: BoxStream<'static, Chunk>,
     ready: VecDeque<Result<Bytes, ExecError>>,
     done: bool,
+    /// A chunk error: request-scoped on the model router path; on the credential-bound
+    /// path an attempt (Go hands the plugin's statusless chunk error to the auth
+    /// manager's stream bootstrap, which classifies it like an execution error).
+    chunk_error: fn(String) -> ExecError,
     _scope: Scope,
 }
 
@@ -512,11 +903,67 @@ impl StreamState {
     }
 }
 
+/// Go `Auth.Attributes` as a plugin executor gets it. `private` names what the Home
+/// dispatcher set itself on a dispatched credential (Go keeps those outside
+/// `Auth.Attributes`); attributes Home sent stay, whatever their names.
+fn plugin_attributes(
+    credential: &cpa_core::credential::Credential,
+    private: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut attributes = crate::management::quota::go_attributes(credential);
+    for key in private {
+        attributes.remove(key);
+    }
+    attributes
+}
+
 #[cfg(test)]
 mod tests {
     use cpa_core::credential::Credential;
 
     use super::*;
+
+    /// A line arriving in pieces is reported whole only once its outer brackets close;
+    /// brackets and escaped quotes inside strings do not count.
+    #[test]
+    fn a_partial_stream_line_is_whole_only_when_its_outer_value_closes() {
+        let mut scan = JsonScan::default();
+        let mut line = Vec::new();
+        let pieces: [&[u8]; 4] = [br#"data: {"usage":[{"t":"}\"]"}"#, br#",{"n":1}"#, b"]", b"}  "];
+        let whole: Vec<bool> = pieces
+            .iter()
+            .map(|piece| {
+                line.extend_from_slice(piece);
+                scan.advance(&line)
+            })
+            .collect();
+        assert_eq!(whole, [false, false, false, true]);
+
+        let mut stray = JsonScan::default();
+        assert!(!stray.advance(b"data: }{}"), "a close before any open never balances");
+    }
+
+    /// A Home credential's dispatcher-set attributes stay out of the plugin request;
+    /// one Home sent itself stays in, even under a name the dispatcher also uses.
+    #[test]
+    fn plugin_attributes_keep_home_sent_ones_and_drop_dispatcher_ones() {
+        let mut c = Credential::relay_session("home-a");
+        for (key, value) in [
+            ("base_url", "http://127.0.0.1:9"),
+            (crate::remote::SESSION, "plugin-owned"),
+            (crate::remote::MODEL_INFO, r#"{"id":"gpt-up"}"#),
+            (crate::remote::PROVIDER, "openai-compatible-probe"),
+        ] {
+            c.attributes.insert(key.into(), value.into());
+        }
+        let private = [crate::remote::MODEL_INFO.to_owned(), crate::remote::PROVIDER.to_owned()];
+        let attributes = plugin_attributes(&c, &private);
+        assert_eq!(
+            attributes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["base_url", crate::remote::SESSION, "runtime_only"]
+        );
+        assert_eq!(attributes[crate::remote::SESSION], "plugin-owned");
+    }
 
     /// Every provider offered to a model router selects its credential when routed to,
     /// including Kimi files typed with their domain.

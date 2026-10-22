@@ -337,6 +337,23 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
                     }
                     used.insert(call_id.clone());
                 }
+                // Codex rejects call_id values longer than 64 bytes (b0debb35).
+                let mut shortened = shorten_call_id(&call_id);
+                if shortened != call_id {
+                    // Go shortens `call_id + "_N"` until the result is unused. Every candidate
+                    // keeps the same first bytes, so `call_id` is hashed once and each attempt
+                    // only feeds its `_N`: linear however many candidates a client occupies.
+                    use sha2::Digest;
+                    let prefix = sha2::Sha256::new_with_prefix(&call_id);
+                    let mut attempt = 1;
+                    while used.contains(&shortened) {
+                        let sum = prefix.clone().chain_update(format!("_{attempt}")).finalize();
+                        shortened = with_hash_suffix(&call_id, &sum);
+                        attempt += 1;
+                    }
+                    used.insert(shortened.clone());
+                    call_id = shortened;
+                }
                 pending.push(PendingCall {
                     call_id: call_id.clone(),
                     source_id,
@@ -475,6 +492,25 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
     out
 }
 
+/// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
+/// regard to UTF-8, as Go slices the string) and ends in `_` plus 8 bytes of its SHA-256.
+fn shorten_call_id(id: &[u8]) -> Vec<u8> {
+    const LIMIT: usize = 64;
+    if id.len() <= LIMIT {
+        return id.to_vec();
+    }
+    use sha2::{Digest, Sha256};
+    with_hash_suffix(id, &Sha256::digest(id))
+}
+
+/// The first 47 bytes of `id` (over 64 bytes), `_` and the first 8 bytes of `sum` in hex.
+fn with_hash_suffix(id: &[u8], sum: &[u8]) -> Vec<u8> {
+    let suffix: String = std::iter::once("_".to_owned())
+        .chain(sum[..8].iter().map(|b| format!("{b:02x}")))
+        .collect();
+    [&id[..64 - suffix.len()], suffix.as_bytes()].concat()
+}
+
 /// setToolCallOutputContent.
 fn set_tool_output(output: &mut Vec<u8>, content: &Res<'_>) {
     if content.kind == Kind::String {
@@ -584,4 +620,27 @@ fn has_image_part(content: &Res<'_>) -> bool {
                 b"input_image" => !item.get("image_url").bytes().is_empty() || !item.get("file_id").bytes().is_empty(),
                 _ => false,
             })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Go v8.0.35 `ConvertOpenAIRequestToCodex` on over-length tool call IDs (b0debb35):
+    /// see tests/reference/codex_chat.
+    #[test]
+    fn over_length_call_ids_match_go() {
+        let go: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chat_go.json")).unwrap();
+        for case in go["requests"].as_array().unwrap() {
+            let out = super::convert(
+                case["model"].as_str().unwrap(),
+                case["in"].as_str().unwrap().as_bytes(),
+                case["stream"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                case["out"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
 }

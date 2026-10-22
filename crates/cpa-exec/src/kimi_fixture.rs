@@ -6,6 +6,7 @@
 //! responses to the Rust executors and captures their requests the same way, so ordered
 //! header lines and body bytes can be compared directly.
 
+use cpa_core::gostr::GoStr;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -293,6 +294,7 @@ pub(crate) fn request(fixture: &Value, principal: &str) -> ExecRequest {
         },
         source_format: source,
         response_format: source,
+        stream_payloads: false,
         requested_model: r["model"].as_str().unwrap().into(),
         model: r["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -309,6 +311,7 @@ pub(crate) fn request(fixture: &Value, principal: &str) -> ExecRequest {
         caller: Caller {
             principal: principal.into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -896,7 +899,7 @@ fn hide_key(key: &str) -> String {
 
 /// Go `util.MaskSensitiveHeaderValue`.
 fn mask_header(name: &str, value: &str) -> String {
-    let lower = name.trim().to_lowercase();
+    let lower = name.trim().go_lower();
     if lower.contains("authorization") {
         return match value.trim().split_once(' ') {
             Some((scheme, rest)) => format!("{scheme} {}", hide_key(rest)),
@@ -937,7 +940,7 @@ fn go_auth_text([provider, id, label, kind, value]: &[String; 5]) -> String {
             parts.push(format!("{key}={}", v.trim()));
         }
     }
-    let (kind, value) = (kind.trim().to_lowercase(), value.trim());
+    let (kind, value) = (kind.trim().go_lower(), value.trim());
     match kind.as_str() {
         "api_key" if !value.is_empty() => parts.push(format!("type=api_key value={}", hide_key(value))),
         "api_key" => parts.push("type=api_key".into()),

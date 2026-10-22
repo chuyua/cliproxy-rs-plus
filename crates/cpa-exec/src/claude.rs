@@ -28,6 +28,7 @@
 mod alias;
 mod betas;
 mod cloak;
+mod compaction;
 mod detect;
 mod headers;
 mod identity;
@@ -44,6 +45,7 @@ mod stream;
 mod telemetry;
 mod thread;
 
+use cpa_core::gostr::GoStr;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -200,11 +202,11 @@ impl ClaudeExecutor {
         self.oauth.prepare(credential, &Proxy::effective(credential, cfg)).await
     }
 
-    fn native_client(&self, proxy: &Proxy) -> Result<wreq::Client, ExecError> {
+    fn native_client(&self, proxy: &Proxy, handshake: Option<std::time::Duration>) -> Result<wreq::Client, ExecError> {
         match &self.native {
             Native::Fixed(client) => Ok(client.clone()),
             Native::Transport(t) => t
-                .clients(proxy)
+                .clients(proxy, handshake)
                 .map(|clients| clients.native.clone())
                 .map_err(|_| ExecError::local(502, FailureScope::Transport, "upstream request failed")),
         }
@@ -239,15 +241,91 @@ impl ClaudeExecutor {
         let cfg = &*scoped;
         // Go never checks for a token here: an empty key counts locally, or reaches the
         // upstream unauthenticated and gets its answer.
-        if req.alt.as_deref() == Some("responses/compact") {
-            // Go returns before it creates the usage reporter: no record at all.
-            req.usage.discard();
-            return Err(ExecError::local(
-                501,
-                FailureScope::Request,
-                "/responses/compact not supported",
-            ));
+        let mut req = req;
+        if req.operation == Operation::Generate {
+            if let Err(e) = crate::antigravity_compaction::expand_request(&mut req, "claude") {
+                // Go rejects the capsule before it creates the usage reporter.
+                req.usage.discard();
+                return Err(crate::gemini::status_err(400, e));
+            }
+            if req.alt.as_deref() == Some("responses/compact")
+                || crate::antigravity_compaction::has_trigger(&req.body)
+                || crate::antigravity_compaction::has_trigger(&req.original_body)
+            {
+                return Box::pin(self.compact(credential, req, cfg, delegation)).await;
+            }
         }
+        // Both paths are boxed: a request future of about 10 KB inline in every caller's
+        // state (the dispatch loop, Home, the WebSocket session) overflowed a 2 MiB
+        // worker stack in debug builds once the summary turn added a second one.
+        Box::pin(self.run(credential, req, cfg, delegation, false)).await
+    }
+
+    /// `executeClaudeCompaction` / `executeClaudeCompactionStream`: a non-stream Claude
+    /// summary of the conversation, sealed into a compaction item.
+    async fn compact(
+        &self,
+        credential: &Credential,
+        mut req: ExecRequest,
+        cfg: &Config,
+        delegation: Delegation,
+    ) -> Result<ExecResponse, ExecError> {
+        let model = base_model(&req.model);
+        let stream = req.stream;
+        req.body = compaction::summary_payload(crate::antigravity_compaction::source_payload(
+            &req.body,
+            &req.original_body,
+        ))
+        .into();
+        req.original_body = Bytes::new();
+        req.alt = None;
+        req.stream = false;
+        req.source_format = Format::OpenAIResponse;
+        req.response_format = Format::Claude;
+        let answer = self.run(credential, req, cfg, delegation, true).await?;
+        let ResponseBody::Buffered(payload) = answer.body else {
+            return Err(crate::antigravity_compaction::statusless(
+                "extract summary: no summary text found in upstream response",
+            ));
+        };
+        let text = crate::antigravity_compaction::summary_text(&payload)
+            .map_err(|e| crate::antigravity_compaction::statusless(format!("extract summary: {e}")))?;
+        let sealed = crate::antigravity_compaction::seal(&text, &model)
+            .map_err(|e| crate::antigravity_compaction::statusless(format!("seal compaction capsule: {e}")))?;
+        let usage = compaction::Usage::of(&payload);
+        let mut headers = answer.headers;
+        if !stream {
+            return Ok(ExecResponse {
+                status: 200,
+                headers,
+                body: ResponseBody::Buffered(compaction::response(&model, &sealed, usage).into()),
+            });
+        }
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let chunks: Vec<Result<Bytes, ExecError>> = compaction::stream_chunks(&model, &sealed, usage)
+            .into_iter()
+            .map(|chunk| Ok(Bytes::from(chunk)))
+            .collect();
+        Ok(ExecResponse {
+            status: 200,
+            headers,
+            body: ResponseBody::Stream(futures_util::stream::iter(chunks).boxed()),
+        })
+    }
+
+    /// One Execute / ExecuteStream / CountTokens after compaction; `compaction_summary`
+    /// marks the summary turn of [`Self::compact`].
+    async fn run(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+        delegation: Delegation,
+        compaction_summary: bool,
+    ) -> Result<ExecResponse, ExecError> {
         if req.response_format != Format::Claude && cpa_translate::pair(req.response_format, Format::Claude).is_none() {
             return Err(ExecError::local(
                 501,
@@ -255,7 +333,8 @@ impl ClaudeExecutor {
                 "Claude response translation pair is not registered",
             ));
         }
-        let ctx = Ctx::new(self, credential, &req, cfg, delegation);
+        let mut ctx = Ctx::new(self, credential, &req, cfg, delegation);
+        ctx.compaction_summary = compaction_summary;
         match req.operation {
             Operation::Generate => self.generate(ctx, req).await,
             Operation::CountTokens => self.count_tokens(ctx, req, delegation.count_upstream).await,
@@ -522,7 +601,7 @@ impl ClaudeExecutor {
         let route = |hop: &url::Url| {
             Ok(if tokens::first_party(hop.as_str()) {
                 Route {
-                    client: self.native_client(&ctx.proxy)?,
+                    client: self.native_client(&ctx.proxy, ctx.handshake)?,
                     order: Some(prepared.order.clone()),
                 }
             } else {
@@ -732,10 +811,13 @@ fn upstream_error(
             } else {
                 FailureScope::Request
             },
-            retry_after: rate_limited.then(|| quota::rate_limit_reset(&headers)).flatten(),
+            retry_after: rate_limited
+                .then(|| quota::rate_limit_reset_for_error(&headers, &body))
+                .flatten(),
             headers: Box::new(headers),
             body,
             direct: true,
+            addon: None,
         };
     }
     let error = ExecError {
@@ -749,6 +831,7 @@ fn upstream_error(
             body
         },
         direct: false,
+        addon: None,
     };
     quota::classify(error, model_level_cooling)
 }
@@ -781,6 +864,8 @@ struct Ctx<'a> {
     base_url: String,
     first_party: bool,
     proxy: Proxy,
+    /// `requests.tls-handshake-timeout-seconds` for the native transport.
+    handshake: Option<std::time::Duration>,
     base_model: String,
     /// The model sent upstream (`upstreamModel`): the base model unless a delegating
     /// executor normalizes it.
@@ -789,6 +874,8 @@ struct Ctx<'a> {
     kimi: bool,
     /// `upstreamRequestLogProvider`: the provider request logs name.
     log_provider: &'static str,
+    /// The summary turn of a Responses compaction (`claudeCompactionSummaryFromContext`).
+    compaction_summary: bool,
     /// Normalized execution-session ID (websocket executions), or empty.
     execution: String,
     /// `cliproxyauth.ResolvedModelInfo`: the capabilities dispatch bound to this attempt.
@@ -828,7 +915,7 @@ struct Prepared {
 
 /// `config.NormalizeClaudeFingerprintProfile`: unknown values are the default ("").
 fn normalize_fingerprint_profile(raw: &str) -> &'static str {
-    match raw.trim().to_lowercase().as_str() {
+    match raw.trim().go_lower().as_str() {
         "claude-code-cli" | "oauth-cli" => "claude-code-cli",
         _ => "",
     }
@@ -856,7 +943,7 @@ fn set_string_if_different(body: String, path: &str, value: &str) -> String {
 
 /// `isKimiMessagesUpstream`: a Kimi credential, or Kimi's API host.
 fn kimi_upstream(provider: &str, base_url: &str) -> bool {
-    let provider = provider.trim().to_lowercase();
+    let provider = provider.trim().go_lower();
     if matches!(provider.as_str(), "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com") {
         return true;
     }
@@ -986,9 +1073,11 @@ impl<'a> Ctx<'a> {
             credential,
             first_party: tokens::first_party(&base_url),
             proxy: Proxy::effective(credential, cfg),
+            handshake: crate::tls::handshake_timeout(cfg),
             upstream_model: delegation.upstream_model.map_or_else(|| base.clone(), |f| f(&base)),
             kimi: kimi_upstream(&credential.provider, &base_url),
             log_provider: delegation.request_log_provider.unwrap_or("claude"),
+            compaction_summary: false,
             execution: session::normalize(req.execution_session.as_deref().unwrap_or_default()),
             is_compat: req.resolved_model.as_ref().is_some_and(|r| r.is_compat()),
             codex: cpa_common::codex_client::Settings::from_config(cfg),
@@ -1126,7 +1215,7 @@ impl<'a> Ctx<'a> {
             key_cloak.is_some() || !attr_mode.is_empty() || attr_strict || !attr_words.is_empty() || attr_cache;
         let mut cloak = (self.cli_profile || configured) && !confirmed;
         if !confirmed {
-            match mode.trim().to_lowercase().as_str() {
+            match mode.trim().go_lower().as_str() {
                 "always" => cloak = true,
                 "never" => cloak = false,
                 _ => {}
@@ -1226,7 +1315,7 @@ impl<'a> Ctx<'a> {
                     explicit,
                 },
             );
-            let model = rawjson::string(&body, "model").trim().to_lowercase();
+            let model = rawjson::string(&body, "model").trim().go_lower();
             if cloak::is_opus55(&model) && !probe_before && !rawjson::get(&body, "fallbacks").exists() {
                 body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-4-8"}]"#);
             }
@@ -1279,6 +1368,9 @@ impl<'a> Ctx<'a> {
                     injected_diagnostics = true;
                 }
             }
+        }
+        if self.compaction_summary {
+            body = compaction::finalize(body);
         }
         let placement = reconcile::SystemPlacement::capture(&before, &body, cloaked);
         let fable = reconcile::FableState::capture(&before, &body, cloaked);
@@ -1781,7 +1873,7 @@ fn cloak_thinking_display(body: String) -> String {
     if rawjson::get(&body, "thinking.display").exists() || !betas::progress_display(&rawjson::string(&body, "model")) {
         return body;
     }
-    match rawjson::string(&body, "thinking.type").trim().to_lowercase().as_str() {
+    match rawjson::string(&body, "thinking.type").trim().go_lower().as_str() {
         "adaptive" | "enabled" => rawjson::set_str(&body, "thinking.display", "updates"),
         _ => body,
     }
@@ -1837,7 +1929,7 @@ fn disable_thinking_if_tool_choice_forced(body: String) -> String {
 /// `normalizeClaudeSamplingForUpstream`.
 fn normalize_sampling(mut body: String, native: bool) -> String {
     let thinking = matches!(
-        rawjson::string(&body, "thinking.type").trim().to_lowercase().as_str(),
+        rawjson::string(&body, "thinking.type").trim().go_lower().as_str(),
         "enabled" | "adaptive" | "auto"
     );
     if !native {

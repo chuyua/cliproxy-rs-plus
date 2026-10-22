@@ -1,6 +1,7 @@
 //! AWS Signature Version 4 for S3, as minio-go's `signer.SignV4` computes it.
 
 use chrono::{DateTime, Utc};
+use cpa_core::gostr::GoStr;
 use sha2::{Digest, Sha256};
 
 pub(crate) const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -96,7 +97,7 @@ pub(crate) fn sign(
     let mut headers: Vec<(String, String)> = request
         .headers
         .iter()
-        .map(|(k, v)| (k.to_lowercase(), trim_all(v)))
+        .map(|(k, v)| (k.go_lower(), trim_all(v)))
         .filter(|(k, _)| {
             !matches!(
                 k.as_str(),

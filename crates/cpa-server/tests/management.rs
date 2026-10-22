@@ -1,5 +1,6 @@
 //! Disposable local server only: no provider endpoints or credential exchanges.
 use cpa_core::config::Config;
+use cpa_core::gostr::GoStr;
 use cpa_exec::Executors;
 use cpa_exec::claude::ClaudeExecutor;
 use cpa_server::management::Management;
@@ -131,6 +132,14 @@ impl Fixture {
     }
     /// A fixture whose runtime holds the credentials `yaml` synthesizes.
     fn from_yaml(name: &str, yaml: impl Fn(&std::path::Path, &str) -> String) -> Self {
+        Self::from_yaml_with(name, yaml, Default::default())
+    }
+    /// [`Self::from_yaml`] with its Codex executor.
+    fn from_yaml_with(
+        name: &str,
+        yaml: impl Fn(&std::path::Path, &str) -> String,
+        codex: cpa_exec::codex::CodexExecutor,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("manage-{name}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("auth")).unwrap();
         let path = dir.join("config.yaml");
@@ -142,7 +151,7 @@ impl Fixture {
             cpa_core::config::credentials::load(&cfg),
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-                codex: Default::default(),
+                codex,
                 devices: Default::default(),
                 openai: Default::default(),
                 google: Default::default(),
@@ -767,6 +776,39 @@ async fn config_api_keys_become_scheduled_credentials_on_write_and_reload() {
     server.abort();
 }
 
+/// A number or bool written as the key is hashed as the string it decodes to (Go
+/// `ParseConfigBytes`), so it authenticates at once, before any reload.
+#[tokio::test]
+async fn typed_secret_keys_are_hashed_as_the_string_they_decode_to() {
+    let f = Fixture::new("typed-secret");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let get = |key: &str| {
+        client
+            .get(format!("{base}/v8/management/config/server/port"))
+            .bearer_auth(key)
+            .send()
+    };
+    let mut old = "fake-management-only";
+    for (written, key) in [(json!(123), "123"), (json!(true), "true")] {
+        let r = client
+            .put(format!("{base}/v8/management/config/management/secret-key"))
+            .bearer_auth(old)
+            .json(&written)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{written}");
+        assert_eq!(get(key).await.unwrap().status(), 200, "{written}: new key");
+        assert_eq!(get(old).await.unwrap().status(), 401, "{written}: old key");
+        let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(&f.file()).unwrap();
+        let hash = file["management"]["secret-key"].as_str().expect("stored as a string");
+        assert!(bcrypt::verify(key, hash).unwrap(), "{written}: {hash}");
+        old = key;
+    }
+    server.abort();
+}
+
 #[tokio::test]
 async fn unreadable_auth_dir_never_blocks_secret_rotation_or_removal() {
     let f = Fixture::new("authfile");
@@ -820,9 +862,9 @@ async fn unreadable_auth_dir_never_blocks_secret_rotation_or_removal() {
     server.abort();
 }
 
-/// Deliberate difference from Go, whose saver re-normalizes every OAuth map and
-/// rewrites every typed value on any write: only what the request wrote is
-/// normalized, so untouched keys stay byte-stable.
+/// A v8 write saves what it wrote, as Go v8.0.35 does (the runtime config still
+/// sanitizes OAuth maps). Deliberate difference: Go re-encodes the whole file, while
+/// untouched keys here stay byte-stable.
 #[tokio::test]
 async fn writes_normalize_only_what_they_touch() {
     let f = Fixture::new("scoped");
@@ -858,7 +900,7 @@ async fn writes_normalize_only_what_they_touch() {
         .json()
         .await
         .unwrap();
-    assert_eq!(config["oauth"]["excluded-models"]["gemini"], json!(["b", "c"]));
+    assert_eq!(config["oauth"]["excluded-models"]["gemini"], json!([" B ", "b", "c"]));
     let r = send(
         wreq::Method::PATCH,
         "/config",
@@ -876,6 +918,156 @@ async fn writes_normalize_only_what_they_touch() {
     let r = send(wreq::Method::PATCH, "/config", "{}").await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(f.file(), after_patch, "an empty PATCH writes nothing");
+    // A YAML 1.1 bool spelling is saved and read back as the string written; only the
+    // runtime config decodes it.
+    let r = send(wreq::Method::PUT, "/config/upstream/xai/inject-x-search", r#""on""#)
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(&f.file()).unwrap();
+    assert_eq!(
+        file["upstream"]["xai"]["inject-x-search"],
+        serde_yaml_ng::Value::from("on")
+    );
+    let got = send(wreq::Method::GET, "/config/upstream/xai/inject-x-search", "")
+        .await
+        .unwrap();
+    assert_eq!(got.text().await.unwrap(), r#""on""#);
+    assert_eq!(
+        f.rt.config().document["upstream"]["xai"]["inject-x-search"],
+        serde_yaml_ng::Value::Bool(true)
+    );
+    server.abort();
+}
+
+/// Go v8.0.35 `TestConfigV8ETagIfMatch`: reads carry the file's SHA-256 as a strong
+/// ETag, and a write whose `If-Match` names another version fails with 412.
+#[tokio::test]
+async fn config_writes_honour_if_match_against_the_file_etag() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new("etag");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let etag = || {
+        let hex: String = Sha256::digest(f.file()).iter().map(|b| format!("{b:02x}")).collect();
+        format!("\"{hex}\"")
+    };
+    let send = |method, at: &str, body: &str, if_match: &[&str]| {
+        let mut req = client
+            .request(method, format!("{base}/v8/management{at}"))
+            .bearer_auth("fake-management-only")
+            .body(body.to_owned());
+        for v in if_match {
+            req = req.header("If-Match", *v);
+        }
+        req.send()
+    };
+    // `TestConfigV8ETagExposedForCORS`: every answer lets a cross-origin page read it.
+    let tag = |r: &wreq::Response| {
+        let exposed = r.headers()["access-control-expose-headers"].to_str().unwrap();
+        assert!(exposed.split(',').any(|h| h.trim() == "ETag"), "{exposed}");
+        r.headers()["etag"].to_str().unwrap().to_owned()
+    };
+    let (put, patch, delete, get) = (
+        wreq::Method::PUT,
+        wreq::Method::PATCH,
+        wreq::Method::DELETE,
+        wreq::Method::GET,
+    );
+
+    let before = f.file();
+    let r = send(
+        patch.clone(),
+        "/config",
+        r#"{"routing":{"retry":{"request-retry":1}}}"#,
+        &[r#""stale""#],
+    )
+    .await
+    .unwrap();
+    assert_eq!((r.status().as_u16(), tag(&r)), (412, etag()));
+    assert_eq!(r.text().await.unwrap(), r#"{"error":"precondition_failed"}"#);
+    assert_eq!(f.file(), before, "a stale PATCH writes nothing");
+    let current = etag();
+    let r = send(
+        patch,
+        "/config",
+        r#"{"routing":{"retry":{"request-retry":1}}}"#,
+        &[&current],
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_ne!(tag(&r), current);
+    assert_eq!(tag(&r), etag(), "the write answers with the new version on disk");
+
+    for at in ["/config.yaml", "/config", "/config/server"] {
+        let r = send(get.clone(), at, "", &[r#""stale""#]).await.unwrap();
+        assert_eq!(
+            (r.status().as_u16(), tag(&r)),
+            (200, etag()),
+            "{at}: reads ignore If-Match"
+        );
+    }
+    let stale = etag();
+    let r = send(put.clone(), "/config/access/api-keys", r#"["other-key"]"#, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.status().as_u16(), tag(&r)),
+        (200, etag()),
+        "absent If-Match stays unconditional"
+    );
+    let before = f.file();
+    let r = send(
+        put.clone(),
+        "/config.yaml",
+        &before.replace("other-key", "revoked-key"),
+        &[&stale],
+    )
+    .await
+    .unwrap();
+    assert_eq!((r.status().as_u16(), tag(&r)), (412, etag()));
+    let r = send(delete.clone(), "/config/access/api-keys", "", &[&stale])
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 412);
+    assert_eq!(f.file(), before);
+
+    // Strong comparison only; a quoted comma is tag content and `*` must be the whole field.
+    let current = etag();
+    let weak = format!("W/{current}");
+    let comma = format!("{},\"", current.trim_end_matches('"'));
+    for bad in [
+        &weak,
+        "not-an-etag",
+        r#""unterminated"#,
+        r#""a"b""#,
+        r#""stale,*,tag""#,
+        r#"W/"stale,*,tag""#,
+        r#""stale", *"#,
+        &comma,
+        "",
+        "  \t  ",
+    ] {
+        let r = send(put.clone(), "/config/server/port", "8318", &[bad]).await.unwrap();
+        assert_eq!(r.status(), 412, "{bad:?}");
+    }
+    assert_eq!(f.file(), before);
+    let r = send(put.clone(), "/config/server/port", "8318", &[r#""stale""#, &current])
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "repeated lines form one list");
+    let list = format!(r#""stale", {} , W/{}"#, etag(), etag());
+    let r = send(delete, "/config/access/api-keys", "", &[&list]).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!f.file().contains("other-key"));
+    let r = send(put.clone(), "/config/server/port", "8320", &["*"]).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let next = tag(&r);
+    // Go `strings.TrimSpace` also trims Unicode white space (here U+00A0).
+    let padded = format!("\u{a0}{next}\u{a0}");
+    let r = send(put, "/config/server/port", "8321", &[&padded]).await.unwrap();
+    assert_eq!(r.status(), 200, "the response ETag chains into the next write");
     server.abort();
 }
 
@@ -937,34 +1129,218 @@ async fn config_key_toggle_edits_only_the_target_key_in_the_current_file() {
     server.abort();
 }
 
-/// Go edits config API keys in memory only: attributes follow the patched metadata
-/// and config.yaml is not written.
+/// Go d69962e4 and 3e309fb4: a config API key is not an auth file, so the fields patch
+/// does not find it (404) and changes nothing, in memory or in config.yaml.
 #[tokio::test]
-async fn config_key_field_patch_updates_memory_only() {
+async fn config_key_field_patch_is_not_found() {
     let f = Fixture::from_yaml("cfgfields", |auth, hash| {
         format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  claude:\n    - keys:\n        - api-key: fake-k\n",
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  claude:\n    - excluded-models: [config-*]\n      keys:\n        - api-key: fake-k\n",
             auth.display()
         )
     });
-    let id = f.rt.store().snapshot()[0].id.clone();
-    let before = f.file();
+    let before = f.rt.store().snapshot()[0].clone();
+    let file = f.file();
     let (base, server) = f.server().await;
     let r = wreq::Client::new()
         .patch(format!("{base}/v8/management/credentials/fields"))
         .bearer_auth("fake-management-only")
-        .json(&json!({"name": id, "note": " updated ", "priority": "3", "headers": {"X-B": "2"}, "disabled": "true"}))
+        .json(&json!({"name": before.id, "note": " updated ", "excluded_models": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(
+        r.json::<Value>().await.unwrap(),
+        json!({"error": "auth file not found"})
+    );
+    let after = f.rt.store().snapshot()[0].clone();
+    assert_eq!(
+        (&after.attributes, &after.metadata),
+        (&before.attributes, &before.metadata)
+    );
+    assert_eq!(f.file(), file, "config.yaml must not change");
+    server.abort();
+}
+
+/// Go `TestCodexExcludedModelsCredentialPriorityAfterPatchAndReload` (b015f208,
+/// 94d1a9a0): a credential's own excluded models replace the global
+/// `oauth.excluded-models`; with none, the current global list applies, so a later
+/// config change reaches the same credential without rewriting it.
+#[tokio::test]
+async fn credential_excluded_models_take_priority_over_the_global_list() {
+    let empty = Config::parse("").unwrap();
+    let probe = std::path::Path::new("/auth/codex.json");
+    let probe =
+        cpa_core::config::credentials::from_file(&empty, probe.parent().unwrap(), probe, br#"{"type":"codex"}"#)
+            .unwrap()
+            .unwrap();
+    let models = cpa_core::registry::dynamic::models_for(&empty, &Default::default(), &probe, 0);
+    let (global, own) = (models[0].id.clone(), models[models.len() - 1].id.clone());
+    let f = Fixture::from_yaml("excl-priority", |auth, hash| {
+        std::fs::write(auth.join("codex.json"), r#"{"type":"codex"}"#).unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n  excluded-models:\n    codex: ['{global}']\n",
+            auth.display()
+        )
+    });
+    let id = f.rt.store().snapshot()[0].id.clone();
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let available = |stage: &str, want_global: bool, want_own: bool| {
+        let registry = f.rt.registry();
+        let got = (
+            registry.client_supports(&id, &global),
+            registry.client_supports(&id, &own),
+        );
+        assert_eq!(got, (want_global, want_own), "{stage}");
+    };
+    let patch = |rules: Value| {
+        client
+            .patch(format!("{base}/v8/management/credentials/fields"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({"name": "codex.json", "excluded_models": rules}))
+            .send()
+    };
+    available("global fallback", false, true);
+    assert_eq!(patch(json!([own.go_upper()])).await.unwrap().status(), 200);
+    available("credential override", true, false);
+    assert_eq!(patch(json!([])).await.unwrap().status(), 200);
+    available("empty falls back to the global list", false, true);
+    let cred = f.rt.store().snapshot().into_iter().find(|c| c.id == id).unwrap();
+    assert!(
+        !cred.attributes.contains_key("excluded_models"),
+        "global rules are not copied in"
+    );
+    let r = client
+        .put(format!("{base}/v8/management/config/oauth/excluded-models/codex"))
+        .bearer_auth("fake-management-only")
+        .body(json!([own]).to_string())
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let cred = f.rt.store().snapshot().into_iter().find(|c| c.id == id).unwrap();
-    assert_eq!(cred.attributes.get("note").map(String::as_str), Some("updated"));
-    assert_eq!(cred.attributes.get("priority").map(String::as_str), Some("3"));
-    assert_eq!(cred.attributes.get("header:X-B").map(String::as_str), Some("2"));
-    assert_eq!(cred.attributes.get("api_key").map(String::as_str), Some("fake-k"));
-    assert!(cred.disabled);
-    assert_eq!(f.file(), before, "config.yaml must not change");
+    available("updated global list", true, false);
+    server.abort();
+}
+
+/// Go `auth_files_excluded_models_test` (1a28c61e, 3e309fb4): the fields patch takes a
+/// string array or null and stores only the credential's normalized rules; any other
+/// shape, and an upload with invalid rules, is a 400 that changes nothing.
+#[tokio::test]
+async fn excluded_models_writes_are_validated() {
+    let f = Fixture::from_yaml("excl-writes", |auth, hash| {
+        std::fs::write(
+            auth.join("credential.json"),
+            r#"{"type":"codex","excluded-models":["old-*"]}"#,
+        )
+        .unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n  excluded-models:\n    codex: [global-*]\n",
+            auth.display()
+        )
+    });
+    let auth = f.dir.join("auth");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let patch = |fields: &str| {
+        client
+            .patch(format!("{base}/v8/management/credentials/fields"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"name":"credential.json",{fields}}}"#))
+            .send()
+    };
+    let current = || {
+        f.rt.store()
+            .snapshot()
+            .into_iter()
+            .find(|c| c.id == "credential.json")
+            .unwrap()
+    };
+    for (fields, want) in [
+        (
+            r#""excluded_models":[" Local-* ","LOCAL-*","b-*"]"#,
+            Some("b-*,local-*"),
+        ),
+        (r#""excluded-models":["alias-*"]"#, Some("alias-*")),
+        (r#""excluded_models":[],"excluded-models":["alias-*"]"#, None),
+        (r#""excluded_models":["x"]"#, Some("x")),
+        (r#""excluded_models":[" ","\t"]"#, None),
+        (r#""excluded_models":["y"]"#, Some("y")),
+        (r#""excluded_models":null"#, None),
+    ] {
+        let r = patch(fields).await.unwrap();
+        assert_eq!(r.status(), 200, "{fields}");
+        let c = current();
+        assert_eq!(
+            c.attributes.get("excluded_models").map(String::as_str),
+            want,
+            "{fields}"
+        );
+        assert!(
+            !c.metadata.contains_key("excluded-models"),
+            "{fields}: legacy alias retained"
+        );
+    }
+    let before = (
+        current().metadata.clone(),
+        std::fs::read(auth.join("credential.json")).unwrap(),
+    );
+    for fields in [
+        r#""excluded_models":123"#,
+        r#""excluded-models":true"#,
+        r#""excluded_models":{}"#,
+        r#""excluded_models":["codex-new",null]"#,
+        r#""excluded_models":[42,false]"#,
+        r#""excluded_models":[["codex-new"]]"#,
+        r#""excluded_models":"codex-new""#,
+        r#""excluded-models":"codex-new""#,
+        r#""excluded_models.child":["codex-new"]"#,
+        r#""excluded-models.0":"codex-new""#,
+    ] {
+        let r = patch(&format!(r#""abc":true,{fields}"#)).await.unwrap();
+        assert_eq!(r.status(), 400, "{fields}");
+        let after = (
+            current().metadata.clone(),
+            std::fs::read(auth.join("credential.json")).unwrap(),
+        );
+        assert_eq!(after, before, "{fields}: a rejected patch changes nothing");
+    }
+    for content in [
+        r#"{"type":"codex","excluded_models":123}"#,
+        r#"{"type":"gemini-cli","excluded_models":123}"#,
+        r#"{"type":"codex","excluded_models":["codex-new",1]}"#,
+    ] {
+        let r = client
+            .post(format!("{base}/v8/management/credentials?name=bad.json"))
+            .bearer_auth("fake-management-only")
+            .body(content)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{content}");
+        let error = r.json::<Value>().await.unwrap()["error"].as_str().unwrap().to_owned();
+        assert!(
+            error.starts_with("invalid auth file: metadata excluded_models"),
+            "{error}"
+        );
+        assert!(!auth.join("bad.json").exists(), "{content}: nothing is written");
+    }
+    // The alias is canonicalized first, as Go's NormalizeCredentialMetadata does.
+    let r = client
+        .post(format!("{base}/v8/management/credentials?name=bad.json"))
+        .bearer_auth("fake-management-only")
+        .body(r#"{"type":"codex","excluded-models":["a",true]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        r.text().await.unwrap(),
+        r#"{"error":"invalid auth file: metadata excluded_models[1] must be a string, got bool"}"#
+    );
+    assert!(!auth.join("bad.json").exists());
     server.abort();
 }
 
@@ -1000,7 +1376,7 @@ async fn credential_models_come_from_registrations() {
     };
     assert_eq!(models(client.clone(), base.clone(), id.clone()).await, ["sonnet"]);
     let r = client
-        .patch(format!("{base}/v8/management/credentials/fields"))
+        .patch(format!("{base}/v8/management/credentials/status"))
         .bearer_auth("fake-management-only")
         .json(&json!({"name": id, "disabled": true}))
         .send()
@@ -1008,6 +1384,198 @@ async fn credential_models_come_from_registrations() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(models(client, base, id).await.is_empty());
+    server.abort();
+}
+
+/// Go v8.0.35 `GetStaticModelDefinitions` (`50cfd238`): a channel without a built-in
+/// catalog lists the models its credentials registered, sorted by ID, as Go's
+/// `registry.ModelInfo` encodes them; a channel with neither is still unknown
+/// (`TestGetStaticModelDefinitions_FallsBackToRegistryModelsForPerAuthPlugin`,
+/// `TestGetStaticModelDefinitions_BuiltInChannel`,
+/// `TestGetStaticModelDefinitions_RejectsUnknownChannel`).
+#[tokio::test]
+async fn model_definitions_fall_back_to_registered_models_by_channel() {
+    let f = Fixture::from_yaml("definitions", |auth, hash| {
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: http://127.0.0.1:9/v1\n      models: [{{name: up-z, alias: zeta}}, {{name: up-a, alias: alpha}}]\n      keys: [{{api-key: fake-acme}}]\n",
+            auth.display()
+        )
+    });
+    let (base, server) = f.server().await;
+    let get = |channel: &str| {
+        wreq::Client::new()
+            .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
+            .bearer_auth("fake-management-only")
+            .send()
+    };
+    let r = get("OpenAI-Compatible-Acme").await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["channel"], "openai-compatible-acme");
+    let models = v["models"].as_array().unwrap();
+    let ids: Vec<_> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["alpha", "zeta"]);
+    for internal in [
+        "user_defined",
+        "is_compat",
+        "max_context_length",
+        "support_configuration_update",
+    ] {
+        assert!(
+            models.iter().all(|m| m.get(internal).is_none()),
+            "{internal}: {models:?}"
+        );
+    }
+    let v0: Value = wreq::Client::new()
+        .get(format!("{base}/v0/management/model-definitions/openai-compatible-acme"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v0, v, "v0 serves the same handler");
+    let r = get("claude").await.unwrap();
+    assert_eq!(r.status(), 200, "the built-in catalog still wins");
+    let r = get("nobody").await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        r.json::<Value>().await.unwrap(),
+        json!({"channel": "nobody", "error": "unknown channel"})
+    );
+    server.abort();
+}
+
+/// Go v8.0.35 `TestGetStaticModelDefinitions_FallsBackToPluginStaticModels`: a plugin
+/// channel lists the plugin's static models in plugin order. The plugin is the Go
+/// recorder test plugin.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_definitions_fall_back_to_plugin_static_models() {
+    let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let Some(built) = cpa_plugin::testing::built_plugins(tmp, "model_definitions_plugin") else {
+        return;
+    };
+    let dir = cpa_plugin::testing::scratch(tmp, "definitions-plugin");
+    let (plugins, records) = (dir.join("plugins"), dir.join("records"));
+    let respond = records.join("respond/workbuddy");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::create_dir_all(&respond).unwrap();
+    std::fs::copy(built.join("recorder.so"), plugins.join("workbuddy.so")).unwrap();
+    // pluginapi.ModelInfo has no JSON tags: the wire names are Go's field names.
+    let models = json!({"provider": "workbuddy", "models": [
+        {"ID": "workbuddy-pro", "DisplayName": "WorkBuddy Pro"},
+        {"ID": "workbuddy-lite", "DisplayName": "WorkBuddy Lite"}]});
+    std::fs::write(
+        respond.join("model.static.json"),
+        json!({"ok": true, "result": models}).to_string(),
+    )
+    .unwrap();
+    let f = Fixture::from_yaml("definitions-plugin", |auth, hash| {
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    workbuddy:\n      enabled: true\n      label: workbuddy\n      record: {}\n      caps: model_provider\n",
+            auth.display(),
+            plugins.display(),
+            records.display()
+        )
+    });
+    // The startup sync registers the plugin's static models.
+    cpa_server::plugins::start(&f.rt).await;
+    let (base, server) = f.server().await;
+    let r = wreq::Client::new()
+        .get(format!("{base}/v8/management/routing/model-definitions/WorkBuddy"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["channel"], "workbuddy");
+    let ids: Vec<_> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!("workbuddy-pro"), json!("workbuddy-lite")]);
+    assert_eq!(v["models"][0]["display_name"], "WorkBuddy Pro");
+    server.abort();
+}
+
+/// Go v8.0.35 `injectV8APIKeyAuthIndexesLocked` (`0fb50a18`): JSON reads of
+/// `api-keys` carry each key's `auth_index` (fixture recorded from Go), and writes drop
+/// echoed `auth_index`/`auth-index` fields instead of saving them.
+#[tokio::test]
+async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
+    let f = Fixture::from_yaml("authindex", |auth, hash| {
+        fixture["config"].as_str().unwrap().replace(
+            "config-version: 8\n",
+            &format!(
+                "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+                auth.display()
+            ),
+        )
+    });
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let send = |method, at: &str, body: String| {
+        client
+            .request(method, format!("{base}/v8/management/config{at}"))
+            .bearer_auth("fake-management-only")
+            .body(body)
+            .send()
+    };
+    let read = send(wreq::Method::GET, "/api-keys", String::new()).await.unwrap();
+    let read: Value = read.json().await.unwrap();
+    assert_eq!(read, fixture["response"]);
+    // `TestConfigV8APIKeysExposeAuthIndex_Issue6287`: a provider sub-path and the root
+    // carry the same indexes; the YAML document carries none.
+    let codex: Value = send(wreq::Method::GET, "/api-keys/codex", String::new())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(codex, fixture["response"]["codex"]);
+    let root: Value = send(wreq::Method::GET, "", String::new())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["api-keys"], fixture["response"]);
+    let yaml = client
+        .get(format!("{base}/v8/management/config.yaml"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(yaml.contains("fake-o2") && !yaml.contains("896fb130477af684"), "{yaml}");
+
+    // Echo the read back, at the provider list and at the root.
+    let acme = read["openai-compatibility"].clone();
+    let r = send(wreq::Method::PUT, "/api-keys/openai-compatibility", acme.to_string())
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = send(wreq::Method::PATCH, "", json!({"api-keys": read}).to_string())
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let file = f.file();
+    assert!(!file.contains("auth_index") && !file.contains("auth-index"), "{file}");
+    let again: Value = send(wreq::Method::GET, "/api-keys", String::new())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again, fixture["response"]);
     server.abort();
 }
 
@@ -1062,31 +1630,77 @@ async fn fallback_with_relative_auth_dir_is_retired_once_synthesized() {
     server.abort();
 }
 
-/// A config-backed field patch invalidates the cached registry: a new prefix is
-/// routable at once.
+/// Go v8.0.35 stale-reload guard (`1631875b`): a watcher reload that read the file
+/// before a management save never publishes the older value after it. Here reloads
+/// read and publish under the same lock as saves, so every save stays visible and Go's
+/// paused-reload interleavings cannot occur
+/// (`TestSetConfigIgnoresConfigLoadedBeforeManagementSave_Issue6631`,
+/// `TestManagementWritesSurviveConcurrentReloadPublications_Issue6631`,
+/// `TestManagementSequentialWritesSurviveStaleReload_Issue6631`,
+/// `TestManagementWriteDuringReloadReachesRuntime_Issue6631`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_reloads_never_publish_a_value_older_than_a_save() {
+    let f = Fixture::new("reloadfence");
+    let (base, server) = f.server().await;
+    let state = f.state.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reloader = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let mut reloads = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                watching::reload(&state).unwrap();
+                reloads += 1;
+            }
+            reloads
+        }
+    });
+    let client = wreq::Client::new();
+    let retry = || f.rt.config().document["routing"]["retry"]["request-retry"].clone();
+    for i in 0..30 {
+        let r = client
+            .put(format!("{base}/v8/management/config/routing/retry/request-retry"))
+            .bearer_auth("fake-management-only")
+            .body(i.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        for _ in 0..5 {
+            assert_eq!(retry().as_i64(), Some(i), "save {i} was replaced by an older reload");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reloader.join().unwrap() > 30, "the reloads raced the saves");
+    server.abort();
+}
+
+/// An auth-file field patch invalidates the cached registry: a new prefix is routable
+/// at once.
 #[tokio::test]
-async fn config_key_prefix_patch_refreshes_the_registry() {
-    let f = Fixture::from_yaml("cfgprefix", |auth, hash| {
+async fn file_credential_prefix_patch_refreshes_the_registry() {
+    let f = Fixture::from_yaml("fileprefix", |auth, hash| {
+        std::fs::write(auth.join("claude.json"), r#"{"type":"claude"}"#).unwrap();
         format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  claude:\n    - models: [{{name: claude-sonnet-4-6, alias: sonnet}}]\n      keys:\n        - api-key: fake-k\n",
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
             auth.display()
         )
     });
-    let id = f.rt.store().snapshot()[0].id.clone();
     assert!(
-        !f.rt.registry().ids().any(|m| m == "new/sonnet"),
+        !f.rt.registry().ids().any(|m| m.starts_with("new/")),
         "warm cache without the prefix"
     );
     let (base, server) = f.server().await;
     let r = wreq::Client::new()
         .patch(format!("{base}/v8/management/credentials/fields"))
         .bearer_auth("fake-management-only")
-        .json(&json!({"name": id, "prefix": "new"}))
+        .json(&json!({"name": "claude.json", "prefix": "new"}))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    assert!(f.rt.registry().ids().any(|m| m == "new/sonnet"));
+    assert!(f.rt.registry().ids().any(|m| m.starts_with("new/")));
     server.abort();
 }
 
@@ -1192,6 +1806,40 @@ async fn latest_version_is_anonymous_cached_and_explicit() {
         && !h.contains_key("proxy-authorization")
         && !h.contains_key("cookie")));
     release_server.abort();
+}
+
+/// Go v8.0.35 `TestGitHubTokenConfigRoundTrip` (7c41cd05): `server.github-token` never
+/// reaches the v0 config JSON (`json:"-"`), whichever spelling holds it. The v8 reads
+/// and writes are the `server_github_token` scenario in `manage_go.json`.
+#[tokio::test]
+async fn github_token_stays_out_of_the_v0_config_json() {
+    for (name, layout) in [
+        (
+            "ghv8",
+            "config-version: 8\nserver:\n  github-token: fake-github-secret\n",
+        ),
+        ("ghlegacy", "github-token: fake-github-secret\n"),
+    ] {
+        let f = Fixture::from_yaml(name, |auth, hash| {
+            private_config(layout, auth, hash, !layout.starts_with("config-version"))
+        });
+        let (base, server) = f.server().await;
+        let (status, body) = call(&base, wreq::Method::GET, "/v0/management/config", "").await;
+        assert_eq!(status, 200, "{name}: {body}");
+        assert!(
+            !body.contains("fake-github-secret") && !body.contains("github-token"),
+            "{name}: {body}"
+        );
+        let (_, v8) = call(
+            &base,
+            wreq::Method::GET,
+            "/v8/management/config/server/github-token",
+            "",
+        )
+        .await;
+        assert_eq!(v8, r#""fake-github-secret""#, "{name}");
+        server.abort();
+    }
 }
 
 /// Separate processes give the environment fallback a fresh proxy snapshot without
@@ -1673,6 +2321,13 @@ async fn fake_logins() -> (
                     "expires_in": 600, "interval": 1}),
                 "/oauth2/token" => json!({"access_token": "fake-xai-at", "refresh_token": "fake-xai-rt",
                     "id_token": xai_id_token, "token_type": "Bearer", "expires_in": 3600}),
+                // These paths mirror the production OAuth URL shapes after the
+                // login_base host is replaced with this loopback fixture.
+                // Unknown endpoints deliberately return {}, failing the login.
+                "/token" => json!({"access_token":"fake-antigravity-at",
+                    "refresh_token":"fake-antigravity-rt","token_type":"Bearer","expires_in":3600}),
+                "/oauth2/v2/userinfo" => json!({"email":"antigravity@example.invalid"}),
+                "/v1internal:loadCodeAssist" => json!({"cloudaicompanionProject":"test-project-123"}),
                 // Devin: code exchange and profile (the user-status RPC gets `{}` and fails,
                 // which the login tolerates).
                 "/auth/cli/token" => json!({"token": "fake-devin-session"}),
@@ -1694,6 +2349,14 @@ async fn login_server(f: &Fixture, login_base: &str) -> (String, Arc<Management>
         login_base: Some(login_base.to_owned()),
         ..Default::default()
     };
+    serve_with(f, options).await
+}
+
+/// A management server over `f`'s runtime with `options`.
+async fn serve_with(
+    f: &Fixture,
+    options: management::Options,
+) -> (String, Arc<Management>, tokio::task::JoinHandle<()>) {
     let state = Management::with_options(f.rt.clone(), f.dir.join("config.yaml"), options);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1721,6 +2384,42 @@ async fn oauth_get(base: &str, path: &str) -> Value {
         .unwrap()
 }
 
+/// A remote store that records every push and explicit delete; with `down`, every auth
+/// push fails. An explicit delete removes the file, as the real stores do.
+#[derive(Default)]
+struct FakeStore {
+    dir: PathBuf,
+    down: bool,
+    pushed: std::sync::Mutex<Vec<String>>,
+}
+
+impl cpa_server::persist::StorePersister for FakeStore {
+    fn persist_config(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn persist_auth_files(
+        &self,
+        message: String,
+        _: Vec<PathBuf>,
+    ) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.pushed.lock().unwrap().push(message);
+        let down = self.down;
+        Box::pin(async move {
+            anyhow::ensure!(!down, "fake store unavailable");
+            Ok(())
+        })
+    }
+    fn delete_auth(&self, path: PathBuf) -> anyhow::Result<()> {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.pushed.lock().unwrap().push(format!("Delete auth {name}"));
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+    fn auth_dir(&self) -> PathBuf {
+        self.dir.clone()
+    }
+}
+
 /// Polls `/oauth/status` until it leaves `wait` (at most `secs`).
 async fn final_status(base: &str, state: &str, secs: u64) -> Value {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
@@ -1731,6 +2430,88 @@ async fn final_status(base: &str, state: &str, secs: u64) -> Value {
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// Antigravity OAuth in the management panel uses the same provider callback
+/// and credential persistence path as the existing CLI flow.
+#[tokio::test]
+async fn antigravity_management_signin_saves_a_usable_credential() {
+    let (fake, seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("antigravity-login");
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
+    assert_eq!(started["status"], "ok");
+    let sid = started["state"].as_str().unwrap();
+    assert_eq!(sid.len(), 32);
+    let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.domain(), Some("accounts.google.com"));
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["redirect_uri"], "http://localhost:51121/oauth-callback");
+    assert_eq!(query["state"], sid);
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state: sid.to_owned(),
+            code: "wrong-provider".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::NotPending
+    );
+    assert_eq!(
+        oauth_get(&base, &format!("/oauth/status?state={sid}")).await["status"],
+        "wait"
+    );
+    let callback = wreq::Client::new()
+        .post(format!("{base}/v8/management/oauth/callback"))
+        .bearer_auth("fake-management-only")
+        .json(&json!({"provider":"antigravity",
+            "redirect_url":format!("http://localhost:51121/oauth-callback?code=test-antigravity-code&state={sid}")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), 200);
+    assert_eq!(final_status(&base, sid, 10).await, json!({"status":"ok"}));
+    let saved_path = f.dir.join("auth/antigravity-antigravity@example.invalid.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
+    assert_eq!(saved["type"], "antigravity");
+    assert_eq!(saved["refresh_token"], "fake-antigravity-rt");
+    assert_eq!(saved["project_id"], "test-project-123");
+    assert!(f.rt.store().snapshot().iter().any(|c| c.provider == "antigravity"));
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|(path, form)| path == "/token"
+        && form.contains("test-antigravity-code")
+        && form.contains("redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback")));
+    assert!(seen.iter().any(|(path, _)| path == "/oauth2/v2/userinfo"));
+    assert!(seen.iter().any(|(path, _)| path == "/v1internal:loadCodeAssist"));
+    server.abort();
+    fake_server.abort();
+}
+
+/// A denied Antigravity authorization must not persist any credentials.
+#[tokio::test]
+async fn antigravity_management_denial_does_not_save_a_credential() {
+    let (fake, seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("antigravity-denied");
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
+    let sid = started["state"].as_str().unwrap();
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "antigravity",
+            state: sid.to_owned(),
+            code: String::new(),
+            error: "access_denied".into(),
+        }),
+        cpa_server::runtime::OAuthDelivery::Delivered
+    );
+    assert_eq!(final_status(&base, sid, 5).await["status"], "error");
+    assert!(f.rt.store().snapshot().iter().all(|c| c.provider != "antigravity"));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "authorization denial must never make upstream token or userinfo calls"
+    );
+    server.abort();
+    fake_server.abort();
 }
 
 /// xAI: Go `RequestXAIToken` answers with the device URL and code, and the poller
@@ -1818,7 +2599,7 @@ async fn devin_login_completes_through_the_main_listener_callback() {
             state: state.to_owned(),
             code: code.to_owned(),
             error: error.to_owned(),
-        })
+        }) == cpa_server::runtime::OAuthDelivery::Delivered
     };
     // A denied authorization ends the session with Go's message.
     let started = oauth_get(&base, "/oauth/auth-url?provider=devin").await;
@@ -1838,12 +2619,15 @@ async fn devin_login_completes_through_the_main_listener_callback() {
     assert_eq!(query["redirect_uri"], "http://127.0.0.1:18999/callback");
     assert_eq!(query["state"], state);
     assert!(!deliver("unknown-state", "c", ""));
-    assert!(!f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-        provider: "codex",
-        state: state.clone(),
-        code: "c".into(),
-        error: String::new(),
-    }));
+    assert_ne!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state: state.clone(),
+            code: "c".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::Delivered
+    );
     assert!(deliver(&state, "fake-devin-code", ""));
     assert_eq!(final_status(&base, &state, 10).await, json!({"status": "ok"}));
     let path = f.dir.join("auth/devin-dev-user.json");
@@ -1902,7 +2686,7 @@ async fn codex_login_completes_through_the_main_listener_callback() {
         code: "fake-code".into(),
         error: String::new(),
     });
-    assert!(delivered);
+    assert_eq!(delivered, cpa_server::runtime::OAuthDelivery::Delivered);
     assert_eq!(final_status(&base, &state, 10).await, json!({"status": "ok"}));
     let token_request = seen
         .lock()
@@ -1924,14 +2708,380 @@ async fn codex_login_completes_through_the_main_listener_callback() {
         .find(|c| c.provider == "codex")
         .expect("saved and published");
     assert_eq!(codex.str("email"), Some("c@example.invalid"));
-    assert!(!f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-        provider: "codex",
-        state,
-        code: "again".into(),
-        error: String::new(),
-    }));
+    assert_ne!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state,
+            code: "again".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::Delivered
+    );
     server.abort();
     fake_server.abort();
+}
+
+/// Antigravity management login permits a missing project (unlike CLI completion),
+/// validates the token/email, and never saves a cancelled exchange.
+#[tokio::test]
+async fn antigravity_management_login_flows() {
+    use axum::response::IntoResponse;
+    let exchanging = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (notice, gate, record) = (exchanging.clone(), resume.clone(), seen.clone());
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+        let (notice, gate, record) = (notice.clone(), gate.clone(), record.clone());
+        async move {
+            assert_ne!(headers.get("authorization").and_then(|v| v.to_str().ok()), Some("Bearer fake-management-only"));
+            let access = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").trim_start_matches("Bearer ");
+            let value = match uri.path() {
+                "/token" => {
+                    let form: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                    record.lock().unwrap().push(form.clone());
+                    let code = form.get("code").map(String::as_str).unwrap_or("");
+                    if code == "denied" {
+                        return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
+                    }
+                    if code == "cancelled" {
+                        notice.notify_one();
+                        let _ = gate.acquire().await.unwrap();
+                    }
+                    json!({"access_token": if code == "empty-token" { "" } else { code }, "refresh_token": "fake-ag-rt", "expires_in": 3600})
+                }
+                "/oauth2/v2/userinfo" => {
+                    if access == "bad-user" {
+                        return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
+                    }
+                    json!({"email": if access == "empty-email" { "".into() } else { format!("{access}@example.invalid") }})
+                }
+                "/v1internal:loadCodeAssist" if access == "no-project" => {
+                    return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
+                }
+                "/v1internal:loadCodeAssist" => json!({"cloudaicompanionProject": "fake-project"}),
+                _ => panic!("unexpected login request: {uri}"),
+            };
+            axum::Json(value).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let f = Fixture::new("antigravitylogin");
+    let (settled_tx, mut settled) = tokio::sync::mpsc::unbounded_channel();
+    let options = management::Options {
+        login_base: Some(fake.clone()),
+        login_settled: Some(settled_tx),
+        ..Default::default()
+    };
+    let (base, _management, server) = serve_with(&f, options).await;
+    for (code, error) in [
+        ("success", ""),
+        ("no-project", ""),
+        ("denied", "Failed to exchange token"),
+        ("empty-token", "Failed to exchange token"),
+        ("bad-user", "Failed to fetch user info"),
+        ("empty-email", "Failed to fetch user info"),
+        ("cancelled", "unknown or expired state"),
+    ] {
+        let started = if code == "success" {
+            wreq::Client::new()
+                .get(format!("{base}/v0/management/antigravity-auth-url"))
+                .bearer_auth("fake-management-only")
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        } else {
+            oauth_get(&base, "/oauth/auth-url?provider=antigravity").await
+        };
+        assert_eq!(started["status"], "ok", "{started}");
+        let sid = started["state"].as_str().unwrap();
+        assert_eq!(sid.len(), 32);
+        let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://accounts.google.com");
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["state"], sid);
+        assert_eq!(query["redirect_uri"], "http://localhost:51121/oauth-callback");
+        assert_eq!(query["access_type"], "offline");
+        let callback: Value = wreq::Client::new().post(format!("{base}/v8/management/oauth/callback"))
+            .json(&json!({"provider":"anti-gravity", "redirect_url":format!("http://localhost:51121/oauth-callback?state={sid}&code={code}")}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(callback, json!({"status":"ok"}));
+        if code == "cancelled" {
+            tokio::time::timeout(std::time::Duration::from_secs(5), exchanging.notified())
+                .await
+                .unwrap();
+            let cancelled: Value = wreq::Client::new()
+                .delete(format!("{base}/v8/management/oauth/session?state={sid}"))
+                .bearer_auth("fake-management-only")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cancelled["cancelled"], true);
+            resume.add_permits(1);
+        }
+        // Barrier: the login worker has finished, including a cancelled exchange.
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), settled.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished, sid);
+        let status = final_status(&base, sid, 5).await;
+        if error.is_empty() {
+            assert_eq!(status, json!({"status":"ok"}));
+            let name = format!("antigravity-{code}@example.invalid.json");
+            let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("auth").join(&name)).unwrap()).unwrap();
+            assert_eq!(saved["type"], "antigravity");
+            assert_eq!(saved["access_token"], code);
+            assert_eq!(saved["refresh_token"], "fake-ag-rt");
+            assert_eq!(
+                saved["project_id"],
+                if code == "no-project" {
+                    Value::Null
+                } else {
+                    json!("fake-project")
+                }
+            );
+            assert!(f.rt.store().get(&name).is_some(), "published");
+        } else {
+            assert_eq!(status, json!({"status":"error", "error":error}));
+            assert!(
+                !f.dir
+                    .join(format!("auth/antigravity-{code}@example.invalid.json"))
+                    .exists()
+            );
+        }
+    }
+    for form in seen.lock().unwrap().iter() {
+        assert_eq!(form["redirect_uri"], "http://localhost:51121/oauth-callback");
+        assert_eq!(form["grant_type"], "authorization_code");
+    }
+    assert_eq!(
+        f.rt.store()
+            .snapshot()
+            .iter()
+            .filter(|c| c.provider == "antigravity")
+            .count(),
+        2
+    );
+    server.abort();
+    // Go `saveTokenRecord`: with a remote store that is down, the login fails.
+    let down = Fixture::new("antigravitystore");
+    let store = Arc::new(FakeStore {
+        dir: down.dir.join("auth"),
+        down: true,
+        ..Default::default()
+    });
+    let options = management::Options {
+        login_base: Some(fake.clone()),
+        store: Some(store.clone()),
+        ..Default::default()
+    };
+    let (base, _management, server) = serve_with(&down, options).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
+    let sid = started["state"].as_str().unwrap();
+    wreq::Client::new()
+        .post(format!("{base}/v8/management/oauth/callback"))
+        .json(&json!({"provider": "antigravity", "redirect_url": format!("http://localhost:51121/oauth-callback?state={sid}&code=stored")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        final_status(&base, sid, 5).await,
+        json!({"status": "error", "error": "Failed to save token to file"})
+    );
+    assert_eq!(
+        *store.pushed.lock().unwrap(),
+        ["Update auth antigravity-stored@example.invalid.json"]
+    );
+    server.abort();
+    upstream.abort();
+}
+
+/// Vertex service-account upload (Go `ImportVertexCredential`) through v8
+/// `/oauth/import?provider=vertex` and v0 `/vertex/import`: Go's error answers, the
+/// form location winning over the query, Go's file bytes, and settings of an existing
+/// file kept.
+#[tokio::test]
+async fn vertex_service_account_import() {
+    let fixture: Value = serde_json::from_str(include_str!("../../cpa-exec/tests/fixtures/vertex_go.json")).unwrap();
+    let basic = &fixture["import"][0];
+    assert_eq!(basic["name"], "basic");
+    let key = basic["input"].as_str().unwrap();
+    let f = Fixture::new("verteximport");
+    let (base, server) = f.server().await;
+    let upload = |path: &str, body: Vec<u8>, content_type: &str| {
+        let request = wreq::Client::new()
+            .post(format!("{base}{path}"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", content_type)
+            .body(body);
+        async move {
+            let response = request.send().await.unwrap();
+            (response.status().as_u16(), response.json::<Value>().await.unwrap())
+        }
+    };
+    let form = |file: &str, location: Option<&str>| {
+        let mut body = String::new();
+        if let Some(location) = location {
+            body.push_str(&format!(
+                "--b\r\nContent-Disposition: form-data; name=\"location\"\r\n\r\n{location}\r\n"
+            ));
+        }
+        body.push_str(&format!(
+            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"key.json\"\r\nContent-Type: application/json\r\n\r\n{file}\r\n--b--\r\n"
+        ));
+        body.into_bytes()
+    };
+    const FORM: &str = "multipart/form-data; boundary=b";
+    let v8 = "/v8/management/oauth/import?provider=vertex";
+    let no_project = {
+        let mut sa: Value = serde_json::from_str(key).unwrap();
+        sa.as_object_mut().unwrap().remove("project_id");
+        sa.to_string()
+    };
+    for (body, content_type, want) in [
+        (b"{}".to_vec(), "application/json", json!({"error": "file required"})),
+        (
+            b"--b\r\nContent-Disposition: form-data; name=\"location\"\r\n\r\nx\r\n--b--\r\n".to_vec(),
+            FORM,
+            json!({"error": "file required"}),
+        ),
+        (
+            form("[1]", None),
+            FORM,
+            json!({"error": "invalid json", "message": "json: cannot unmarshal array into Go value of type map[string]interface {}"}),
+        ),
+        (
+            form("null", None),
+            FORM,
+            json!({"error": "invalid service account", "message": "service account payload is empty"}),
+        ),
+        (
+            form("{}", None),
+            FORM,
+            json!({"error": "invalid service account", "message": "service account missing private_key"}),
+        ),
+        (form(&no_project, None), FORM, json!({"error": "project_id missing"})),
+    ] {
+        assert_eq!(upload(v8, body, content_type).await, (400, want));
+    }
+    let auth = f.dir.join("auth");
+    assert_eq!(std::fs::read_dir(&auth).unwrap().count(), 0);
+
+    // A fresh import writes Go's bytes: the CLI golden without its empty prefix.
+    let (status, body) = upload(
+        "/v8/management/oauth/import?provider=VERTEX&location=us-east1",
+        form(key, None),
+        FORM,
+    )
+    .await;
+    let path = auth.join("vertex-proj-1.json");
+    assert_eq!(
+        (status, body),
+        (
+            200,
+            json!({"status": "ok", "auth-file": path.to_str().unwrap(), "project_id": "proj-1",
+                "email": "svc@proj-1.iam.gserviceaccount.com", "location": "us-east1"})
+        )
+    );
+    let golden = basic["files"]["vertex-proj-1.json"]
+        .as_str()
+        .unwrap()
+        .replace("  \"prefix\": \"\",\n", "")
+        .replace("us-central1", "us-east1");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), golden);
+    // The service account holds a private key: never world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let published = f.rt.store().get("vertex-proj-1.json").expect("published");
+    assert_eq!(published.provider, "vertex");
+
+    // Importing again keeps the user's settings and disabled flag, not token payload;
+    // the form location wins over the query.
+    std::fs::write(
+        &path,
+        r#"{"type":"vertex","prefix":"team","disabled":true,"access_token":"fake-stale"}"#,
+    )
+    .unwrap();
+    let (status, body) = upload(
+        "/v0/management/vertex/import?location=us-east1",
+        form(key, Some(" europe-west4 ")),
+        FORM,
+    )
+    .await;
+    assert_eq!((status, &body["location"]), (200, &json!("europe-west4")));
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        (
+            &saved["prefix"],
+            &saved["disabled"],
+            saved.get("access_token"),
+            &saved["location"]
+        ),
+        (&json!("team"), &json!(true), None, &json!("europe-west4"))
+    );
+
+    // Non-string project IDs name the file as Go's fmt.Sprint prints the float64 and
+    // composite values json.Unmarshal decodes (names from Go v8.0.35 with these literals).
+    for (project, file) in [
+        ("1000000", "vertex-1e+06.json"),
+        ("51.248178375505404", "vertex-51.248178375505404.json"),
+        ("12345678901234567890", "vertex-1.2345678901234567e+19.json"),
+        ("9007199254740993", "vertex-9.007199254740992e+15.json"),
+        ("0.000001", "vertex-1e-06.json"),
+        (r#"["a", "b"]"#, "vertex-[a-b].json"),
+        (
+            r#"{"b":[1.5,2e-7,true,null],"a":{"c":100000}}"#,
+            "vertex-map[a_map[c_100000]-b_[1.5-2e-07-true-<nil>]].json",
+        ),
+    ] {
+        let mut sa: Value = serde_json::from_str(key).unwrap();
+        sa["project_id"] = json!("@project@");
+        let sa = sa.to_string().replace(r#""@project@""#, project);
+        let (status, body) = upload(v8, form(&sa, None), FORM).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(auth.join(file).exists(), "{file}: {body}");
+    }
+    server.abort();
+
+    // Go `saveTokenRecord`: with a remote store that is down, the import fails.
+    let down = Fixture::new("vertexstore");
+    let store = Arc::new(FakeStore {
+        dir: down.dir.join("auth"),
+        down: true,
+        ..Default::default()
+    });
+    let options = management::Options {
+        store: Some(store.clone()),
+        ..Default::default()
+    };
+    let (base, _management, server) = serve_with(&down, options).await;
+    let response = wreq::Client::new()
+        .post(format!("{base}{v8}"))
+        .bearer_auth("fake-management-only")
+        .header("content-type", FORM)
+        .body(form(key, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error": "save_failed", "message": "fake store unavailable"})
+    );
+    assert_eq!(*store.pushed.lock().unwrap(), ["Update auth vertex-proj-1.json"]);
+    assert!(down.rt.store().get("vertex-proj-1.json").is_none(), "not published");
+    server.abort();
 }
 
 /// Claude: a pasted callback URL posted to `/oauth/callback` finishes the login.
@@ -1962,6 +3112,168 @@ async fn claude_login_completes_from_a_posted_redirect_url() {
     assert_eq!(claude.str("access_token"), Some("sk-ant-oat-fake"));
     server.abort();
     fake_server.abort();
+}
+
+/// Go `saveTokenRecord` for Claude: the legacy file a new login replaces is deleted
+/// through the store only after the canonical credential is stored.
+#[tokio::test]
+async fn claude_login_removes_the_legacy_file_only_after_the_store_has_the_new_one() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    for down in [true, false] {
+        let f = Fixture::new(&format!("claudelegacy-{down}"));
+        let legacy = f.dir.join("auth/claude-a@example.invalid.json");
+        std::fs::write(
+            &legacy,
+            r#"{"type":"claude","email":"a@example.invalid","organization_uuid":"org-1"}"#,
+        )
+        .unwrap();
+        let store = Arc::new(FakeStore {
+            dir: f.dir.join("auth"),
+            down,
+            ..Default::default()
+        });
+        let options = management::Options {
+            login_base: Some(fake.clone()),
+            store: Some(store.clone()),
+            ..Default::default()
+        };
+        let (base, _state, server) = serve_with(&f, options).await;
+        let started = oauth_get(&base, "/oauth/auth-url?provider=claude").await;
+        let state = started["state"].as_str().unwrap().to_owned();
+        wreq::Client::new()
+            .post(format!("{base}/v8/management/oauth/callback"))
+            .json(&json!({"provider": "claude",
+                "redirect_url": format!("http://localhost:54545/callback?code=fake-code&state={state}")}))
+            .send()
+            .await
+            .unwrap();
+        let status = final_status(&base, &state, 10).await;
+        let pushed = store.pushed.lock().unwrap().clone();
+        assert!(
+            pushed[0].starts_with("Update auth claude-") && pushed[0].ends_with("-a@example.invalid.json"),
+            "{pushed:?}"
+        );
+        if down {
+            assert_eq!(
+                status,
+                json!({"status": "error", "error": "Failed to save authentication tokens"})
+            );
+            assert_eq!(pushed.len(), 1, "{pushed:?}");
+            assert!(legacy.exists(), "kept while the canonical credential is not stored");
+        } else {
+            assert_eq!(status, json!({"status": "ok"}));
+            assert_eq!(pushed[1..], ["Delete auth claude-a@example.invalid.json"]);
+            assert!(!legacy.exists());
+        }
+        server.abort();
+    }
+    fake_server.abort();
+}
+
+/// A store whose pushes are really pending on the runtime's timers. When the Claude
+/// push arrives (its save holds the disk lock), it starts a Vertex import, whose save
+/// takes the lock next and waits on its own push.
+#[derive(Default)]
+struct SlowStore {
+    dir: PathBuf,
+    upload: std::sync::Mutex<Option<(String, Vec<u8>)>>,
+    imported: std::sync::Mutex<Option<tokio::task::JoinHandle<u16>>>,
+}
+
+impl cpa_server::persist::StorePersister for SlowStore {
+    fn persist_config(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn persist_auth_files(
+        &self,
+        message: String,
+        _: Vec<PathBuf>,
+    ) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            if message.contains("claude") {
+                let (url, body) = self.upload.lock().unwrap().take().unwrap();
+                *self.imported.lock().unwrap() = Some(tokio::spawn(async move {
+                    let response = wreq::Client::new()
+                        .post(url)
+                        .bearer_auth("fake-management-only")
+                        .header("content-type", "multipart/form-data; boundary=b")
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap();
+                    response.status().as_u16()
+                }));
+                // Long enough for the import to be waiting on the disk lock.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Ok(())
+        })
+    }
+    fn delete_auth(&self, _: PathBuf) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn auth_dir(&self) -> PathBuf {
+        self.dir.clone()
+    }
+}
+
+/// A finished login publishes off the runtime workers: on a one-worker runtime, a save
+/// holding the disk lock while its store push waits on a timer must not starve.
+#[test]
+fn a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../cpa-exec/tests/fixtures/vertex_go.json")).unwrap();
+        let key = fixture["import"][0]["input"].as_str().unwrap().to_owned();
+        let (fake, _seen, fake_server) = fake_logins().await;
+        let f = Fixture::new("slowstore");
+        let store = Arc::new(SlowStore {
+            dir: f.dir.join("auth"),
+            ..Default::default()
+        });
+        let options = management::Options {
+            login_base: Some(fake.clone()),
+            store: Some(store.clone()),
+            ..Default::default()
+        };
+        let (base, _state, server) = serve_with(&f, options).await;
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"key.json\"\r\nContent-Type: application/json\r\n\r\n{key}\r\n--b--\r\n"
+        );
+        *store.upload.lock().unwrap() = Some((
+            format!("{base}/v8/management/oauth/import?provider=vertex"),
+            body.into_bytes(),
+        ));
+        let started = oauth_get(&base, "/oauth/auth-url?provider=claude").await;
+        let state = started["state"].as_str().unwrap().to_owned();
+        wreq::Client::new()
+            .post(format!("{base}/v8/management/oauth/callback"))
+            .json(&json!({"provider": "claude",
+                "redirect_url": format!("http://localhost:54545/callback?code=fake-code&state={state}")}))
+            .send()
+            .await
+            .unwrap();
+        let status = final_status(&base, &state, 10).await;
+        let import = store.imported.lock().unwrap().take().unwrap();
+        let imported = import.await.unwrap();
+        server.abort();
+        fake_server.abort();
+        let _ = done.send((status, imported));
+    });
+    let Ok((status, imported)) = finished.recv_timeout(std::time::Duration::from_secs(20)) else {
+        // The runtime's only worker is blocked: dropping it would wait forever.
+        std::mem::forget(rt);
+        panic!("the login and the import deadlocked on the disk lock");
+    };
+    assert_eq!((status, imported), (json!({"status": "ok"}), 200));
 }
 
 /// Kimi device login saves after authorization; a cancelled one saves nothing.
@@ -2035,12 +3347,15 @@ async fn kimi_channel_selects_kimi_ai_and_codex_exchange_errors_read_like_go() {
     let (base, _state, server) = login_server(&f, &bad).await;
     let started = oauth_get(&base, "/oauth/auth-url?provider=codex").await;
     let state = started["state"].as_str().unwrap().to_owned();
-    assert!(f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-        provider: "codex",
-        state: state.clone(),
-        code: "fake-code".into(),
-        error: String::new(),
-    }));
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state: state.clone(),
+            code: "fake-code".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::Delivered
+    );
     // Go appends the upstream body; session errors are readable by anyone holding
     // the state, so cliproxy-rs stops at the status (deliberate hardening).
     assert_eq!(
@@ -2051,4 +3366,2033 @@ async fn kimi_channel_selects_kimi_ai_and_codex_exchange_errors_read_like_go() {
     server.abort();
     bad_server.abort();
     fake_server.abort();
+}
+
+/// Go v8.0.35 `TestConfigV8SaveNormalizesCollectionStylesToBlockYAML` (`0a23627d`):
+/// JSON written through the v8 config API lands as block YAML with plain keys, and an
+/// empty list stays `[]`. Untouched text keeps its own style (DIFFERENCES-FROM-GO.md).
+#[tokio::test]
+async fn config_writes_render_json_values_as_block_yaml() {
+    let f = Fixture::new("styles");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let send = |method, at: &str, body: &str| {
+        client
+            .request(method, format!("{base}/v8/management{at}"))
+            .bearer_auth("fake-management-only")
+            .body(body.to_owned())
+            .send()
+    };
+    let compat = |n: &str| {
+        format!(
+            r#"[{{"name":"compat-{n}","base-url":"https://api.example.com","headers":{{"User-Agent":"$User-Agent"}},"models":[{{"alias":"coding","name":"gpt-4o"}}],"keys":[{{"api-key":"fake-compat-{n}"}}]}}]"#
+        )
+    };
+    let block = "api-keys:\n  openai-compatibility:\n    - name: compat-N\n      base-url: https://api.example.com\n      headers:\n        User-Agent: $User-Agent\n      models:\n        - alias: coding\n          name: gpt-4o\n      keys:\n        - api-key: fake-compat-N\n";
+    let r = send(wreq::Method::PUT, "/config/api-keys/openai-compatibility", &compat("1"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(f.file().ends_with(&block.replace('N', "1")), "{}", f.file());
+    let patch = format!(
+        r#"{{"api-keys":{{"openai-compatibility":{}}},"server":{{"trusted-proxies":[]}}}}"#,
+        compat("2")
+    );
+    let r = send(wreq::Method::PATCH, "/config", &patch).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let file = f.file();
+    assert!(file.ends_with(&block.replace('N', "2")), "{file}");
+    assert!(file.contains("  trusted-proxies: []\n"), "{file}");
+    assert!(
+        file.contains("  api-keys: [fake-client]\n"),
+        "untouched text keeps its style: {file}"
+    );
+    // A whole-config PUT is all JSON: block collections and plain keys throughout, and
+    // the saved file loads.
+    let root = format!(
+        r#"{{"config-version":8,"management":{{"secret-key":"fake-management-only"}},"server":{{"port":8317}},"api-keys":{{"openai-compatibility":{}}}}}"#,
+        compat("3")
+    );
+    let r = send(wreq::Method::PUT, "/config", &root).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let file = f.file();
+    assert!(file.contains(&block.replace('N', "3")), "{file}");
+    for quoted in ["\"config-version\":", "\"server\":", "\"api-keys\":", "[{", "{\""] {
+        assert!(!file.contains(quoted), "{quoted} in {file}");
+    }
+    let loaded = cpa_core::config::Config::parse(&file).unwrap();
+    let compat = &loaded.document["api-keys"]["openai-compatibility"][0];
+    assert_eq!(compat["headers"]["User-Agent"].as_str(), Some("$User-Agent"));
+    server.abort();
+}
+
+/// Go `TestConfigV8SharedUpstreamRoundTrip` (52d5507d): a historical
+/// `oauth.providers.codex` shared field reads at `upstream/...` without a rewrite,
+/// upstream writes keep the OAuth-only header scope, and an invalid write to the
+/// historical path is refused without touching the file.
+#[tokio::test]
+async fn config_shared_upstream_round_trip() {
+    let f = Fixture::from_yaml("upstream", |auth, hash| {
+        format!(
+            "management: {{secret-key: '{hash}'}}\noauth: {{auth-dir: {}, providers: {{codex: {{stream-bootstrap-buffering: true, header-defaults: {{user-agent: oauth-agent}}}}}}}}\n",
+            auth.display()
+        )
+    });
+    let raw = f.file();
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let send = |method, at: &str, body: &str| {
+        client
+            .request(method, format!("{base}/v8/management/config/{at}"))
+            .bearer_auth("fake-management-only")
+            .body(body.to_owned())
+            .send()
+    };
+    let request = |method: wreq::Method, at: &'static str, body: &'static str, want: u16| {
+        let r = send(method.clone(), at, body);
+        async move {
+            let r = r.await.unwrap();
+            let status = r.status().as_u16();
+            let text = r.text().await.unwrap();
+            assert_eq!(status, want, "{method} {at}: {text}");
+            text
+        }
+    };
+    let got = request(wreq::Method::GET, "upstream/codex/stream-bootstrap-buffering", "", 200).await;
+    assert_eq!(got.trim(), "true");
+    assert_eq!(f.file(), raw, "GET rewrote the historical document");
+    request(
+        wreq::Method::PUT,
+        "upstream/codex/stream-bootstrap-buffering",
+        "false",
+        200,
+    )
+    .await;
+    request(wreq::Method::PUT, "oauth/auth-auto-refresh-workers", "3", 200).await;
+    request(
+        wreq::Method::PATCH,
+        "upstream/claude",
+        r#"{"header-defaults":{"timezone":"Asia/Singapore","stabilize-device-profile":false}}"#,
+        200,
+    )
+    .await;
+    let loaded = Config::parse(&f.file()).unwrap();
+    let api = loaded.for_api_key();
+    for cfg in [&loaded, &*api] {
+        let d = &cfg.document;
+        assert_eq!(
+            d["upstream"]["codex"]["stream-bootstrap-buffering"],
+            serde_yaml_ng::Value::Bool(false)
+        );
+        assert_eq!(d["upstream"]["claude"]["header-defaults"]["timezone"], "Asia/Singapore");
+        assert_eq!(d["oauth"]["auth-auto-refresh-workers"], 3);
+    }
+    assert_eq!(
+        loaded.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
+        "oauth-agent"
+    );
+    assert_eq!(
+        api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
+        ""
+    );
+    let before = f.file();
+    // v8.0.35 (3be5fa44) accepts the historical path as an alias; an invalid value is
+    // still refused.
+    request(
+        wreq::Method::PUT,
+        "oauth/providers/codex/stream-bootstrap-buffering",
+        r#""invalid""#,
+        422,
+    )
+    .await;
+    assert_eq!(
+        f.file(),
+        before,
+        "a rejected historical-path write changed the document"
+    );
+    request(wreq::Method::DELETE, "upstream/claude", "", 200).await;
+    assert!(!request(wreq::Method::GET, "upstream/claude", "", 404).await.is_empty());
+    let loaded = Config::parse(&f.file()).unwrap();
+    assert!(
+        loaded.document.get("upstream").and_then(|u| u.get("claude")).is_none(),
+        "{}",
+        f.file()
+    );
+    server.abort();
+}
+
+/// Legacy files whose migration the text form cannot finish alone (a `codex` block
+/// holding a shared `upstream.codex` field, a bare or empty `claude`) keep the comments
+/// of their other sections through a v8 setting save, and save fully migrated; a v0
+/// save leaves them in the legacy layout.
+#[tokio::test]
+async fn legacy_migration_with_shared_upstream_moves_keeps_other_comments() {
+    for (tail, check) in [
+        (
+            "codex: {response-steering: true}\n",
+            &["upstream", "codex", "response-steering"][..],
+        ),
+        ("claude:\n", &["upstream", "claude"][..]),
+        ("claude: {}\n", &["upstream", "claude"][..]),
+    ] {
+        let f = Fixture::from_yaml("shared-moves", |auth, hash| {
+            format!(
+                "remote-management:\n  # keep this comment\n  secret-key: '{hash}'\nauth-dir: {}\n{tail}",
+                auth.display()
+            )
+        });
+        let raw = f.file();
+        let (base, server) = f.server().await;
+        let client = wreq::Client::new();
+        for (at, body) in [
+            ("/v8/management/config/routing/retry/request-retry", "3"),
+            ("/v0/management/debug", r#"{"value":true}"#),
+        ] {
+            std::fs::write(f.dir.join("config.yaml"), &raw).unwrap();
+            let r = client
+                .put(format!("{base}{at}"))
+                .bearer_auth("fake-management-only")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{tail} {at}");
+            let file = f.file();
+            assert!(
+                file.contains("management:\n  # keep this comment\n"),
+                "{tail} {at}: {file}"
+            );
+            if at.starts_with("/v0/") {
+                // A v0 save keeps a legacy-only file in its layout (Go v8.0.35).
+                assert_eq!(file, format!("{raw}debug: true\n"), "{tail} {at}");
+                continue;
+            }
+            // Nothing is left to migrate: the saved values are the canonical ones.
+            let saved: serde_yaml_ng::Value = serde_yaml_ng::from_str(&file).unwrap();
+            let canonical = cpa_core::config::ConfigDocument::parse(&file).unwrap();
+            assert_eq!(&saved, canonical.value(), "{tail} {at}: {file}");
+            let value = check.iter().try_fold(&saved, |v, k| v.get(*k));
+            assert!(value.is_some_and(|v| !v.is_null()), "{tail} {at}: {file}");
+        }
+        server.abort();
+    }
+}
+
+/// Go v8.0.35 Sign in with ChatGPT binding (`d50a1995`, `ae3ee3be`) against a local
+/// token endpoint: start validation, the legacy-callback refusal, callback forms and
+/// conflicts, the bound file, the v8 summary, failures, cancellation, and the v8-only
+/// invalidation by a credential upload.
+#[tokio::test]
+async fn siwc_binding_flows_follow_go() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    let forms: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let (exchanging, resume) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    );
+    let app = axum::Router::new().route(
+        "/api/accounts/oauth/token",
+        axum::routing::post({
+            let (forms, exchanging, resume) = (forms.clone(), exchanging.clone(), resume.clone());
+            move |body: String| async move {
+                forms.lock().unwrap().push(body.clone());
+                let code = url::form_urlencoded::parse(body.as_bytes())
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default();
+                if code == "fail" {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "secret-sentinel".to_owned());
+                }
+                // `hang` never answers (its exchange is expected to be dropped);
+                // `hold` waits for a permit.
+                if code == "hang" {
+                    exchanging.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                if code == "hold" {
+                    exchanging.notify_one();
+                    // Consumed: a dropped permit would release the next hold too.
+                    resume.acquire().await.unwrap().forget();
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    r#"{"access_token":"siwc-at","refresh_token":"siwc-rt","id_token":"siwc-id","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#.to_owned(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let original = r#"{"type":"codex","email":"a@example.invalid","account_id":"acct","access_token":"outer","refresh_token":"outer-rt","note":"keep","big":123456789012345678901234567890,"siwc":{"device_id":"E61BBE28-07EF-466D-8E5D-A344F94AB305"}}"#;
+    let f = Fixture::from_yaml("siwc", |auth, hash| {
+        std::fs::write(auth.join("codex.json"), original).unwrap();
+        std::fs::write(
+            auth.join("claude.json"),
+            r#"{"type":"claude","access_token":"a","refresh_token":"b"}"#,
+        )
+        .unwrap();
+        std::fs::write(auth.join("no-refresh.json"), r#"{"type":"codex","access_token":"a"}"#).unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n  providers:\n    codex:\n      signin-with-chatgpt-identifier: '  Custom Agent  '\n",
+            auth.display()
+        )
+    });
+    let file = f.dir.join("auth").join("codex.json");
+    let (settled_tx, mut settled) = tokio::sync::mpsc::unbounded_channel();
+    let options = management::Options {
+        login_base: Some(fake.clone()),
+        login_settled: Some(settled_tx),
+        ..Default::default()
+    };
+    let (base, _management, server) = serve_with(&f, options).await;
+    let client = wreq::Client::new();
+    let send = |method: wreq::Method, path: String, body: String| {
+        let request = client
+            .request(method, format!("{base}{path}"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/json")
+            .body(body);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap();
+            (status, text)
+        }
+    };
+    let bind = |body: &str| send(wreq::Method::POST, "/v8/management/oauth/siwc/bind".into(), body.into());
+    let callback = |body: Value| {
+        send(
+            wreq::Method::POST,
+            "/v8/management/oauth/callback".into(),
+            body.to_string(),
+        )
+    };
+    let redirect = |state: &str, code: &str| {
+        format!("http://127.0.0.1:1455/auth/callback?state={state}&code={code}&client_id=oaiapp_issued")
+    };
+    let parsed = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+    async fn wait_settled(settled: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), settled.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    let bound_file = || std::fs::read_to_string(&file).unwrap();
+
+    // Start validation (gin `ShouldBindJSON`, then the target).
+    for (body, status, want) in [
+        ("", 400, json!({"error": "invalid request body"})),
+        ("[1]", 400, json!({"error": "invalid request body"})),
+        (r#"{"name":1}"#, 400, json!({"error": "invalid request body"})),
+        ("{}", 400, json!({"error": "name is required"})),
+        (
+            r#"{"name":"missing.json"}"#,
+            404,
+            json!({"error": "auth file not found"}),
+        ),
+        (
+            r#"{"name":"claude.json"}"#,
+            400,
+            json!({"error": "SIWC binding requires a file-backed Codex OAuth credential"}),
+        ),
+        (
+            r#"{"name":"no-refresh.json"}"#,
+            400,
+            json!({"error": "SIWC binding requires a file-backed Codex OAuth credential"}),
+        ),
+    ] {
+        let (got, text) = bind(body).await;
+        assert_eq!((got, parsed(&text)), (status, want), "{body}");
+    }
+    let (status, _) = send(
+        wreq::Method::POST,
+        "/v0/management/oauth/siwc/bind".into(),
+        r#"{"name":"codex.json"}"#.into(),
+    )
+    .await;
+    assert_eq!(status, 404, "v8 only");
+    let keyless = client
+        .post(format!("{base}/v8/management/oauth/siwc/bind"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyless.status().as_u16(), 401);
+
+    // A binding starts with server-held PKCE, device ID and redirect.
+    let (status, text) = bind(r#"{"NAME":" codex.json "}"#).await;
+    assert_eq!(status, 200, "{text}");
+    let started = parsed(&text);
+    let sid = started["state"].as_str().unwrap().to_owned();
+    assert_eq!(
+        started,
+        json!({"status": "ok", "url": started["url"], "state": sid, "flow": "siwc_bind", "expires_in": 300})
+    );
+    let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        url.as_str().split('?').next(),
+        Some("https://auth.openai.com/api/accounts/authorize")
+    );
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], "dynamic_agent_client");
+    assert_eq!(query["redirect_uri"], "http://127.0.0.1:1455/auth/callback");
+    assert_eq!(query["agent_name_hint"], "Custom Agent");
+    assert_eq!(
+        query["ext_agent_host_id"],
+        "urn:uuid:e61bbe28-07ef-466d-8e5d-a344f94ab305"
+    );
+    assert_eq!(query["state"], sid);
+    assert_eq!(query["code_challenge_method"], "S256");
+    assert!(!query["nonce"].is_empty() && query["nonce"] != sid);
+    let (status, text) = bind(r#"{"name":"codex.json"}"#).await;
+    assert_eq!(
+        (status, parsed(&text)),
+        (
+            409,
+            json!({"error": "a SIWC binding is already pending for this credential"})
+        )
+    );
+
+    // Legacy sinks refuse the state and leave the binding pending.
+    let (status, text) = send(
+        wreq::Method::POST,
+        "/v0/management/oauth-callback".into(),
+        json!({"provider": "codex", "state": sid, "code": "issued-code"}).to_string(),
+    )
+    .await;
+    assert_eq!(
+        (status, parsed(&text)),
+        (409, json!({"status": "error", "error": "oauth flow is not pending"}))
+    );
+    assert_eq!(
+        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+            provider: "codex",
+            state: sid.clone(),
+            code: "issued-code".into(),
+            error: String::new(),
+        }),
+        cpa_server::runtime::OAuthDelivery::RequiresV8
+    );
+
+    // Incomplete or conflicting callbacks are refused before any exchange.
+    let evil = redirect(&sid, "issued-code").replace("127.0.0.1", "evil.example");
+    let userinfo = redirect(&sid, "issued-code").replace("http://", "http://u@");
+    for body in [
+        json!({"state": sid, "code": "c"}),
+        json!({"state": sid, "client_id": "client"}),
+        json!({"state": sid, "code": "c", "client_id": "client", "provider": "claude"}),
+        json!({"state": sid, "redirect_url": redirect("other-state", "c")}),
+        json!({"state": sid, "redirect_url": evil}),
+        json!({"redirect_url": userinfo}),
+        json!({"redirect_url": format!("{}#frag", redirect(&sid, "c"))}),
+        json!({"redirect_url": format!("{}&client_id=other", redirect(&sid, "c"))}),
+        json!({"state": sid, "client_id": "other", "redirect_url": redirect(&sid, "c")}),
+    ] {
+        let (status, text) = callback(body.clone()).await;
+        assert_eq!(status, 400, "{body}: {text}");
+    }
+    // Go compares the decoded `URL.Path`: `&`, `;` and `+` are literal path bytes.
+    for path in [
+        "/auth/callback&junk",
+        "/auth/callback;junk",
+        "/auth/call+back",
+        "/auth/callback/",
+    ] {
+        let url = redirect(&sid, "c").replace("/auth/callback", path);
+        let (status, text) = callback(json!({"redirect_url": url})).await;
+        assert_eq!(
+            (status, parsed(&text)),
+            (400, json!({"status": "error", "error": "unexpected SIWC callback URL"})),
+            "{path}"
+        );
+    }
+    let (status, _) = send(
+        wreq::Method::GET,
+        format!("/v8/management/oauth/callback?state={sid}&code=c&client_id=a&client_id=b"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(forms.lock().unwrap().is_empty());
+
+    // The pasted loopback URL completes it with the issued client ID.
+    // An escaped path is the same path to Go.
+    let encoded = redirect(&sid, "issued-code").replace("/auth/callback", "/auth/%63allback");
+    let (status, text) = callback(json!({"provider": "openai", "redirect_url": encoded})).await;
+    assert_eq!((status, parsed(&text)), (200, json!({"status": "ok"})));
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(final_status(&base, &sid, 5).await, json!({"status": "ok"}));
+    let form = forms.lock().unwrap().pop().unwrap();
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(form.as_bytes()).into_owned().collect();
+    assert_eq!(form["client_id"], "oaiapp_issued");
+    assert_eq!(form["code"], "issued-code");
+    assert_eq!(form["grant_type"], "authorization_code");
+    assert_eq!(form["redirect_uri"], "http://127.0.0.1:1455/auth/callback");
+    assert_eq!(form["resource"], "https://api.openai.com/v1");
+    let verifier = &form["code_verifier"];
+    assert_eq!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+        query["code_challenge"],
+        "the verifier the session kept"
+    );
+    assert!(!text.contains(verifier.as_str()));
+    // Go `json.Marshal` of the merged file: sorted, compact, other members verbatim.
+    let bound = bound_file();
+    assert!(
+        bound.starts_with(r#"{"access_token":"outer","account_id":"acct","big":123456789012345678901234567890,"email":"a@example.invalid","note":"keep","refresh_token":"outer-rt","siwc":{"access_token":"siwc-at","client_id":"oaiapp_issued","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305","expired":""#),
+        "{bound}"
+    );
+    assert!(
+        bound.ends_with(r#""refresh_token":"siwc-rt","scope":"openid chatgpt.tokens.use.direct","scopes":["openid","chatgpt.tokens.use.direct"]},"type":"codex","use_siwc":true}"#),
+        "{bound}"
+    );
+    let published =
+        f.rt.store()
+            .snapshot()
+            .into_iter()
+            .find(|c| c.id == "codex.json")
+            .unwrap();
+    assert_eq!(published.metadata["use_siwc"], true);
+    assert_eq!(published.metadata["siwc"]["client_id"], "oaiapp_issued");
+    // The v8 list summarizes it without a token; v0 is unchanged.
+    let (_, listed) = send(wreq::Method::GET, "/v8/management/credentials".into(), String::new()).await;
+    for secret in ["siwc-at", "siwc-rt", "siwc-id", "oaiapp_issued"] {
+        assert!(!listed.contains(secret), "{secret}");
+    }
+    let listed = parsed(&listed);
+    let entry = |listed: &Value, name: &str| {
+        listed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let codex = entry(&listed, "codex.json");
+    assert_eq!(
+        (&codex["siwc_bind_supported"], &codex["use_siwc"], &codex["siwc_bound"]),
+        (&json!(true), &json!(true), &json!(true))
+    );
+    let expires = chrono::DateTime::parse_from_rfc3339(codex["siwc_expires_at"].as_str().unwrap()).unwrap();
+    assert!(codex["siwc_expires_at"].as_str().unwrap().ends_with('Z'));
+    let left = (expires.to_utc() - chrono::Utc::now()).num_seconds();
+    assert!((3300..=3420).contains(&left), "{left}");
+    assert_eq!(entry(&listed, "no-refresh.json")["siwc_bind_supported"], false);
+    assert!(entry(&listed, "claude.json").get("siwc_bound").is_none());
+    let (_, legacy) = send(wreq::Method::GET, "/v0/management/auth-files".into(), String::new()).await;
+    assert!(entry(&parsed(&legacy), "codex.json").get("siwc_bound").is_none());
+    // A second callback and a late cancel change nothing.
+    let (status, text) = callback(json!({"redirect_url": redirect(&sid, "issued-code")})).await;
+    assert_eq!(
+        (status, parsed(&text)),
+        (
+            409,
+            json!({"status": "error", "error": "SIWC session is no longer accepting callbacks"})
+        )
+    );
+    let (_, text) = send(
+        wreq::Method::DELETE,
+        format!("/v8/management/oauth/session?state={sid}"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(parsed(&text), json!({"status": "ok", "cancelled": false}));
+
+    let start = || async {
+        let (status, text) = bind(r#"{"name":"codex.json"}"#).await;
+        assert_eq!(status, 200, "{text}");
+        parsed(&text)["state"].as_str().unwrap().to_owned()
+    };
+    // A denied authorization and a failed exchange report fixed messages and save nothing.
+    let sid = start().await;
+    let (status, _) = send(
+        wreq::Method::GET,
+        format!("/v8/management/oauth/callback?state={sid}&error=access_denied%3A+secret-data"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(
+        final_status(&base, &sid, 5).await,
+        json!({"status": "error", "error": "SIWC authorization was denied or failed"})
+    );
+    let sid = start().await;
+    let (status, _) = callback(json!({"redirect_url": redirect(&sid, "fail")})).await;
+    assert_eq!(status, 200);
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(
+        final_status(&base, &sid, 5).await,
+        json!({"status": "error", "error": "Failed to exchange SIWC authorization code; start a new binding"})
+    );
+    assert_eq!(bound_file(), bound);
+
+    // Cancelling during the exchange drops it; the state is then unknown.
+    let sid = start().await;
+    assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hang")})).await.0, 200);
+    tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+        .await
+        .unwrap();
+    let (_, text) = send(
+        wreq::Method::DELETE,
+        format!("/v8/management/oauth/session?state={sid}"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(parsed(&text), json!({"status": "ok", "cancelled": true}));
+    let (status, text) = callback(json!({"redirect_url": redirect(&sid, "hang")})).await;
+    assert_eq!(
+        (status, parsed(&text)),
+        (404, json!({"status": "error", "error": "unknown or expired state"}))
+    );
+
+    // A v8 upload of the file, even unchanged, fails a pending binding; a v0 one does not.
+    let upload = |version: &str| {
+        let path = match version {
+            "v8" => "/v8/management/credentials?name=codex.json",
+            _ => "/v0/management/auth-files?name=codex.json",
+        };
+        send(wreq::Method::POST, path.into(), bound_file())
+    };
+    let sid = start().await;
+    assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hang")})).await.0, 200);
+    tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+        .await
+        .unwrap();
+    assert_eq!(upload("v8").await.0, 200);
+    assert_eq!(
+        final_status(&base, &sid, 5).await,
+        json!({"status": "error", "error": "SIWC binding target changed; start a new binding"})
+    );
+    let sid = start().await;
+    assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hold")})).await.0, 200);
+    tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+        .await
+        .unwrap();
+    assert_eq!(upload("v0").await.0, 200);
+    resume.add_permits(1);
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(final_status(&base, &sid, 5).await, json!({"status": "ok"}));
+
+    // A v0 upload that swaps in another account does not fail the binding, but the
+    // tokens never land on that account.
+    let sid = start().await;
+    assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hold")})).await.0, 200);
+    tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+        .await
+        .unwrap();
+    let other = original.replace(r#""account_id":"acct""#, r#""account_id":"other""#);
+    let (status, _) = send(
+        wreq::Method::POST,
+        "/v0/management/auth-files?name=codex.json".into(),
+        other.clone(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let swapped = bound_file();
+    assert!(swapped.contains(r#""account_id":"other""#));
+    resume.add_permits(1);
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(
+        final_status(&base, &sid, 5).await,
+        json!({"status": "error", "error": "Failed to save SIWC binding; the target may have changed"})
+    );
+    assert_eq!(bound_file(), swapped);
+    assert!(!swapped.contains("siwc-at"));
+
+    // A successful binding clears the target's unauthorized cooldowns and keeps its
+    // quota blocks (Go `BindCodexSIWC`), and leaves other credentials alone. Recording
+    // a result rewrites the file the way Go's `MarkResult` persist does.
+    let fail = |id: &str, model: &str, status: u16, scope| {
+        use cpa_core::exec::ExecError;
+        let mut selection = cpa_server::runtime::Selection::new("codex", model);
+        selection.exclude = ["codex.json", "no-refresh.json"]
+            .into_iter()
+            .filter(|other| *other != id)
+            .map(str::to_owned)
+            .collect();
+        let lease = f.rt.store().select(selection).unwrap();
+        assert_eq!(lease.credential.id, id);
+        let mut error = ExecError::local(status, scope, "upstream said no");
+        error.retry_after = Some(Duration::from_secs(600));
+        lease.complete(cpa_server::runtime::Outcome::Failure(error));
+    };
+    use cpa_core::exec::FailureScope;
+    fail("codex.json", "m-unauthorized", 401, FailureScope::Credential);
+    fail("codex.json", "m-quota", 429, FailureScope::Model);
+    fail("codex.json", "m-forbidden", 403, FailureScope::Credential);
+    fail("no-refresh.json", "m-unauthorized", 401, FailureScope::Credential);
+    let cooling = |id: &str| {
+        f.rt.store()
+            .cooldowns(id)
+            .into_iter()
+            .map(|c| (c.model, c.status))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cooling("codex.json"),
+        [
+            ("m-forbidden".into(), 403),
+            ("m-quota".into(), 429),
+            ("m-unauthorized".into(), 401)
+        ]
+    );
+
+    // A binding never lands under an outer token refresh: one that read the
+    // credential first commits its rotated tokens, then the binding follows on top.
+    let sid = start().await;
+    let refreshing = f.rt.store().prepare_lock("codex.json");
+    let paused = refreshing.lock().await;
+    let read = f.rt.store().get("codex.json").unwrap();
+    assert_eq!(
+        callback(json!({"redirect_url": redirect(&sid, "issued-code")})).await.0,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        oauth_get(&base, &format!("/oauth/status?state={sid}")).await,
+        json!({"status": "wait"})
+    );
+    let rotated = cpa_core::credential::MetadataPatch {
+        set: serde_json::Map::from_iter([
+            ("access_token".into(), "rotated-outer".into()),
+            ("refresh_token".into(), "rotated-outer-rt".into()),
+        ]),
+        remove: vec![],
+    };
+    f.rt.store().apply_patch("codex.json", read.revision, &rotated).unwrap();
+    drop(paused);
+    assert_eq!(wait_settled(&mut settled).await, sid);
+    assert_eq!(final_status(&base, &sid, 5).await, json!({"status": "ok"}));
+    assert_eq!(
+        cooling("codex.json"),
+        [("m-forbidden".into(), 403), ("m-quota".into(), 429)]
+    );
+    assert_eq!(cooling("no-refresh.json"), [("m-unauthorized".into(), 401)]);
+    let disk: Value = serde_json::from_str(&bound_file()).unwrap();
+    let memory = f.rt.store().get("codex.json").unwrap().metadata.clone();
+    for meta in [&disk, &Value::Object(memory)] {
+        assert_eq!(
+            (
+                &meta["access_token"],
+                &meta["refresh_token"],
+                &meta["use_siwc"],
+                &meta["siwc"]["access_token"]
+            ),
+            (
+                &json!("rotated-outer"),
+                &json!("rotated-outer-rt"),
+                &json!(true),
+                &json!("siwc-at")
+            ),
+            "{meta}"
+        );
+    }
+
+    // So does a v8 delete; the file is then gone.
+    let sid = start().await;
+    assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hang")})).await.0, 200);
+    tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+        .await
+        .unwrap();
+    let (status, _) = send(
+        wreq::Method::DELETE,
+        "/v8/management/credentials?name=codex.json".into(),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        final_status(&base, &sid, 5).await,
+        json!({"status": "error", "error": "SIWC binding target changed; start a new binding"})
+    );
+    assert!(!file.exists());
+    let (status, _) = send(
+        wreq::Method::POST,
+        "/v8/management/credentials?name=codex.json".into(),
+        original.into(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // A binding whose exchange is in flight, by its state.
+    let pending = || async {
+        let sid = start().await;
+        assert_eq!(callback(json!({"redirect_url": redirect(&sid, "hang")})).await.0, 200);
+        tokio::time::timeout(Duration::from_secs(5), exchanging.notified())
+            .await
+            .unwrap();
+        sid
+    };
+    let changed = json!({"status": "error", "error": "SIWC binding target changed; start a new binding"});
+    let other = f.dir.join("auth").join("other.json");
+
+    // Go `TestSIWCFileMutationScopeAndValidation`: a refused v8 upload, a v8 upload of
+    // another file and a v0 upload keep the binding pending; a v8 reupload fails it.
+    let sid = pending().await;
+    let before = bound_file();
+    for (path, body, want) in [
+        (
+            "/v8/management/credentials?name=codex.json",
+            r#"{"type":"codex","excluded_models":123}"#.to_owned(),
+            400,
+        ),
+        ("/v8/management/credentials?name=other.json", before.clone(), 200),
+        ("/v0/management/auth-files?name=codex.json", before.clone(), 200),
+    ] {
+        let (status, text) = send(wreq::Method::POST, path.into(), body).await;
+        assert_eq!(status, want, "{path}: {text}");
+        assert_eq!(
+            oauth_get(&base, &format!("/oauth/status?state={sid}")).await,
+            json!({"status": "wait"}),
+            "{path}"
+        );
+    }
+    assert_eq!(upload("v8").await.0, 200);
+    assert_eq!(final_status(&base, &sid, 5).await, changed);
+
+    // Go `TestSIWCFileMutationRejectsLateExchange`, by route: each v8 mutation of the
+    // file fails a binding whose exchange is in flight, and stops that exchange. A
+    // result that returns while the mutation runs is
+    // `management::siwc::tests::a_late_exchange_lands_nothing_after_a_v8_mutation`.
+    for operation in ["upload", "delete", "delete-all", "delete-batch"] {
+        let sid = pending().await;
+        let before = bound_file();
+        if operation.starts_with("delete-") {
+            std::fs::write(&other, &before).unwrap();
+        }
+        let (method, path, body) = match operation {
+            "upload" => (
+                wreq::Method::POST,
+                "/v8/management/credentials?name=codex.json",
+                before.clone(),
+            ),
+            "delete" => (
+                wreq::Method::DELETE,
+                "/v8/management/credentials?name=codex.json",
+                String::new(),
+            ),
+            "delete-all" => (
+                wreq::Method::DELETE,
+                "/v8/management/credentials?all=true",
+                String::new(),
+            ),
+            _ => (
+                wreq::Method::DELETE,
+                "/v8/management/credentials",
+                r#"["codex.json","other.json"]"#.to_owned(),
+            ),
+        };
+        let (status, text) = send(method, path.into(), body).await;
+        assert_eq!(status, 200, "{operation}: {text}");
+        assert_eq!(final_status(&base, &sid, 5).await, changed, "{operation}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if operation == "upload" {
+            assert_eq!(bound_file(), before, "{operation}");
+            continue;
+        }
+        assert!(!file.exists(), "{operation}: file resurrected");
+        assert!(
+            f.rt.store().get("codex.json").is_none(),
+            "{operation}: registration resurrected"
+        );
+        let (status, _) = send(
+            wreq::Method::POST,
+            "/v8/management/credentials?name=codex.json".into(),
+            original.into(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    // The credential file itself may not be a symlink.
+    #[cfg(unix)]
+    {
+        let target = f.dir.join("auth").join("target.json");
+        std::fs::rename(&file, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        let (status, text) = bind(r#"{"name":"codex.json"}"#).await;
+        assert_eq!(
+            (status, parsed(&text)),
+            (400, json!({"error": "SIWC binding target is unavailable or invalid"}))
+        );
+    }
+    server.abort();
+    upstream.abort();
+}
+
+/// `raw` with this fixture's management key and private auth-dir added, in the v8
+/// layout or, for `legacy`, as legacy root keys (so a legacy file stays legacy).
+fn private_config(raw: &str, auth: &std::path::Path, hash: &str, legacy: bool) -> String {
+    let auth = auth.display();
+    if legacy {
+        return format!("remote-management: {{secret-key: '{hash}'}}\nauth-dir: {auth}\n{raw}");
+    }
+    let mut out = format!("management: {{secret-key: '{hash}'}}\n");
+    if raw.contains("oauth: {") {
+        out += &raw.replacen("oauth: {", &format!("oauth: {{auth-dir: {auth}, "), 1);
+    } else if let Some(line) = raw.lines().find(|l| l.starts_with("oauth:")) {
+        out += &raw.replacen(&format!("{line}\n"), &format!("{line}\n  auth-dir: {auth}\n"), 1);
+    } else {
+        out += raw;
+        out += &format!("oauth:\n  auth-dir: {auth}\n");
+    }
+    out
+}
+
+/// One management request: its status and body.
+async fn call(base: &str, method: wreq::Method, path: &str, body: &str) -> (u16, String) {
+    let r = wreq::Client::new()
+        .request(method, format!("{base}{path}"))
+        .bearer_auth("fake-management-only")
+        .body(body.to_owned())
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+/// Every saved v8 file is fully canonical: nothing is left for a migration to move.
+fn assert_canonical(file: &str) {
+    let saved: serde_yaml_ng::Value = serde_yaml_ng::from_str(file).unwrap();
+    let canonical = cpa_core::config::ConfigDocument::parse(file).unwrap();
+    assert_eq!(&saved, canonical.value(), "{file}");
+    assert!(file.contains("config-version: 8"), "{file}");
+}
+
+/// Go v8.0.35 `TestConfigV8HistoricalFieldPaths` (3be5fa44): every historical v8 field
+/// path reads, patches, replaces and deletes its canonical field.
+#[tokio::test]
+async fn config_v8_historical_field_paths() {
+    for (historical, current, value) in [
+        (
+            "oauth/providers/codex/disable-codex-cloaking",
+            "upstream/codex/disable-codex-cloaking",
+            "true",
+        ),
+        (
+            "oauth/providers/codex/stream-bootstrap-buffering",
+            "upstream/codex/stream-bootstrap-buffering",
+            "true",
+        ),
+        (
+            "oauth/providers/codex/stream-bootstrap-timeout",
+            "upstream/codex/stream-bootstrap-timeout",
+            r#""10s""#,
+        ),
+        (
+            "oauth/providers/codex/orphan-delegation-compatibility",
+            "upstream/codex/orphan-delegation-compatibility",
+            "true",
+        ),
+        (
+            "oauth/providers/codex/model-level-cooling",
+            "upstream/codex/model-level-cooling",
+            "true",
+        ),
+        (
+            "oauth/providers/codex/response-steering",
+            "upstream/codex/response-steering",
+            "true",
+        ),
+        (
+            "oauth/providers/claude/model-level-cooling",
+            "upstream/claude/model-level-cooling",
+            "true",
+        ),
+        (
+            "oauth/providers/claude/disable-claude-cloak-mode",
+            "upstream/claude/disable-claude-cloak-mode",
+            "true",
+        ),
+        (
+            "oauth/providers/claude/header-defaults/user-agent",
+            "upstream/claude/header-defaults/user-agent",
+            r#""test-agent""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/package-version",
+            "upstream/claude/header-defaults/package-version",
+            r#""0.2.0""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/runtime-version",
+            "upstream/claude/header-defaults/runtime-version",
+            r#""v22""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/os",
+            "upstream/claude/header-defaults/os",
+            r#""Windows""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/arch",
+            "upstream/claude/header-defaults/arch",
+            r#""amd64""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/timeout",
+            "upstream/claude/header-defaults/timeout",
+            r#""300""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/timezone",
+            "upstream/claude/header-defaults/timezone",
+            r#""Asia/Shanghai""#,
+        ),
+        (
+            "oauth/providers/claude/header-defaults/stabilize-device-profile",
+            "upstream/claude/header-defaults/stabilize-device-profile",
+            "true",
+        ),
+        (
+            "oauth/providers/claude/claude-code/disable-cloaking-model-list",
+            "upstream/claude/disable-cloaking-model-list",
+            "false",
+        ),
+        (
+            "oauth/providers/xai/inject-x-search",
+            "upstream/xai/inject-x-search",
+            "true",
+        ),
+        (
+            "oauth/providers/codex/optimize-multi-agent-v2",
+            "client/codex/optimize-multi-agent-v2",
+            "true",
+        ),
+    ] {
+        let f = Fixture::from_yaml("historical-fields", |auth, hash| {
+            private_config("server: {port: 8317}\n", auth, hash, false)
+        });
+        let (base, server) = f.server().await;
+        let at = |p: &str| format!("/v8/management/config/{p}");
+        assert_eq!(
+            call(&base, wreq::Method::PUT, &at(current), value).await.0,
+            200,
+            "{current}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::GET, &at(historical), "").await,
+            (200, value.to_owned()),
+            "{historical}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::PATCH, &at(historical), value).await.0,
+            200,
+            "{historical}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::PUT, &at(historical), "null").await.0,
+            200,
+            "{historical}"
+        );
+        // v8.0.35 saves the validated tree directly: an explicit null keeps through
+        // either path.
+        assert_eq!(
+            call(&base, wreq::Method::GET, &at(current), "").await,
+            (200, "null".to_owned()),
+            "{historical}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::PUT, &at(current), value).await.0,
+            200,
+            "{current}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::PUT, &at(current), "null").await.0,
+            200,
+            "{current}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::GET, &at(current), "").await,
+            (200, "null".to_owned()),
+            "{current}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::DELETE, &at(historical), "").await.0,
+            200,
+            "{historical}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::GET, &at(current), "").await.0,
+            404,
+            "{historical}"
+        );
+        assert_eq!(
+            call(&base, wreq::Method::GET, &at("server/port"), "").await,
+            (200, "8317".to_owned())
+        );
+        assert_canonical(&f.file());
+        server.abort();
+    }
+}
+
+/// Go `TestConfigV8HistoricalProviderSubtrees`: a historical provider subtree shows the
+/// shared and client values it once held, and PATCH merges into, PUT replaces and
+/// DELETE removes all of them, leaving unrelated settings and OAuth scope alone.
+#[tokio::test]
+async fn config_v8_historical_provider_subtrees() {
+    let raw = "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}, xai: {inject-x-search: true}}\noauth: {providers: {codex: {header-defaults: {user-agent: oauth-agent}}}}\nclient: {codex: {optimize-multi-agent-v2: true, enable-apply-patch: true}}\n";
+    for (method, path, body, steering, buffering, optimize, agent) in [
+        (
+            wreq::Method::PATCH,
+            "oauth/providers/codex",
+            r#"{"response-steering":false,"header-defaults":{"user-agent":"updated"}}"#,
+            false,
+            true,
+            true,
+            "updated",
+        ),
+        (
+            wreq::Method::PUT,
+            "oauth/providers/codex",
+            r#"{"response-steering":true}"#,
+            true,
+            false,
+            false,
+            "",
+        ),
+        (
+            wreq::Method::DELETE,
+            "oauth/providers/codex",
+            "",
+            false,
+            false,
+            false,
+            "",
+        ),
+        (
+            wreq::Method::PUT,
+            "upstream/codex",
+            r#"{"response-steering":false}"#,
+            false,
+            false,
+            true,
+            "oauth-agent",
+        ),
+    ] {
+        let f = Fixture::from_yaml("historical-subtrees", |auth, hash| {
+            private_config(raw, auth, hash, false)
+        });
+        let original = f.file();
+        let (base, server) = f.server().await;
+        let (status, view) = call(
+            &base,
+            wreq::Method::GET,
+            "/v8/management/config/oauth/providers/codex",
+            "",
+        )
+        .await;
+        let view: Value = serde_json::from_str(&view).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            (&view["response-steering"], &view["optimize-multi-agent-v2"]),
+            (&json!(true), &json!(true)),
+            "{view}"
+        );
+        assert_eq!(f.file(), original, "a historical GET changed the file");
+        let (status, text) = call(&base, method.clone(), &format!("/v8/management/config/{path}"), body).await;
+        assert_eq!(status, 200, "{method} {path}: {text}");
+        let file = f.file();
+        assert_canonical(&file);
+        let cfg = Config::parse(&file).unwrap();
+        let d = &cfg.document;
+        let flag = |v: &serde_yaml_ng::Value| v.as_bool().unwrap_or(false);
+        assert_eq!(
+            (
+                flag(&d["upstream"]["codex"]["response-steering"]),
+                flag(&d["upstream"]["codex"]["stream-bootstrap-buffering"]),
+                flag(&d["client"]["codex"]["optimize-multi-agent-v2"]),
+                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                    .as_str()
+                    .unwrap_or(""),
+            ),
+            (steering, buffering, optimize, agent),
+            "{method} {path}: {file}"
+        );
+        assert!(flag(&d["upstream"]["xai"]["inject-x-search"]) && flag(&d["client"]["codex"]["enable-apply-patch"]));
+        let api = cfg.for_api_key();
+        assert!(
+            api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        );
+        server.abort();
+    }
+}
+
+/// Go `TestConfigV8HistoricalConfigurationBodies` and
+/// `TestConfigV8HistoricalNullContainerPatch`: whole-config bodies with historical
+/// paths are normalized, a canonical value in the same body wins, and a null
+/// historical container resets its fields.
+#[tokio::test]
+async fn config_v8_historical_configuration_bodies() {
+    for (method, route, body, steering, buffering) in [
+        (
+            wreq::Method::PATCH,
+            "config",
+            r#"{"oauth":{"providers":{"codex":{"response-steering":false}}}}"#,
+            false,
+            true,
+        ),
+        (
+            wreq::Method::PATCH,
+            "config",
+            r#"{"oauth":{"providers":{"codex":{"response-steering":true}}},"upstream":{"codex":{"response-steering":false}}}"#,
+            false,
+            true,
+        ),
+        (
+            wreq::Method::PATCH,
+            "config",
+            r#"{"oauth":{"providers":{"codex":{"response-steering":true}}},"upstream":{"codex":{"response-steering":null}}}"#,
+            false,
+            true,
+        ),
+        (
+            wreq::Method::PUT,
+            "config",
+            r#"{"oauth":{"providers":{"codex":{"response-steering":true}}}}"#,
+            true,
+            false,
+        ),
+        (
+            wreq::Method::PUT,
+            "config.yaml",
+            "# Keep this comment\noauth: {providers: {codex: {response-steering: false}}}\n",
+            false,
+            false,
+        ),
+    ] {
+        let f = Fixture::from_yaml("historical-bodies", |auth, hash| {
+            private_config(
+                "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}}\n",
+                auth,
+                hash,
+                false,
+            )
+        });
+        let (base, server) = f.server().await;
+        // Root writes replace the whole file, so the body carries its own access.
+        let body = if method == wreq::Method::PUT {
+            let auth = f.dir.join("auth");
+            let hash = f.rt.config().management.secret_key.clone();
+            if route == "config" {
+                let mut v: Value = serde_json::from_str(body).unwrap();
+                v["management"] = json!({"secret-key": hash});
+                v["oauth"]["auth-dir"] = json!(auth.display().to_string());
+                v.to_string()
+            } else {
+                private_config(body, &auth, &hash, false)
+            }
+        } else {
+            body.to_owned()
+        };
+        let (status, text) = call(&base, method.clone(), &format!("/v8/management/{route}"), &body).await;
+        assert_eq!(status, 200, "{body}: {text}");
+        let file = f.file();
+        assert_canonical(&file);
+        let d = Config::parse(&file).unwrap().document;
+        let flag = |v: &serde_yaml_ng::Value| v.as_bool().unwrap_or(false);
+        assert_eq!(
+            (
+                flag(&d["upstream"]["codex"]["response-steering"]),
+                flag(&d["upstream"]["codex"]["stream-bootstrap-buffering"])
+            ),
+            (steering, buffering),
+            "{body}: {file}"
+        );
+        if route == "config.yaml" {
+            assert!(file.contains("# Keep this comment"), "{file}");
+        }
+        server.abort();
+    }
+    let f = Fixture::from_yaml("historical-null", |auth, hash| {
+        private_config(
+            "upstream: {claude: {model-level-cooling: true, header-defaults: {user-agent: agent, timezone: UTC, stabilize-device-profile: true}}}\n",
+            auth,
+            hash,
+            false,
+        )
+    });
+    let (base, server) = f.server().await;
+    let body = r#"{"oauth":{"providers":{"claude":{"header-defaults":null}}}}"#;
+    assert_eq!(
+        call(&base, wreq::Method::PATCH, "/v8/management/config", body).await.0,
+        200
+    );
+    let d = Config::parse(&f.file()).unwrap().document;
+    let claude = &d["upstream"]["claude"];
+    for field in ["user-agent", "timezone"] {
+        assert!(
+            claude["header-defaults"][field].as_str().unwrap_or("").is_empty(),
+            "{}",
+            f.file()
+        );
+    }
+    assert_eq!(claude["model-level-cooling"], serde_yaml_ng::Value::Bool(true));
+    server.abort();
+
+    // Request normalization is not the loader's validation: a missing canonical field
+    // replaces a non-mapping ancestor (Go `setYAMLPath`), and a malformed historical
+    // container is left for the config parse, which answers 422.
+    let f = Fixture::from_yaml("historical-malformed", |auth, hash| {
+        private_config(
+            "upstream: {codex: {response-steering: true}}
+",
+            auth,
+            hash,
+            false,
+        )
+    });
+    let (base, server) = f.server().await;
+    let body = r#"{"upstream":null,"oauth":{"providers":{"xai":{"inject-x-search":true}}}}"#;
+    let (status, text) = call(&base, wreq::Method::PATCH, "/v8/management/config", body).await;
+    assert_eq!(status, 200, "{text}");
+    let file = f.file();
+    assert_canonical(&file);
+    let d = Config::parse(&file).unwrap().document;
+    assert_eq!(
+        d["upstream"]["xai"]["inject-x-search"],
+        serde_yaml_ng::Value::Bool(true),
+        "{file}"
+    );
+    assert_eq!(
+        d["upstream"]["codex"]["response-steering"],
+        serde_yaml_ng::Value::Bool(true),
+        "{file}"
+    );
+    let (status, text) = call(
+        &base,
+        wreq::Method::PUT,
+        "/v8/management/config/oauth/providers/claude",
+        r#""bad""#,
+    )
+    .await;
+    assert_eq!(status, 422, "{text}");
+    let err: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(err["error"], "invalid_config", "{text}");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("oauth.providers.claude must be a mapping"),
+        "{text}"
+    );
+    assert_eq!(f.file(), file, "a refused write changed the file");
+    server.abort();
+}
+
+/// Go `TestLegacyConfigYAMLSavesBySubmittedVersion`: `PUT /v0/management/config.yaml`
+/// keeps a legacy upload as submitted and saves a v8 one in the latest layout.
+#[tokio::test]
+async fn v0_config_yaml_saves_by_submitted_version() {
+    for (body, steering, v8) in [
+        ("# Keep this comment\ncodex: {response-steering: true}\n", true, false),
+        (
+            "# Keep this comment\noauth: {providers: {codex: {response-steering: true}}}\n",
+            true,
+            true,
+        ),
+        (
+            "# Keep this comment\nconfig-version: 8\nupstream: {codex: {response-steering: false}}\n",
+            false,
+            true,
+        ),
+        (
+            "# Keep this comment\nrequest-retry: 3\nupstream: {codex: {response-steering: false}}\n",
+            false,
+            true,
+        ),
+    ] {
+        let f = Fixture::new("v0-yaml-version");
+        let (base, server) = f.server().await;
+        let hash = f.rt.config().management.secret_key.clone();
+        let body = private_config(body, &f.dir.join("auth"), &hash, !v8);
+        let (status, text) = call(&base, wreq::Method::PUT, "/v0/management/config.yaml", &body).await;
+        assert_eq!(status, 200, "{body}: {text}");
+        let file = f.file();
+        if v8 {
+            assert_canonical(&file);
+        } else {
+            assert_eq!(file, body, "v0 changed the submitted legacy layout");
+        }
+        assert!(file.contains("# Keep this comment"), "{file}");
+        let api = f.rt.config();
+        let api = api.for_api_key();
+        assert_eq!(
+            api.document["upstream"]["codex"]["response-steering"].as_bool(),
+            Some(steering),
+            "{file}"
+        );
+        server.abort();
+    }
+}
+
+/// Go `TestV0SetterSavesByExistingVersion` (v8 cases), `TestV0SaveUpgradesHistoricalV8Layout`
+/// and `TestV8MovedCommentsSurviveV0Saves`: a v0 setter saves an existing v8 file in the
+/// latest layout, and the comments of a moved historical field (and of the ancestors
+/// it leaves empty) survive repeated saves exactly once. Legacy-only files:
+/// [`v0_setters_keep_a_legacy_layout`].
+#[tokio::test]
+async fn v0_setters_save_v8_files_in_the_latest_layout() {
+    for raw in [
+        "config-version: 8\n# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
+        "# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
+        "config-version: 8\nupstream: {codex: {response-steering: true}, xai: {inject-x-search: true}}\nrouting: {retry: {request-retry: 3}}\n",
+    ] {
+        let f = Fixture::from_yaml("v0-existing-version", |auth, hash| {
+            private_config(raw, auth, hash, false)
+        });
+        let (base, server) = f.server().await;
+        let (status, text) = call(
+            &base,
+            wreq::Method::PUT,
+            "/v0/management/request-retry",
+            r#"{"value":2}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{text}");
+        let file = f.file();
+        assert_canonical(&file);
+        let cfg = Config::parse(&file).unwrap();
+        let api = cfg.for_api_key();
+        assert_eq!(api.document["routing"]["retry"]["request-retry"], 2);
+        assert_eq!(
+            api.document["upstream"]["codex"]["response-steering"],
+            serde_yaml_ng::Value::Bool(true)
+        );
+        assert_eq!(
+            api.document["upstream"]["xai"]["inject-x-search"],
+            serde_yaml_ng::Value::Bool(true)
+        );
+        if raw.contains("oauth-agent") {
+            // The Codex header defaults stay OAuth-only through the save.
+            let ua = |d: &serde_yaml_ng::Value| {
+                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            assert_eq!(
+                (ua(&cfg.document), ua(&api.document)),
+                ("oauth-agent".to_owned(), String::new()),
+                "{file}"
+            );
+        }
+        if raw.contains('#') {
+            assert!(file.contains("# Preserve provider settings"), "{file}");
+        }
+        server.abort();
+    }
+    let raw = "# DOCUMENT HEAD\nconfig-version: 8\noauth: # OAUTH INLINE\n  providers: # PROVIDERS INLINE\n    xai: # PROVIDER INLINE\n      # FIELD HEAD\n      inject-x-search: true # FIELD INLINE\n\n      # FIELD FOOT\n\n    # PROVIDER FOOT\nserver:\n  port: 8317 # UNRELATED INLINE\n# DOCUMENT FOOT\n";
+    let f = Fixture::from_yaml("v0-moved-comments", |auth, hash| {
+        let raw = raw.replacen(
+            "oauth: # OAUTH INLINE\n",
+            &format!("oauth: # OAUTH INLINE\n  auth-dir: {}\n", auth.display()),
+            1,
+        );
+        format!("management: {{secret-key: '{hash}'}}\n{raw}")
+    });
+    let (base, server) = f.server().await;
+    for (method, retry) in [(wreq::Method::PUT, 2), (wreq::Method::PATCH, 1), (wreq::Method::PUT, 0)] {
+        let (status, body) = call(
+            &base,
+            method,
+            "/v0/management/request-retry",
+            &format!(r#"{{"value":{retry}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let file = f.file();
+        assert_canonical(&file);
+        assert_eq!(
+            Config::parse(&file).unwrap().document["routing"]["retry"]["request-retry"],
+            retry,
+            "{file}"
+        );
+        for marker in [
+            "DOCUMENT HEAD",
+            "OAUTH INLINE",
+            "PROVIDERS INLINE",
+            "PROVIDER INLINE",
+            "FIELD HEAD",
+            "FIELD INLINE",
+            "FIELD FOOT",
+            "PROVIDER FOOT",
+            "UNRELATED INLINE",
+            "DOCUMENT FOOT",
+        ] {
+            assert_eq!(file.matches(marker).count(), 1, "{marker}: {file}");
+        }
+    }
+    server.abort();
+}
+
+/// Go `TestConfigV8FieldUpdatesKeepComments`: scalar field updates through the
+/// historical or canonical path keep the field's and its section's comments.
+#[tokio::test]
+async fn config_v8_field_updates_keep_comments() {
+    for method in [wreq::Method::PUT, wreq::Method::PATCH] {
+        for path in [
+            "oauth/providers/codex/response-steering",
+            "upstream/codex/response-steering",
+        ] {
+            let f = Fixture::from_yaml("field-comments", |auth, hash| {
+                format!(
+                    "management: {{secret-key: '{hash}'}}\noauth:\n  auth-dir: {}\n  providers:\n    codex: # PROVIDER INLINE\n      # FIELD HEAD\n      response-steering: true # FIELD INLINE\n\n      # FIELD FOOT\n",
+                    auth.display()
+                )
+            });
+            let (base, server) = f.server().await;
+            for body in ["false", "null", "true"] {
+                let (status, text) = call(&base, method.clone(), &format!("/v8/management/config/{path}"), body).await;
+                assert_eq!(status, 200, "{text}");
+                let file = f.file();
+                for marker in ["PROVIDER INLINE", "FIELD HEAD", "FIELD INLINE", "FIELD FOOT"] {
+                    assert_eq!(
+                        file.matches(marker).count(),
+                        1,
+                        "{method} {path} {body} {marker}: {file}"
+                    );
+                }
+            }
+            server.abort();
+        }
+    }
+}
+
+/// Go `TestV0SetterSavesByExistingVersion` (legacy case) and
+/// `TestV0RepeatedSavesKeepLegacyClientAlias`: a v0 setter on a file without v8
+/// sections keeps the legacy layout and its comments, so every setting keeps its
+/// meaning; a legacy `codex-header-defaults` still applies to API-key credentials.
+#[tokio::test]
+async fn v0_setters_keep_a_legacy_layout() {
+    for raw in [
+        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\nrouting: {strategy: fill-first}\n",
+        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\ncodex-header-defaults: {user-agent: legacy-agent}\n",
+    ] {
+        let f = Fixture::from_yaml("v0-legacy-version", |auth, hash| private_config(raw, auth, hash, true));
+        let (base, server) = f.server().await;
+        let (status, text) = call(
+            &base,
+            wreq::Method::PUT,
+            "/v0/management/request-retry",
+            r#"{"value":2}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{text}");
+        let file = f.file();
+        assert!(
+            !file.contains("config-version:") && !file.contains("upstream:"),
+            "v0 migrated a legacy-only file: {file}"
+        );
+        let cfg = Config::parse(&file).unwrap();
+        let api = cfg.for_api_key();
+        let d = &api.document;
+        assert_eq!(d["routing"]["retry"]["request-retry"], 2, "{file}");
+        assert_eq!(
+            d["upstream"]["codex"]["response-steering"],
+            serde_yaml_ng::Value::Bool(true),
+            "{file}"
+        );
+        assert_eq!(
+            d["upstream"]["xai"]["inject-x-search"],
+            serde_yaml_ng::Value::Bool(true),
+            "{file}"
+        );
+        if raw.contains("legacy-agent") {
+            let ua = &d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"];
+            assert_eq!(
+                ua.as_str(),
+                Some("legacy-agent"),
+                "API keys lost the legacy header default: {file}"
+            );
+        }
+        server.abort();
+    }
+    let raw = "# LEGACY DOCUMENT\ncodex:\n  # OPTIMIZE HEAD\n  optimize-multi-agent-v2: true # OPTIMIZE INLINE\n  response-steering: true\nrequest-retry: 3\n";
+    let f = Fixture::from_yaml("v0-legacy-client", |auth, hash| private_config(raw, auth, hash, true));
+    let (base, server) = f.server().await;
+    for retry in [2, 1, 0] {
+        let body = format!(r#"{{"value":{retry}}}"#);
+        let (status, text) = call(&base, wreq::Method::PUT, "/v0/management/request-retry", &body).await;
+        assert_eq!(status, 200, "{text}");
+        let file = f.file();
+        for absent in ["config-version:", "upstream:", "client:"] {
+            assert!(!file.contains(absent), "v0 save changed the legacy layout: {file}");
+        }
+        assert!(file.contains("optimize-multi-agent-v2: true"), "{file}");
+        for marker in ["LEGACY DOCUMENT", "OPTIMIZE HEAD", "OPTIMIZE INLINE"] {
+            assert_eq!(file.matches(marker).count(), 1, "{marker}: {file}");
+        }
+        let cfg = Config::parse(&file).unwrap();
+        let api = cfg.for_api_key();
+        assert_eq!(api.document["routing"]["retry"]["request-retry"], retry, "{file}");
+        assert_eq!(
+            api.document["client"]["codex"]["optimize-multi-agent-v2"],
+            serde_yaml_ng::Value::Bool(true),
+            "{file}"
+        );
+        assert_eq!(
+            api.document["upstream"]["codex"]["response-steering"],
+            serde_yaml_ng::Value::Bool(true),
+            "{file}"
+        );
+    }
+    server.abort();
+}
+
+/// A v0 legacy save works on Go's flattened tree: an inherited (`<<`) setting can be
+/// deleted, and a setter below an inherited parent keeps its untouched siblings. A key
+/// edited into the file as plaintext is saved and published hashed, whether the save
+/// sets, deletes or keeps a value, as Go saves its in-memory, hashed config.
+#[tokio::test]
+async fn v0_legacy_saves_expand_merges_and_hash_the_key() {
+    let merged = |name: &str| {
+        Fixture::from_yaml(name, |auth, hash| {
+            private_config(
+                "<<:\n  oauth-excluded-models:\n    codex: [blocked-model]\n  quota-exceeded:\n    switch-project: true\n    switch-preview-model: true\n",
+                auth,
+                hash,
+                true,
+            )
+        })
+    };
+    let f = merged("v0-legacy-merge-delete");
+    let (base, server) = f.server().await;
+    let excluded = |f: &Fixture| {
+        f.rt.config().document["oauth"]["excluded-models"]
+            .get("codex")
+            .is_some()
+    };
+    assert!(excluded(&f));
+    let (status, text) = call(
+        &base,
+        wreq::Method::DELETE,
+        "/v0/management/oauth-excluded-models?provider=codex",
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let file = f.file();
+    assert!(
+        !file.contains("blocked-model") && !file.contains("config-version:"),
+        "{file}"
+    );
+    assert!(!excluded(&f), "{file}");
+    server.abort();
+
+    // A fresh merged file: the edit lands under the inherited parent itself.
+    let f = merged("v0-legacy-merge-sibling");
+    let (base, server) = f.server().await;
+    let (status, text) = call(
+        &base,
+        wreq::Method::PATCH,
+        "/v0/management/quota-exceeded/switch-project",
+        r#"{"value":false}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let file = f.file();
+    let d = Config::parse(&file).unwrap().document;
+    assert_eq!(
+        d["quota-exceeded"]["switch-project"],
+        serde_yaml_ng::Value::Bool(false),
+        "{file}"
+    );
+    assert_eq!(
+        d["quota-exceeded"]["switch-preview-model"],
+        serde_yaml_ng::Value::Bool(true),
+        "{file}"
+    );
+    assert!(file.contains("blocked-model"), "{file}");
+    server.abort();
+
+    for (name, method, route, body) in [
+        (
+            "set",
+            wreq::Method::PUT,
+            "/v0/management/request-retry",
+            r#"{"value":2}"#,
+        ),
+        (
+            "delete",
+            wreq::Method::DELETE,
+            "/v0/management/oauth-excluded-models?provider=codex",
+            "",
+        ),
+        (
+            "keep",
+            wreq::Method::PUT,
+            "/v0/management/oauth-excluded-models",
+            r#"{"codex":["blocked-model"]}"#,
+        ),
+    ] {
+        let f = Fixture::from_yaml(&format!("v0-legacy-secret-{name}"), |auth, hash| {
+            private_config(
+                "request-retry: 3\noauth-excluded-models:\n  codex: [blocked-model]\n",
+                auth,
+                hash,
+                true,
+            )
+        });
+        let (base, server) = f.server().await;
+        // Hand-edited after startup, before any reload (the fixture runs no watcher).
+        let hash = f.rt.config().management.secret_key.clone();
+        std::fs::write(
+            f.dir.join("config.yaml"),
+            f.file().replace(&hash, "fake-management-only"),
+        )
+        .unwrap();
+        let (status, text) = call(&base, method, route, body).await;
+        assert_eq!(status, 200, "{name}: {text}");
+        let file = f.file();
+        assert_eq!(file.contains("blocked-model"), name != "delete", "{name}: {file}");
+        let saved = Config::parse(&file).unwrap().management.secret_key;
+        assert!(
+            bcrypt::verify("fake-management-only", &saved).unwrap(),
+            "{name}: {file}"
+        );
+        let live = f.rt.config().management.secret_key.clone();
+        assert!(bcrypt::verify("fake-management-only", &live).unwrap(), "{name}: {live}");
+        assert_eq!(
+            call(&base, wreq::Method::GET, "/v0/management/request-retry", "")
+                .await
+                .0,
+            200,
+            "{name}"
+        );
+        server.abort();
+    }
+}
+
+/// Go `TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe` (0c708401, 3d61c954): v8 lists
+/// name the quota plugin the host selects for each credential's provider (a first-pass
+/// identifier match beats an earlier plugin's described providers), and hide the
+/// declarative `quota_probe`, which only the v0 quota route runs. v0 lists keep the
+/// probe and never name the plugin.
+#[tokio::test]
+async fn auth_files_list_v8_quota_plugin_id_and_no_quota_probe() {
+    use cpa_plugin::testing::scripted::{Script, host_with};
+    let quota = |identifier: &'static str, describe: &'static str| Script {
+        caps: r#""quota_provider":true"#,
+        results: [("quota.identifier", identifier), ("quota.describe", describe)].into(),
+        fuse_on: None,
+    };
+    let dir = std::env::temp_dir().join(format!("manage-quota-plugins-{}", std::process::id()));
+    let (host, _) = host_with(
+        &dir,
+        [
+            (
+                "a-multi-quota",
+                quota(
+                    r#"{"identifier":"multi-quota"}"#,
+                    r#"{"supported_providers":["foo","bar"]}"#,
+                ),
+            ),
+            ("m-high-quota", quota(r#"{"identifier":"high"}"#, "{}")),
+            ("z-foo-quota", quota(r#"{"identifier":"foo"}"#, "{}")),
+        ]
+        .into(),
+    )
+    .await;
+    let auth = std::env::temp_dir().join(format!("manage-quota-auth-{}", std::process::id()));
+    std::fs::create_dir_all(&auth).unwrap();
+    for (name, body) in [
+        ("foo.json", r#"{"type":"foo"}"#),
+        ("bar.json", r#"{"type":"bar"}"#),
+        ("upper.json", r#"{"type":"high"}"#),
+        (
+            "probe.json",
+            r#"{"type":"custom","quota_probe":{"url":"https://api.example.invalid/quota"}}"#,
+        ),
+    ] {
+        std::fs::write(auth.join(name), body).unwrap();
+    }
+    let path = auth.join("config.yaml");
+    let hash = bcrypt::hash("fake-management-only", 4).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        ),
+    )
+    .unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let mut credentials = cpa_core::config::credentials::load(&cfg);
+    // A provider that isn't lowercased yet: Go's strings.ToLower maps U+0130 to a plain
+    // "i", so the lookup finds the plugin keyed "high"; full Unicode lowercasing doesn't.
+    let upper = credentials.iter_mut().find(|c| c.id == "upper.json").unwrap();
+    upper.provider = "H\u{130}GH".to_owned();
+    let rt = Arc::new(
+        cpa_server::testing::runtime(
+            cfg.clone(),
+            credentials,
+            Executors {
+                claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        )
+        .with_plugin_host(host),
+    );
+    let state = Management::new(rt, path);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            management::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let list = |path: &'static str| {
+        let base = base.clone();
+        async move {
+            let listed: Value = wreq::Client::new()
+                .get(format!("{base}{path}"))
+                .bearer_auth("fake-management-only")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let files = listed["files"].as_array().unwrap().clone();
+            move |name: &str| files.iter().find(|f| f["name"] == name).unwrap().clone()
+        }
+    };
+    let v8 = list("/v8/management/credentials").await;
+    assert_eq!(v8("foo.json")["quota_plugin_id"], "z-foo-quota");
+    assert_eq!(v8("bar.json")["quota_plugin_id"], "a-multi-quota");
+    assert_eq!(v8("bar.json")["supports_quota"], true);
+    assert_eq!(v8("bar.json")["quota_provider"], "bar");
+    assert_eq!(v8("upper.json")["quota_plugin_id"], "m-high-quota");
+    assert_eq!(v8("upper.json")["quota_provider"], "H\u{130}GH");
+    let probe = v8("probe.json");
+    assert!(probe.get("supports_quota").is_none(), "{probe}");
+    assert!(probe.get("quota_probe").is_none(), "{probe}");
+
+    let v0 = list("/v0/management/auth-files").await;
+    let probe = v0("probe.json");
+    assert_eq!(probe["supports_quota"], true);
+    assert_eq!(probe["quota_probe"]["url"], "https://api.example.invalid/quota");
+    assert_eq!(v0("bar.json")["supports_quota"], true);
+    assert!(v0("bar.json").get("quota_plugin_id").is_none());
+    server.abort();
+    let _ = std::fs::remove_dir_all(&auth);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Go's management rules for plugin-virtual credentials (several a plugin parsed from
+/// one file): a field edit, status change or delete naming one of them is refused with
+/// 409, and the source file is never overwritten with one credential's document; a
+/// status change or delete naming the source file applies to the file and every
+/// credential parsed from it. Go `TestPatchPluginVirtualAuthStatusReturnsConflictForVirtualChild`,
+/// `TestPatchPluginVirtualSourceStatusDisablesAllExpandedAuths`,
+/// `TestPatchPluginVirtualAuthFieldsReturnsConflict` and
+/// `TestDeletePluginVirtualSourceRemovesExpandedRuntimeAuths`.
+#[tokio::test]
+async fn plugin_virtual_credentials_change_only_through_their_source_file() {
+    let f = Fixture::new("plugin-virtual");
+    let dir = f.dir.join("auth");
+    let source = dir.join("acme.json");
+    let original = r#"{"type":"acme","proxy-url":"http://proxy.invalid","openapi-location":"https://alias.invalid","openapi_location":"https://canonical.invalid","openapi-models":["m"]}"#;
+    std::fs::write(&source, original).unwrap();
+    let full = source.display().to_string();
+    let child = |id: &str, token: &str| {
+        let metadata = json!({"type": "acme", "token": token});
+        let mut c =
+            cpa_core::credential::Credential::from_file(&dir, &source, metadata.as_object().unwrap().clone()).unwrap();
+        c.id = id.into();
+        for (k, v) in [
+            ("plugin_virtual", "true"),
+            ("virtual_source", &full),
+            ("path", &full),
+            ("source", &full),
+        ] {
+            c.attributes.insert(k.into(), v.to_owned());
+        }
+        c
+    };
+    f.rt.store().reconcile(vec![child("acme-a", "a"), child("acme-b", "b")]);
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let call = |method: wreq::Method, path: &str, body: Option<Value>| {
+        let mut req = client
+            .request(method, format!("{base}/v8/management/credentials{path}"))
+            .bearer_auth("fake-management-only");
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        async move {
+            let r = req.send().await.unwrap();
+            (r.status().as_u16(), r.json::<Value>().await.unwrap())
+        }
+    };
+    let refused =
+        json!({"error": "plugin virtual auth cannot be modified directly; edit or delete the source auth file"});
+    let status = |name: &str| Some(json!({"name": name, "disabled": true}));
+    assert_eq!(
+        call(wreq::Method::PATCH, "/status", status("acme-a")).await,
+        (409, refused.clone())
+    );
+    assert_eq!(
+        call(
+            wreq::Method::PATCH,
+            "/fields",
+            Some(json!({"name": "acme-a", "prefix": "x"}))
+        )
+        .await,
+        (409, refused.clone())
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+    for id in ["acme-a", "acme-b"] {
+        assert!(!f.rt.store().get(id).unwrap().disabled, "{id}");
+    }
+    // Through the source file's name: the file and every parsed credential.
+    assert_eq!(
+        call(wreq::Method::PATCH, "/status", status("acme.json")).await,
+        (200, json!({"status": "ok", "disabled": true}))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        r#"{"disabled":true,"openapi_location":"https://canonical.invalid","openapi_models":["m"],"proxy_url":"http://proxy.invalid","type":"acme"}"#
+    );
+    for id in ["acme-a", "acme-b"] {
+        let c = f.rt.store().get(id).unwrap();
+        assert!(c.disabled, "{id}");
+        assert_eq!(c.metadata["token"], if id == "acme-a" { "a" } else { "b" });
+    }
+    // A refused delete still republishes the folder, as every delete does.
+    assert_eq!(call(wreq::Method::DELETE, "?name=acme-a", None).await, (409, refused));
+    assert!(source.exists());
+    assert_eq!(call(wreq::Method::DELETE, "?name=acme.json", None).await.0, 200);
+    assert!(!source.exists());
+    server.abort();
+}
+
+/// Go `ForceRefreshAuth` and `ForceRefreshAll` (`authHasRefreshCredential`): a Codex
+/// credential whose only refresh credential is its Sign in with ChatGPT partition
+/// refreshes by name and in bulk.
+#[tokio::test]
+async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
+    let forms = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = axum::Router::new().route(
+        "/api/accounts/oauth/token",
+        axum::routing::post({
+            let forms = forms.clone();
+            move |body: String| async move {
+                forms.lock().unwrap().push(body);
+                r#"{"access_token":"siwc-new","refresh_token":"siwc-rt-new","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_url = format!("http://{}/api/accounts/oauth/token", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let oauth = cpa_exec::codex_oauth::CodexOAuth::with_endpoints(wreq::Client::new(), "http://127.0.0.1:1", "", "")
+        .with_siwc_token_url(&token_url)
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    let codex = cpa_exec::codex::CodexExecutor::with_client(wreq::Client::new(), oauth);
+    let f = Fixture::from_yaml_with(
+        "siwc-refresh",
+        |auth, hash| {
+            let siwc = |rt: &str, active: bool| {
+                // A loopback base URL lets the test runtime's guard reach the token mock.
+                json!({"type": "codex", "use_siwc": active, "access_token": "outer-at", "base_url": "http://127.0.0.1:1",
+                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1"}})
+                .to_string()
+            };
+            std::fs::write(auth.join("active.json"), siwc("siwc-rt-1", true)).unwrap();
+            std::fs::write(auth.join("bound.json"), siwc("siwc-rt-2", false)).unwrap();
+            std::fs::write(auth.join("plain.json"), r#"{"type":"codex","access_token":"a"}"#).unwrap();
+            format!(
+                "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+                auth.display()
+            )
+        },
+        codex,
+    );
+    let (base, server) = f.server().await;
+    let refresh = |body: &'static str| {
+        let request = wreq::Client::new()
+            .post(format!("{base}/v8/management/credentials/refresh"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/json")
+            .body(body);
+        async move {
+            let response = request.send().await.unwrap();
+            (response.status().as_u16(), response.json::<Value>().await.unwrap())
+        }
+    };
+    let token = |name: &str| {
+        let c =
+            f.rt.store()
+                .snapshot()
+                .into_iter()
+                .find(|c| c.id.ends_with(name))
+                .unwrap();
+        c.metadata["siwc"]["access_token"].as_str().unwrap().to_owned()
+    };
+    let refreshed_with = |forms: &[String]| {
+        let mut tokens: Vec<String> = forms
+            .iter()
+            .map(|f| {
+                url::form_urlencoded::parse(f.as_bytes())
+                    .find(|(k, _)| k == "refresh_token")
+                    .unwrap()
+                    .1
+                    .into_owned()
+            })
+            .collect();
+        tokens.sort();
+        tokens
+    };
+
+    let (status, body) = refresh(r#"{"name":"active.json"}"#).await;
+    assert_eq!((status, body["ok"].clone()), (200, json!(true)), "{body}");
+    assert_eq!(token("active.json"), "siwc-new");
+    assert_eq!(
+        refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
+        ["siwc-rt-1"]
+    );
+
+    let (status, body) = refresh(r#"{"all":true}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut results: Vec<(String, bool)> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().rsplit('/').next().unwrap().to_owned(),
+                r["success"] == true,
+            )
+        })
+        .collect();
+    results.sort();
+    assert_eq!(
+        results,
+        [("active.json".to_owned(), true), ("bound.json".to_owned(), true)],
+        "plain.json has nothing to refresh"
+    );
+    assert_eq!(token("bound.json"), "siwc-new");
+    assert_eq!(
+        refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
+        ["siwc-rt-2", "siwc-rt-new"]
+    );
+    server.abort();
+    upstream.abort();
 }

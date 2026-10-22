@@ -21,6 +21,7 @@ use cpa_core::config::Config;
 use http::HeaderMap;
 use serde_yaml_ng::Value as Yaml;
 
+use crate::gostr::GoStr;
 use crate::json::{self, GoValue, Kind, Res};
 
 /// One request's context for payload rules (Go's parameters to
@@ -249,7 +250,7 @@ impl Rules {
             .collect();
         let image_generation = match doc.get("multimedia").and_then(|m| m.get("disable-image-generation")) {
             Some(Yaml::Bool(true)) => ImageGeneration::All,
-            Some(Yaml::String(s)) => match s.trim().to_lowercase().as_str() {
+            Some(Yaml::String(s)) => match s.trim().go_lower().as_str() {
                 "true" | "1" | "on" | "yes" => ImageGeneration::All,
                 "chat" => ImageGeneration::Chat,
                 "passthrough" => ImageGeneration::Passthrough,
@@ -342,7 +343,7 @@ pub fn apply_tracked(
     if let Some(headers) = req.headers
         && is_codex_user_agent(headers)
         && !matches!(
-            req.target_executor.trim().to_lowercase().as_str(),
+            req.target_executor.trim().go_lower().as_str(),
             "codex" | "codex-websockets" | "codex_websockets"
         )
     {
@@ -550,7 +551,7 @@ fn rules_match(models: &[ModelRule], req: &Request<'_>, payload: &[u8], candidat
                 return false;
             }
             let protocol = entry.protocol.trim();
-            if !protocol.is_empty() && !req.protocol.is_empty() && !protocol.eq_ignore_ascii_case(req.protocol) {
+            if !protocol.is_empty() && !req.protocol.is_empty() && !protocol.go_eq_fold(req.protocol) {
                 return false;
             }
             from_protocol_matches(&entry.from_protocol, req.from_protocol)
@@ -596,7 +597,7 @@ fn path_exists(payload: &[u8], path: &str) -> bool {
 }
 
 fn normalize_from_protocol(p: &str) -> String {
-    match p.trim().to_lowercase().as_str() {
+    match p.trim().go_lower().as_str() {
         "openai-response" | "openai-responses" | "response" => "responses".into(),
         other => other.to_owned(),
     }
@@ -608,7 +609,7 @@ fn from_protocol_matches(pattern: &str, from: &str) -> bool {
         return true;
     }
     let from = normalize_from_protocol(from);
-    !from.is_empty() && pattern.eq_ignore_ascii_case(&from)
+    !from.is_empty() && pattern.go_eq_fold(&from)
 }
 
 fn headers_match(headers: Option<&HeaderMap>, rules: &[(String, String)]) -> bool {
@@ -626,12 +627,14 @@ fn headers_match(headers: Option<&HeaderMap>, rules: &[(String, String)]) -> boo
 }
 
 /// Go `payloadModelCandidates`: the upstream model, the client's suffix-free model and,
-/// when it has a thinking suffix, the client's model as written (case-insensitive dedup).
+/// when it has a thinking suffix, the client's model as written, deduplicated by
+/// `strings.ToLower` key (σ and ς stay distinct; `İ` and `i` collapse).
 fn model_candidates(model: &str, requested: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     let mut add = |v: &str| {
         let v = v.trim();
-        if !v.is_empty() && !out.iter().any(|c| c.eq_ignore_ascii_case(v)) {
+        if !v.is_empty() && seen.insert(v.go_lower()) {
             out.push(v.to_owned());
         }
     };
@@ -850,12 +853,11 @@ fn remove_tool_type(payload: &[u8], tools_path: &str, tool_type: &str) -> Vec<u8
 fn remove_tool_choice(payload: &[u8], path: &str, tool_type: &str) -> Vec<u8> {
     let choice = json::get(payload, path);
     let delete = match choice.kind {
-        Kind::String => choice.str().trim().eq_ignore_ascii_case(tool_type),
+        Kind::String => choice.str().trim().go_eq_fold(tool_type),
         Kind::Json => {
             let kind = choice.get("type").str().trim().to_owned();
-            kind.eq_ignore_ascii_case(tool_type)
-                || (kind.eq_ignore_ascii_case("tool")
-                    && choice.get("name").str().trim().eq_ignore_ascii_case(tool_type))
+            kind.go_eq_fold(tool_type)
+                || (kind.go_eq_fold("tool") && choice.get("name").str().trim().go_eq_fold(tool_type))
         }
         _ => false,
     };
@@ -905,16 +907,28 @@ pub fn is_codex_user_agent(headers: &HeaderMap) -> bool {
         .iter()
         .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
         .find(|v| !v.is_empty())
-        .is_some_and(|ua| ua.to_lowercase().contains("codex"))
+        .is_some_and(|ua| ua.go_lower().contains("codex"))
 }
 
-/// Codex client tools whose `number` parameters Codex deserializes as integers.
+/// `codexClientToolIntegerFields` and `matchCodexTargetTool`: the Codex client tools
+/// whose `number` parameters Codex deserializes as integers. Fields are paths under
+/// `parameters.properties`, not recursive names. A namespaced tool arrives as
+/// `namespace__name`.
 fn codex_integer_fields(tool: &str) -> &'static [&'static str] {
     let base = tool.trim();
     let base = base
         .strip_prefix("functions__")
         .or_else(|| base.strip_prefix("collab__"))
         .unwrap_or(base);
+    let base = match base {
+        "multi_agent_v1__wait_agent" | "collaboration__wait_agent" => "wait_agent",
+        "collaboration__get_channels"
+        | "collaboration__list_threads"
+        | "collaboration__search_posts"
+        | "collaboration__read_thread"
+        | "collaboration__read_post" => &base["collaboration__".len()..],
+        other => other,
+    };
     match base {
         "exec_command" => &["yield_time_ms", "max_output_tokens", "timeout_ms"],
         "write_stdin" => &["session_id", "yield_time_ms", "max_output_tokens"],
@@ -922,7 +936,35 @@ fn codex_integer_fields(tool: &str) -> &'static [&'static str] {
         "wait_agent" => &["timeout_ms"],
         "wait" => &["yield_time_ms", "max_tokens"],
         "tool_search" => &["limit"],
-        "test_sync_tool" => &["sleep_before_ms", "sleep_after_ms", "participants", "timeout_ms"],
+        "test_sync_tool" => &[
+            "sleep_before_ms",
+            "sleep_after_ms",
+            "participants",
+            "timeout_ms",
+            "barrier.properties.participants",
+            "barrier.properties.timeout_ms",
+        ],
+        "create_goal" => &["token_budget"],
+        "get_channels" | "history__list_windows" | "history__search_contents" => &["limit"],
+        "list_threads" | "search_posts" | "read_thread" => &["limit", "max_chars_per_post"],
+        "read_post" | "history__read_item" => &["offset_chars", "limit_chars"],
+        "memories__list" | "notes__list_files_by_prefix" => &["max_results"],
+        "memories__read" => &["line_offset", "max_lines"],
+        "memories__search" => &["context_lines", "max_results"],
+        "history__list_items" => &["limit", "max_chars_per_item"],
+        // Codex declares signed line numbers in the first nullable union branch.
+        "notes__read_file" => &["start_line", "stop_line", "start_line.anyOf.0", "stop_line.anyOf.0"],
+        "notes__search_contents" => &["max_matches_per_file", "max_files"],
+        "image_gen__imagegen" => &["num_last_images_to_include"],
+        "web__run" => &[
+            "search_query.items.properties.recency",
+            "image_query.items.properties.recency",
+            "open.items.properties.lineno",
+            "click.items.properties.id",
+            "screenshot.items.properties.pageno",
+            "weather.items.properties.duration",
+            "sports.items.properties.num_games",
+        ],
         _ => &[],
     }
 }
@@ -937,7 +979,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
         return body;
     }
     let tools = json::get(&body, "tools");
-    if let Some(updated) = normalize_tool_array(&tools)
+    if let Some(updated) = normalize_tool_array(&tools, "")
         && let Ok(next) = json::try_set_raw(&body, "tools", updated)
     {
         body = next;
@@ -948,7 +990,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
             if *item.get("type").str() != *"additional_tools" {
                 continue;
             }
-            if let Some(updated) = normalize_tool_array(&item.get("tools"))
+            if let Some(updated) = normalize_tool_array(&item.get("tools"), "")
                 && let Ok(next) = json::try_set_raw(&body, &format!("input.{index}.tools"), updated)
             {
                 body = next;
@@ -959,7 +1001,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
 }
 
 /// Rewrites changed elements of a tool array, copying the bytes between them verbatim.
-fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
+fn normalize_tool_array(tools: &Res<'_>, namespace: &str) -> Option<Vec<u8>> {
     if !tools.is_array() {
         return None;
     }
@@ -967,7 +1009,7 @@ fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
     let mut out: Option<Vec<u8>> = None;
     let mut offset = 0;
     for tool in tools.array() {
-        let Some(updated) = normalize_tool(&tool) else {
+        let Some(updated) = normalize_tool(&tool, namespace) else {
             continue;
         };
         let start = tool.index.saturating_sub(tools.index);
@@ -981,16 +1023,21 @@ fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
+fn normalize_tool(tool: &Res<'_>, namespace: &str) -> Option<Vec<u8>> {
     let mut raw = tool.raw().to_vec();
     if *tool.get("type").str() == *"namespace" {
-        let updated = normalize_tool_array(&tool.get("tools"))?;
+        // One namespace level; its name qualifies the nested tools.
+        let name = tool.get("name").str().into_owned();
+        if !namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+        let updated = normalize_tool_array(&tool.get("tools"), &name)?;
         return json::try_set_raw(&raw, "tools", updated).ok();
     }
     for key in ["function_declarations", "functionDeclarations"] {
         let decls = tool.get(key);
         if decls.is_array() {
-            let updated = normalize_tool_array(&decls)?;
+            let updated = normalize_tool_array(&decls, namespace)?;
             return json::try_set_raw(&raw, key, updated).ok();
         }
     }
@@ -1017,6 +1064,9 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
             return None;
         }
     }
+    if !namespace.is_empty() {
+        name = format!("{namespace}__{name}");
+    }
     let fields = codex_integer_fields(&name);
     if fields.is_empty() {
         return None;
@@ -1028,8 +1078,8 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
         return None;
     }
     for field in fields {
-        let kind = properties.get(&escape_key(field)).get("type");
-        let path = format!("properties.{}.type", escape_key(field));
+        let kind = properties.get(field).get("type");
+        let path = format!("properties.{field}.type");
         if kind.kind == Kind::String && *kind.str() == *"number" {
             changed |= json::set_str(&mut updated, &path, "integer");
         } else if kind.is_array() {
@@ -1055,9 +1105,4 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
     }
     raw = json::try_set_raw(&raw, path, updated).ok()?;
     Some(raw)
-}
-
-/// Go `escapeCodexSjsonKey`.
-fn escape_key(key: &str) -> String {
-    key.replace('\\', "\\\\").replace('.', "\\.").replace(':', "\\:")
 }

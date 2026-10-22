@@ -842,8 +842,15 @@ pub(crate) async fn install(
     State(state): State<Arc<Management>>,
     UrlPath(raw): UrlPath<String>,
     RawQuery(query): RawQuery,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let message = format!("read install request: {}", super::read_reason(&rejection));
+            return error(super::read_status(&rejection), "invalid_request", &message);
+        }
+    };
     match install_inner(state, &raw, &go_query(query.as_deref().unwrap_or_default()), &body).await {
         Ok(r) => r,
         Err(r) => *r,

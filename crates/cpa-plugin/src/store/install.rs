@@ -2,6 +2,7 @@
 //! downloaded, verified, and its library written atomically to
 //! `<plugins-dir>/<goos>/<goarch>/<id>-v<version><ext>`.
 
+use cpa_core::gostr::GoStr;
 use std::path::{Path, PathBuf};
 
 use super::checksum::{parse_checksums, sha256_hex, verify_checksum};
@@ -310,7 +311,7 @@ pub fn select_artifact(plan: &InstallPlan, goos: &str, goarch: &str) -> Result<A
 
 /// Go `VerifyArtifactChecksum`.
 pub fn verify_artifact_checksum(artifact: &Artifact, data: &[u8]) -> Result<(), String> {
-    let expected = artifact.sha256.trim().to_lowercase();
+    let expected = artifact.sha256.trim().go_lower();
     if expected.is_empty() {
         return Err("artifact checksum missing".into());
     }
@@ -394,7 +395,7 @@ fn read_target_library(archive: &Archive<'_>, id: &str, version: &str, goos: &st
         if !entry.is_regular() {
             return Err(format!("zip entry {} is not a regular file", entry.name));
         }
-        let lower = cleaned.to_lowercase();
+        let lower = cleaned.go_lower();
         if !(lower.ends_with(".dylib") || lower.ends_with(".so") || lower.ends_with(".dll")) {
             continue;
         }
@@ -434,7 +435,7 @@ fn versioned_file_name(id: &str, version: &str, goos: &str) -> String {
 
 /// Go `pluginExtension`.
 fn extension(goos: &str) -> &'static str {
-    match goos.trim().to_lowercase().as_str() {
+    match goos.trim().go_lower().as_str() {
         "darwin" | "mac" | "macos" | "osx" => ".dylib",
         "windows" => ".dll",
         _ => ".so",
@@ -551,7 +552,7 @@ fn write_file_atomic(target: &Path, data: &[u8], mode: u32) -> Result<(), String
 }
 
 /// `os.CreateTemp(dir, "."+base+".tmp-*")`.
-fn create_temp(dir: &Path, base: &str) -> Result<(std::fs::File, PathBuf), String> {
+pub(crate) fn create_temp(dir: &Path, base: &str) -> Result<(std::fs::File, PathBuf), String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

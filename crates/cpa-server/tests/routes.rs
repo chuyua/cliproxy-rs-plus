@@ -73,6 +73,7 @@ async fn upstream(State(seen): State<Arc<Seen>>, req: Request) -> Response {
     }
     match token.as_str() {
         "Bearer fake-fail" => (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response(),
+        "Bearer fake-unauth" => (StatusCode::UNAUTHORIZED, "bad token").into_response(),
         "Bearer fake-hdr" => (
             [
                 ("content-type", "application/json; charset=utf-8"),
@@ -151,6 +152,7 @@ struct Proxy {
     url: String,
     seen: Arc<Seen>,
     rt: Arc<Runtime>,
+    upstream: String,
 }
 
 async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
@@ -170,7 +172,12 @@ async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     let url = serve(router(rt.clone())).await;
-    Proxy { url, seen, rt }
+    Proxy {
+        url,
+        seen,
+        rt,
+        upstream: upstream_url,
+    }
 }
 
 async fn post(url: &str, path: &str, body: &str) -> (u16, wreq::header::HeaderMap, String) {
@@ -320,6 +327,8 @@ async fn wrong_methods_are_gin_no_route() {
         (wreq::Method::PUT, "/v1/models"),
         (wreq::Method::DELETE, "/v1/messages"),
         (wreq::Method::HEAD, "/v1/models"),
+        (wreq::Method::HEAD, "/v1/models/gpt-5"),
+        (wreq::Method::POST, "/v1/models/gpt-5"),
         (wreq::Method::HEAD, "/"),
         (wreq::Method::POST, "/healthz"),
         (wreq::Method::GET, "/v2/nothing"),
@@ -351,8 +360,14 @@ async fn wrong_methods_are_gin_no_route() {
             .unwrap();
         assert_eq!(res.status().as_u16(), 404, "{method} {path} without a key");
     }
-    let res = client.get(format!("{}/v1/models", p.url)).send().await.unwrap();
-    assert_eq!(res.status().as_u16(), 401, "matched routes still require the key");
+    for path in ["/v1/models", "/v1/models/gpt-5"] {
+        let res = client.get(format!("{}{path}", p.url)).send().await.unwrap();
+        assert_eq!(
+            res.status().as_u16(),
+            401,
+            "{path}: matched routes still require the key"
+        );
+    }
     for (method, path) in [(wreq::Method::HEAD, "/healthz"), (wreq::Method::GET, "/v1/models")] {
         let res = client
             .request(method.clone(), format!("{}{path}", p.url))
@@ -365,9 +380,10 @@ async fn wrong_methods_are_gin_no_route() {
 }
 
 /// `requests.passthrough-headers` (Go `downstreamHeadersFromExecutor`,
-/// `WriteUpstreamHeaders`, `WriteErrorResponse` addon): off by default; on, filtered
-/// upstream headers fill what the handler did not set, and an error's upstream
-/// headers come along. Filter expectations are the Go golden `upstream_headers`.
+/// `WriteUpstreamHeaders`): off by default; on, filtered upstream headers fill what the
+/// handler did not set. A Claude status error has no `Headers()`, so its upstream headers
+/// never come along (`passthrough_errors_go.json` has the Go goldens). Filter
+/// expectations are the Go golden `upstream_headers`.
 #[tokio::test]
 async fn passthrough_headers_follow_go() {
     let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
@@ -389,7 +405,7 @@ async fn passthrough_headers_follow_go() {
         let bad = proxy(&config, vec![oauth("a.json", "fake-hdr-bad", serde_json::json!({}))]).await;
         let (status, headers, _) = post(&bad.url, "/v1/messages", &body).await;
         assert_eq!(status, 400);
-        assert_eq!(headers.get("x-upstream-id").is_some(), enabled, "{headers:?}");
+        assert!(headers.get("x-upstream-id").is_none(), "{headers:?}");
     }
 }
 
@@ -516,6 +532,61 @@ async fn mid_stream_failure_ends_with_route_error_frame() {
     assert!(!text.contains("[DONE]"), "terminal errors replace [DONE]");
 }
 
+/// `upstream.claude.disable-cloaking-model-list` (Go 52d5507d) in each spelling stops
+/// the Anthropic catalog from cloaking non-Claude IDs.
+#[tokio::test]
+async fn anthropic_model_list_cloaking_reads_the_shared_setting() {
+    for (config, cloaked) in [
+        ("", true),
+        ("upstream: {claude: {disable-cloaking-model-list: true}}\n", false),
+        (
+            "oauth: {providers: {claude: {claude-code: {disable-cloaking-model-list: true}}}}\n",
+            false,
+        ),
+        ("claude-code: {disable-cloaking-model-list: true}\n", false),
+    ] {
+        let key = Credential {
+            id: "claude:apikey:1".into(),
+            provider: "claude".into(),
+            source: Source::Config {
+                section: "claude-api-key".into(),
+                index: 0,
+            },
+            disabled: false,
+            label: "claude-apikey".into(),
+            attributes: [("api_key".into(), "fake-ok".into())].into(),
+            metadata: serde_json::json!({"models": [{"name": MODEL, "alias": "friendly"}]})
+                .as_object()
+                .unwrap()
+                .clone(),
+            revision: 0,
+        };
+        let p = proxy(config, vec![key]).await;
+        let models: Value = wreq::Client::new()
+            .get(format!("{}/v1/models", p.url))
+            .header("authorization", "Bearer client-key")
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<&str> = models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        let want = if cloaked {
+            "claude-fable-5-dd-yldneirf"
+        } else {
+            "friendly"
+        };
+        assert!(ids.contains(&want), "{config}: {ids:?}");
+    }
+}
+
 #[tokio::test]
 async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
     let mut key = Credential {
@@ -614,7 +685,7 @@ async fn misc_routes_match_go() {
     let sink = got.clone();
     p.rt.set_oauth_callback_sink(Some(Arc::new(move |cb: &cpa_server::runtime::OAuthCallback| {
         *sink.lock().unwrap() = Some((cb.provider, cb.state.clone(), cb.code.clone(), cb.error.clone()));
-        true
+        cpa_server::runtime::OAuthDelivery::Delivered
     })));
     let callback = |path: &'static str| client.get(format!("{}{path}", p.url)).send();
     let ok = callback("/callback?code=%20c1%20&state=s1").await.unwrap();
@@ -642,6 +713,20 @@ async fn misc_routes_match_go() {
         *got.lock().unwrap(),
         Some(("anthropic", "s3".to_owned(), String::new(), " ".to_owned()))
     );
+    // A Sign in with ChatGPT binding's state (Go `ae3ee3be`): the Codex route refuses
+    // it with 409; the other provider routes still show their page.
+    p.rt.set_oauth_callback_sink(Some(Arc::new(|_: &cpa_server::runtime::OAuthCallback| {
+        cpa_server::runtime::OAuthDelivery::RequiresV8
+    })));
+    let refused = callback("/codex/callback?state=siwc&code=c").await.unwrap();
+    assert_eq!(refused.status().as_u16(), 409);
+    assert_eq!(
+        refused.text().await.unwrap(),
+        r#"{"error":"SIWC callbacks require /v8/management/oauth/callback"}"#
+    );
+    let other = callback("/anthropic/callback?state=siwc&code=c").await.unwrap();
+    assert_eq!(other.status().as_u16(), 200);
+    assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
     // Interactions validation (interactions_handlers.go).
     let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
     assert_eq!(
@@ -662,19 +747,28 @@ async fn misc_routes_match_go() {
     );
     let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
     assert_eq!((status, text.as_str()), (200, ""));
-    // Compact through Claude: the executor's 501 is a request fault, no failover.
+    // Compact through Claude (v8.0.35 2bc236d2): one non-stream summary turn, sealed
+    // into a single compaction item.
     let (status, _, text) = post(
         &p.url,
         "/v1/responses/compact",
         &format!(r#"{{"model":"{MODEL}","input":"x","stream":false}}"#),
     )
     .await;
-    assert_eq!(status, 501);
-    assert_eq!(
-        text,
-        r#"{"error":{"message":"/responses/compact not supported","type":"server_error","code":"internal_server_error"}}"#
+    assert_eq!(status, 200, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["object"], "response.compaction");
+    assert_eq!(answer["output"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["output"][0]["type"], "compaction");
+    assert_eq!(answer["usage"]["total_tokens"], 6);
+    let seen = p.seen.requests.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1["stream"], false);
+    assert!(
+        seen[0].1["messages"]
+            .to_string()
+            .contains("Please provide a concise and comprehensive summary")
     );
-    assert!(p.seen.requests.lock().unwrap().is_empty());
 }
 
 #[derive(Default)]
@@ -762,6 +856,59 @@ async fn expired_token_is_used_then_refreshed_once_after_401() {
         "the rotated token is persisted"
     );
     assert_eq!(rt.store().stats().success, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A `siwc` map does not give a Claude credential a refresh path: a 401 on a Claude token
+/// with no refresh token is answered once, with no prepare, credential write or retry.
+#[tokio::test]
+async fn a_siwc_map_never_refreshes_a_claude_credential_after_401() {
+    let mock = Arc::new(OAuthMock::default());
+    let upstream_url = serve(axum::Router::new().fallback(oauth_upstream).with_state(mock.clone())).await;
+    let dir = std::env::temp_dir().join(format!("cpa-routes-siwc-401-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("claude.json");
+    let metadata = serde_json::json!({"type":"claude","access_token":"sk-ant-oat-old-fake",
+        "account_uuid":"acct-fake","email":"a@example.invalid","claude_device_ids":["b".repeat(64)],
+        "siwc":{"access_token":"siwc-at","refresh_token":"siwc-rt","client_id":"client-1"}});
+    std::fs::write(&path, metadata.to_string()).unwrap();
+    let mut credential = Credential::from_file(&dir, &path, metadata.as_object().unwrap().clone()).unwrap();
+    credential.attributes.insert("base_url".into(), upstream_url.clone());
+    let oauth = cpa_exec::oauth::OAuth::with_endpoints(
+        wreq::Client::new(),
+        &format!("{upstream_url}/token"),
+        &format!("{upstream_url}/profile"),
+        &format!("{upstream_url}/roles"),
+    );
+    let executors = Executors {
+        claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
+    let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
+    let revision = rt.store().get("claude.json").unwrap().revision;
+    let url = serve(router(rt.clone())).await;
+    let (status, _, text) = post(
+        &url,
+        "/v1/messages",
+        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[]}}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "{text}");
+    let calls = mock.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().map(|c| c.split(' ').next().unwrap()).collect::<Vec<_>>(),
+        ["/v1/messages"],
+        "{calls:?}"
+    );
+    assert_eq!(
+        rt.store().get("claude.json").unwrap().revision,
+        revision,
+        "no credential write"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1063,6 +1210,7 @@ async fn usage_queue_records_every_attempt() {
         ("endpoint", "POST /v1/messages"),
         ("auth_type", "oauth"),
         ("api_key", "client-key"),
+        ("access_provider", "config-inline"),
         ("service_tier", "auto"),
         ("response_model", MODEL),
     ] {
@@ -1072,6 +1220,7 @@ async fn usage_queue_records_every_attempt() {
     assert_eq!(ok["trace_id"], request_id);
     assert_eq!(ok["stream"], false);
     assert_eq!(ok["generate"], true);
+    assert_eq!(ok["is_native_key"], true);
     assert_ne!(failed["execution_id"], ok["execution_id"]);
     assert_eq!(ok["access_token_sha256"].as_str().unwrap().len(), 64);
 
@@ -1092,6 +1241,88 @@ async fn usage_queue_records_every_attempt() {
     assert_eq!(status, 200);
     queue.configure(true, &cfg);
     assert!(pop().is_empty());
+}
+
+/// Home picks in order, each with the client key Home authenticated.
+struct Picks(Mutex<Vec<(Credential, &'static str)>>);
+
+impl cpa_server::remote::RemoteDispatch for Picks {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn dispatch(
+        &self,
+        _: cpa_server::remote::RemoteRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<cpa_server::remote::RemoteGrant, cpa_server::remote::RemoteError>>
+    {
+        let (credential, key) = self.0.lock().unwrap().remove(0);
+        Box::pin(async move {
+            Ok(cpa_server::remote::RemoteGrant {
+                credential,
+                end: Box::new(|| None),
+                cancel: None,
+                request_retry: None,
+                user_api_key: key.into(),
+                private: Default::default(),
+            })
+        })
+    }
+
+    fn models(
+        &self,
+        _: Vec<(String, String)>,
+        _: Vec<(String, String)>,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, cpa_server::remote::ModelsError>> {
+        unreachable!("no model lists")
+    }
+}
+
+/// Go's count_tokens handler runs on `GetContextWithCancel(.., context.Background())`,
+/// which drops the access middleware's usage key, so its Home 401 records carry the key
+/// Home authenticated (gin `userApiKey`), even over a client key the middleware
+/// accepted; a later pick without one keeps it.
+#[tokio::test]
+async fn count_tokens_home_401s_record_the_home_client_key() {
+    let p = proxy("", vec![]).await;
+    let cfg = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    p.rt.usage_queue().configure(true, &cfg);
+    // Kimi counts tokens upstream (Go `countTokensUpstream`).
+    let pick = |id: &str, token: &str| {
+        let metadata = serde_json::json!({"type": "kimi", "access_token": token});
+        let mut c = Credential::from_file(
+            Path::new("/fake"),
+            &Path::new("/fake").join(id),
+            metadata.as_object().unwrap().clone(),
+        )
+        .unwrap();
+        for (k, v) in [
+            (cpa_core::config::credentials::HOME_AUTH_INDEX, format!("idx-{id}")),
+            ("base_url", p.upstream.clone()),
+            (cpa_server::remote::UPSTREAM_MODEL, "kimi-up".to_owned()),
+        ] {
+            c.attributes.insert(k.into(), v);
+        }
+        c
+    };
+    p.rt.set_remote_dispatch(Some(Arc::new(Picks(Mutex::new(vec![
+        (pick("a.json", "fake-unauth"), "home-client"),
+        (pick("b.json", "fake-unauth"), ""),
+        (pick("c.json", "fake-ok"), ""),
+    ])))));
+    let body = r#"{"model":"kimi-x","messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _, text) = post(&p.url, "/v1/messages/count_tokens", body).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(p.seen.requests.lock().unwrap().len(), 3, "three upstream attempts");
+    let keys: Vec<(String, Value)> =
+        p.rt.usage_queue()
+            .pop_oldest(10)
+            .iter()
+            .map(|r| serde_json::from_slice::<Value>(r).unwrap())
+            .map(|r| (r["api_key"].as_str().unwrap().to_owned(), r["executor_type"].clone()))
+            .collect();
+    let want = ("home-client".to_owned(), Value::from("home-result"));
+    assert_eq!(keys, [want.clone(), want]);
 }
 
 /// Go's Responses handler applies `prepareCodexOrphanDelegation` before dispatch, so the
@@ -1122,15 +1353,9 @@ async fn responses_route_prepares_codex_orphan_delegation() {
     assert_eq!(send(p.url.clone(), body.clone()).await, 200);
     let upstream = p.seen.requests.lock().unwrap()[0].1.to_string();
     assert!(upstream.contains(rewritten), "{upstream}");
-    // Written in v8 form it is OAuth-only: the handler leaves the input alone, but an
-    // OAuth credential's executor still sees it (Go's executor translation runs
-    // RewriteCodexOrphanDelegationInputForConfig with the unscoped config).
+    // The setting is shared (`upstream.codex`, Go 52d5507d): its historical v8 spelling
+    // rewrites for an API-key credential too, which runs with cfg.ForAPIKey().
     let v8 = "oauth:\n  providers:\n    codex:\n      orphan-delegation-compatibility: true\n";
-    let p = proxy(v8, vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
-    assert_eq!(send(p.url.clone(), body.clone()).await, 200);
-    let upstream = p.seen.requests.lock().unwrap()[0].1.to_string();
-    assert!(upstream.contains(rewritten), "{upstream}");
-    // An API-key credential runs with cfg.ForAPIKey() (executorForAuth): nobody rewrites.
     let mut key = Credential::from_file(
         Path::new("/fake"),
         &Path::new("/fake").join("key.json"),
@@ -1141,7 +1366,7 @@ async fn responses_route_prepares_codex_orphan_delegation() {
     let p = proxy(v8, vec![key]).await;
     assert_eq!(send(p.url.clone(), body).await, 200);
     let upstream = p.seen.requests.lock().unwrap()[0].1.to_string();
-    assert!(!upstream.contains("Tool output from"), "{upstream}");
+    assert!(upstream.contains(rewritten), "{upstream}");
 }
 
 /// Session turns (the Responses WebSocket) run through `dispatch::run`: the pin
@@ -1186,6 +1411,7 @@ async fn session_turns_honour_pin_callback_and_session() {
         caller: Caller {
             principal: "client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
         forced_provider: None,
         selection_model: None,

@@ -34,10 +34,11 @@ MANAGEMENT_KEY = "probe-management-key"
 
 def routes():
     out = []
-    for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "checklist.md"), encoding="utf-8"):
-        m = re.match(r"^- \[[ x]\] \*\*\[M\d\] (M\d-\d{4})\*\* `([A-Z]+) (/\S*)`", LINK.sub(r"\1", line))
-        if m:
-            out.append((m.group(1), m.group(2), m.group(3)))
+    with open(os.path.join(HERE, "checklist.md"), encoding="utf-8") as checklist:
+        for line in checklist:
+            m = re.match(r"^- \[[ x]\] \*\*\[M\d\] (M\d-\d{4})\*\* `([A-Z]+) (/\S*)`", LINK.sub(r"\1", line))
+            if m:
+                out.append((m.group(1), m.group(2), m.group(3)))
     return out
 
 

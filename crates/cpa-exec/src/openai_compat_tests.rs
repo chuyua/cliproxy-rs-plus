@@ -202,6 +202,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> (ExecRequest, String)
         },
         source_format: source,
         response_format: response,
+        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,
@@ -218,6 +219,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> (ExecRequest, String)
         caller: Caller {
             principal: "fake-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     };
     (req, op.to_owned())
@@ -588,7 +590,13 @@ fn go_primitive_vectors() {
                 .collect();
             MediaType::Ok(media.to_owned(), params)
         } else if media.is_empty() {
-            MediaType::Invalid
+            match parse_media_type(input) {
+                MediaType::Invalid(reason) => {
+                    assert_eq!(reason, error, "mime.ParseMediaType({input:?})");
+                    MediaType::Invalid(reason)
+                }
+                _ => MediaType::Invalid("<expected invalid>"),
+            }
         } else {
             MediaType::BadParams(media.to_owned())
         };

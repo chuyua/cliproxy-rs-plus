@@ -34,6 +34,8 @@ struct FakeHome {
     fail: Option<RemoteError>,
     ack: Option<Arc<Notify>>,
     ack_result: Option<String>,
+    /// The client key every grant carries (Go `dispatch.UserAPIKey`).
+    user_key: &'static str,
 }
 
 impl FakeHome {
@@ -86,7 +88,8 @@ impl RemoteDispatch for FakeHome {
                 }),
                 cancel: None,
                 request_retry: None,
-                user_api_key: Default::default(),
+                user_api_key: self.user_key.into(),
+                private: Default::default(),
             })
         })
     }
@@ -136,6 +139,17 @@ async fn start(
     lifetime: Duration,
     relay: Option<Arc<dyn MediaRelay>>,
 ) -> (String, Arc<Live>, Seen) {
+    let (proxy, live, seen, _) = start_rt(home, location, lifetime, relay).await;
+    (proxy, live, seen)
+}
+
+/// [`start`], also returning the runtime.
+async fn start_rt(
+    home: Arc<FakeHome>,
+    location: Option<&'static str>,
+    lifetime: Duration,
+    relay: Option<Arc<dyn MediaRelay>>,
+) -> (String, Arc<Live>, Seen, Arc<Runtime>) {
     let seen = Seen::default();
     let record = seen.clone();
     let upstream = axum::Router::new().fallback(
@@ -147,9 +161,13 @@ async fn start(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_owned();
+                let unauthorized = auth.contains("unauth") || uri.path().contains("unauth");
                 record.lock().unwrap().push((uri.path().to_owned(), auth));
                 if uri.to_string().contains("fail") {
                     return (StatusCode::NOT_FOUND, "no such call").into_response();
+                }
+                if unauthorized {
+                    return (StatusCode::UNAUTHORIZED, "bad token").into_response();
                 }
                 if let Ok(ws) = ws {
                     return ws.on_upgrade(|mut socket| async move {
@@ -220,8 +238,10 @@ async fn start(
     live.calls = calls::Calls::new_shared(lifetime);
     live.relays.fixed = relay;
     let live = Arc::new(live);
-    let app = axum::Router::new().merge(routes_with(&rt, live.clone())).with_state(rt);
-    (serve(app).await, live, seen)
+    let app = axum::Router::new()
+        .merge(routes_with(&rt, live.clone()))
+        .with_state(rt.clone());
+    (serve(app).await, live, seen, rt)
 }
 
 const BOUNDARY: &str = "home-live-boundary";
@@ -826,4 +846,67 @@ async fn cancelled_media_setup_releases_after_its_close() {
         assert_eq!(home.log(), ["media_closed", "home-codex-live"], "fail={fail}");
         assert!(seen.lock().unwrap().is_empty(), "nothing went upstream");
     }
+}
+
+/// Go `reportHomeUnauthorized` reads `usage.APIKeyFromContext`: with no key from the
+/// access middleware, a Home 401 record carries the client key this request's own Home
+/// pick returned (`setHomeUserAPIKeyOnGinContext`). A hangup on a held call makes no
+/// pick, so its record has none.
+#[tokio::test]
+async fn home_unauthorized_records_carry_the_home_client_key() {
+    let usage = cpa_core::config::Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
+    let records = |rt: &Runtime| -> Vec<serde_json::Value> {
+        rt.usage_queue()
+            .pop_oldest(10)
+            .iter()
+            .map(|r| serde_json::from_slice(r).unwrap())
+            .collect()
+    };
+    let identity = |r: &serde_json::Value| {
+        (
+            r["api_key"].as_str().unwrap().to_owned(),
+            r["is_native_key"].clone(),
+            r.get("access_provider").cloned(),
+        )
+    };
+    let home = Arc::new(FakeHome {
+        grants: Mutex::new(vec![credential("unauth-live", "codex", "oauth")]),
+        user_key: "home-client",
+        ..FakeHome::default()
+    });
+    let (proxy, _, _, rt) = start_rt(home, None, HOUR, None).await;
+    rt.usage_queue().configure(true, &usage);
+    // Call creation.
+    assert_eq!(post_live(&proxy, "gpt-live-1-codex").await.status().as_u16(), 401);
+    // The direct socket's dial.
+    let dial = wreq::Client::new()
+        .websocket(format!(
+            "ws{}/v1/realtime?model=gpt-realtime",
+            proxy.trim_start_matches("http")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(dial.status().as_u16(), 101);
+    let got: Vec<_> = records(&rt).iter().map(identity).collect();
+    let want = ("home-client".to_owned(), serde_json::Value::Bool(false), None);
+    assert_eq!(got, [want.clone(), want]);
+
+    // A hangup on the held call.
+    let home = Arc::new(FakeHome {
+        grants: Mutex::new(vec![live_credential()]),
+        user_key: "home-client",
+        ..FakeHome::default()
+    });
+    let (proxy, _, _, rt) = start_rt(home, Some("/v1/live/unauth-call"), HOUR, None).await;
+    rt.usage_queue().configure(true, &usage);
+    assert_eq!(post_live(&proxy, "gpt-live-1-codex").await.status().as_u16(), 201);
+    let hangup = wreq::Client::new()
+        .post(format!("{proxy}/v1/realtime/calls/unauth-call/hangup"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hangup.status().as_u16(), 401);
+    let got: Vec<_> = records(&rt).iter().map(identity).collect();
+    assert_eq!(got, [(String::new(), serde_json::Value::Bool(false), None)]);
 }

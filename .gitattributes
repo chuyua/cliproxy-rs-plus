@@ -1,0 +1,4 @@
+# Checked-in generated management panel must be byte-identical on Linux and Windows.
+ui/dist-panel/management.html text eol=lf
+ui/dist-panel/management.html.sha256 text eol=lf
+ui/PANEL.md text eol=lf

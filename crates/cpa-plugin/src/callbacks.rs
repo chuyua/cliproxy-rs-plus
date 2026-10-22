@@ -7,7 +7,7 @@
 //! resources opened through it, which close with the context.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
@@ -18,6 +18,15 @@ use crate::go_struct;
 use crate::gojson::{self, Metadata};
 use crate::host::{Host, Inner, lock};
 use crate::streams::{Chunk, StreamBridge};
+
+/// Synchronous plugin calls (translator hooks, thinking appliers) currently blocking a
+/// current-thread runtime's only thread. While any is, callbacks that would block on a
+/// current-thread runtime fail instead of hanging.
+// ponytail: process-wide, so one parked current-thread runtime also refuses callbacks
+// bound to another current-thread runtime. The binary runs multi-threaded, where
+// synchronous calls use `block_in_place` and callbacks always work; per-runtime
+// tracking is the upgrade if an embedder needs current-thread runtimes side by side.
+pub(crate) static PARKED_CURRENT_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 /// What a callback context remembers about the request it serves.
 #[derive(Clone, Default)]
@@ -30,6 +39,17 @@ pub struct RequestScope {
     /// The request's cancellation (Go's request context): `host.http.*` operations
     /// opened under the context end when it fires.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Inbound values inherited by host.model callbacks that omit overrides.
+    pub headers: gojson::Header,
+    pub query: gojson::Header,
+    /// Internal execution context; never serialized to plugin RPC requests.
+    pub pinned_auth_id: Option<String>,
+    pub execution_session: Option<String>,
+    pub request_path: String,
+    /// The client's usage identity (Go's parent callback context: `userApiKey` and
+    /// `accessProvider`), for the usage records of nested `host.model.*` calls.
+    pub api_key: String,
+    pub access_provider: String,
 }
 
 impl std::fmt::Debug for RequestScope {
@@ -80,6 +100,8 @@ pub(crate) struct Callbacks {
     pub http: crate::hosthttp::HttpBridge,
     /// The server's credential manager (Go `SetAuthManager`).
     pub auth: std::sync::RwLock<Option<Arc<dyn crate::hostauth::AuthManager>>>,
+    pub model_executor: std::sync::RwLock<Option<Arc<dyn crate::hostmodel::ModelExecutor>>>,
+    pub model: crate::hostmodel::ModelBridge,
     runtime: OnceLock<tokio::runtime::Handle>,
 }
 
@@ -93,6 +115,8 @@ impl Callbacks {
             streams: Arc::default(),
             http: Default::default(),
             auth: Default::default(),
+            model_executor: Default::default(),
+            model: Default::default(),
             runtime: OnceLock::new(),
         }
     }
@@ -136,9 +160,16 @@ impl Callbacks {
     }
 
     /// The runtime async callbacks run on (captured when plugins were handed the
-    /// dispatcher).
+    /// dispatcher). `None` while a current-thread runtime is parked in a synchronous
+    /// plugin call ([`PARKED_CURRENT_THREAD`]): blocking on it would never finish.
     pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
-        self.runtime.get().cloned()
+        let handle = self.runtime.get()?;
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+            && PARKED_CURRENT_THREAD.load(Ordering::Acquire) > 0
+        {
+            return None;
+        }
+        Some(handle.clone())
     }
 
     /// Go `addCallbackCleanupHandle`: runs `cleanup` when the context closes; `None`
@@ -327,6 +358,10 @@ impl Host {
             method::HOST_HTTP_CANCEL => self.host_http_cancel(caller, request),
             method::HOST_HTTP_STREAM_READ => self.host_http_stream_read(caller, request),
             method::HOST_HTTP_STREAM_CLOSE => self.host_http_stream_close(caller, request),
+            method::HOST_MODEL_EXECUTE => self.host_model_execute(caller, request, false),
+            method::HOST_MODEL_EXECUTE_STREAM => self.host_model_execute(caller, request, true),
+            method::HOST_MODEL_STREAM_READ => self.host_model_stream_read(request),
+            method::HOST_MODEL_STREAM_CLOSE => self.host_model_stream_close(request),
             method::HOST_AUTH_LIST => self.host_auth_list(request),
             method::HOST_AUTH_GET => self.host_auth_get(request),
             method::HOST_AUTH_GET_RUNTIME => self.host_auth_get_runtime(request),

@@ -10,6 +10,7 @@
 //! (`cpa:claude:session-id:*`, `cpa:claude:user-id:*`), so every node uses the same
 //! identity for a key; the continuity store stays process-local.
 
+use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -310,7 +311,7 @@ pub(crate) fn begin(credential: &str, session: &str, new_turn: bool, explicit_pr
     }
     let explicit = explicit_prompt.trim();
     let prompt = if !explicit.is_empty() && valid_prompt_id(explicit) {
-        explicit.to_lowercase()
+        explicit.go_lower()
     } else if new_turn || entry.prompt_id.is_empty() {
         new_v4()
     } else {
@@ -377,7 +378,7 @@ pub(crate) fn commit(key: &str, sequence: u64, message_id: &str, request_id: &st
         String::new()
     };
     if valid_prompt_id(prompt_id.trim()) {
-        entry.prompt_id = prompt_id.trim().to_lowercase();
+        entry.prompt_id = prompt_id.trim().go_lower();
     }
     entry.committed_sequence = sequence;
     entry.last_access = access;

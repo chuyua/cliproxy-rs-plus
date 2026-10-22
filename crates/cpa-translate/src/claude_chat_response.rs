@@ -2,7 +2,11 @@
 //! (internal/translator/claude/openai/chat-completions/claude_openai_response.go).
 //! Tool arguments are collected until content_block_stop, like Go.
 
-use crate::{Error, ResponseCtx, common::now_unix, stream::GoStream};
+use crate::{
+    Error, ResponseCtx,
+    common::{self, now_unix},
+    stream::GoStream,
+};
 use cpa_common::json::{self as gj, Res};
 use std::collections::{BTreeMap, HashMap};
 
@@ -228,6 +232,8 @@ impl State {
 /// Buffered Claude SSE (the executor streams upstream for non-Claude clients) to one
 /// chat.completion.
 pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+    let (body, _) = common::claude_messages_json_to_sse(body);
+    let body = &*body;
     let mut out = br#"{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#.to_vec();
     let mut id = vec![];
     let mut model = vec![];

@@ -1118,3 +1118,344 @@ async fn queued_create_keeps_the_namespace_state_until_written() {
     );
     drop(stream);
 }
+
+/// Go's reader waits inside `EmitWebSocketResponseEvent` while its writer goroutine keeps
+/// taking client frames: a steer sent while an observer holds a delta reaches upstream,
+/// and the held delta reaches the client only once its observation returns.
+#[tokio::test]
+async fn a_slow_observer_does_not_hold_client_input() {
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","input":"steer while observed"}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","delta":"held"}"#;
+    /// Holds every delta until `release`, telling `held` when it starts.
+    struct Holding {
+        held: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a cpa_core::credential::Credential,
+            _: &'a str,
+            payload: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if gjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta" {
+                    self.held.notify_one();
+                    let _ = self.release.acquire().await.unwrap();
+                }
+            })
+        }
+    }
+    let (steered, delta) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let up = {
+        let (steered, delta) = (steered.clone(), delta.clone());
+        Scripted::start(move |mut c: Peer| {
+            let (steered, delta) = (steered.clone(), delta.clone());
+            async move {
+                c.read().await;
+                c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                delta.notified().await;
+                c.write(DELTA).await;
+                let got = c.read().await;
+                if got != STEER {
+                    c.error(format!("steer: {got}"));
+                }
+                steered.notify_one();
+                c.write(r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}"#)
+                    .await;
+                c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                c.idle().await;
+            }
+        })
+        .await
+    };
+    let client = Client::new("observer-duplex");
+    let observer = Arc::new(Holding {
+        held: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer.clone()));
+    let mut stream = client
+        .start_with(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex, usage)
+        .await;
+    let created = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&created, "type"), "response.created");
+    delta.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), observer.held.notified())
+        .await
+        .expect("the delta was not observed");
+    // Go's unbuffered send: the duplex takes the steer while the delta is observed.
+    client.send(STEER).await;
+    tokio::time::timeout(Duration::from_secs(5), steered.notified())
+        .await
+        .expect("the steer did not reach upstream while the delta was observed");
+    let early = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(
+        early.is_err(),
+        "the held delta was delivered before its observation returned: {early:?}"
+    );
+    observer.release.add_permits(10);
+    let mut types = Vec::new();
+    while let Some(chunk) = next(&mut stream).await {
+        let kind = get(&chunk.unwrap(), "type");
+        types.push(kind.clone());
+        if kind == "response.completed" {
+            break;
+        }
+    }
+    assert_eq!(
+        types,
+        [
+            "response.output_text.delta",
+            "response.steer.accepted",
+            "response.completed"
+        ]
+    );
+    drop(stream);
+    up.finish().await;
+}
+
+/// Go's writer only records its failure; the reader finishes the observer and sends the
+/// message it holds, then reports the error. A writer-side failure (a create for another
+/// model) raised while a delta is observed reaches the client after that delta.
+#[tokio::test]
+async fn a_failure_waits_for_the_observed_message() {
+    const DELTA: &str = r#"{"type":"response.output_text.delta","delta":"held"}"#;
+    struct Holding {
+        held: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a cpa_core::credential::Credential,
+            _: &'a str,
+            payload: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if gjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta" {
+                    self.held.notify_one();
+                    let _ = self.release.acquire().await.unwrap();
+                }
+            })
+        }
+    }
+    let delta = Arc::new(tokio::sync::Notify::new());
+    let up = {
+        let delta = delta.clone();
+        Scripted::start(move |mut c: Peer| {
+            let delta = delta.clone();
+            async move {
+                c.read().await;
+                c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                delta.notified().await;
+                c.write(DELTA).await;
+                c.idle().await;
+            }
+        })
+        .await
+    };
+    let client = Client::new("observer-duplex-failure");
+    let observer = Arc::new(Holding {
+        held: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer.clone()));
+    let mut stream = client
+        .start_with(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex, usage)
+        .await;
+    let created = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&created, "type"), "response.created");
+    delta.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), observer.held.notified())
+        .await
+        .expect("the delta was not observed");
+    client
+        .send(r#"{"type":"response.create","model":"another-model","input":[]}"#)
+        .await;
+    let early = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(early.is_err(), "delivered before the observation returned: {early:?}");
+    observer.release.add_permits(10);
+    let held = next(&mut stream).await.expect("the held delta").unwrap();
+    assert_eq!(get(&held, "type"), "response.output_text.delta");
+    let error = next(&mut stream).await.expect("the deferred failure").unwrap_err();
+    assert!(error.is_replay_required(), "{error}");
+    assert!(next(&mut stream).await.is_none());
+    drop(stream);
+    up.finish().await;
+}
+
+/// A failure raised by queued-create progress while a message is observed stops client
+/// input at once: no later client frame is consumed and nothing is output before the
+/// observed message, which the failure then follows.
+#[tokio::test]
+async fn a_progress_failure_stops_client_input_during_an_observation() {
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","input":"steer"}"#;
+    const CREATED_R2: &str =
+        r#"{"type":"response.created","response":{"id":"r2","previous_response_id":"r1","output":[]}}"#;
+    struct Holding {
+        held: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a cpa_core::credential::Credential,
+            _: &'a str,
+            payload: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if gjson::get(&String::from_utf8_lossy(payload), "response.id").str() == "r2" {
+                    self.held.notify_one();
+                    let _ = self.release.acquire().await.unwrap();
+                }
+            })
+        }
+    }
+    let go = Arc::new(tokio::sync::Notify::new());
+    let up = {
+        let go = go.clone();
+        Scripted::start(move |mut c: Peer| {
+            let go = go.clone();
+            async move {
+                c.read().await;
+                c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                let create = c.read().await;
+                if get(&create, "type") != "response.create" {
+                    c.error(format!("pending create: {create}"));
+                }
+                let steer = c.read().await;
+                if steer != STEER {
+                    c.error(format!("steer: {steer}"));
+                }
+                go.notified().await;
+                c.write(r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}"#)
+                    .await;
+                c.write(CREATED_R2).await;
+                c.idle().await;
+            }
+        })
+        .await
+    };
+    let client = Client::new("observer-duplex-progress-failure");
+    let observer = Arc::new(Holding {
+        held: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer.clone()));
+    let mut stream = client
+        .start_with(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex, usage)
+        .await;
+    assert_eq!(
+        get(&next(&mut stream).await.unwrap().unwrap(), "type"),
+        "response.created"
+    );
+    // A create that stays pending, a steer on r1, and a create for another model queued
+    // behind the steer.
+    client.send(r#"{"type":"response.create","input":[]}"#).await;
+    client.send(STEER).await;
+    client
+        .send(r#"{"type":"response.create","model":"another-model","input":[]}"#)
+        .await;
+    go.notify_one();
+    let accepted = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&accepted, "type"), "response.steer.accepted");
+    // r2's created event frees the queued create, whose progress fails while r2 is held.
+    tokio::time::timeout(Duration::from_secs(5), observer.held.notified())
+        .await
+        .expect("r2 was not observed");
+    client.input.send(Bytes::from_static(b"not json")).await.unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+    assert!(early.is_err(), "output before the observation returned: {early:?}");
+    assert_eq!(
+        client.input.capacity(),
+        0,
+        "a client frame was consumed after the failure"
+    );
+    observer.release.add_permits(10);
+    let created = next(&mut stream).await.expect("the held event").unwrap();
+    assert_eq!(get(&created, "response.id"), "r2");
+    let error = next(&mut stream).await.expect("the deferred failure").unwrap_err();
+    assert!(error.is_replay_required(), "{error}");
+    assert!(next(&mut stream).await.is_none());
+    drop(stream);
+    up.finish().await;
+}
+
+/// Sign in with ChatGPT on a steering socket (7b0319fb): creates get the SIWC WebSocket
+/// body rules, and a steer only loses its `configuration_update` items.
+#[tokio::test]
+async fn siwc_creates_and_steers_drop_configuration_updates() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        let first = c.read().await;
+        if gjson::get(&first, "temperature").exists()
+            || first.contains("configuration_update")
+            || get(&first, "store") != "false"
+            || get(&first, "reasoning.effort") != "low"
+        {
+            c.error(format!("first create kept SIWC-unsupported fields: {first}"));
+        }
+        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+            .await;
+        let steer = c.read().await;
+        if steer
+            != r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"message","role":"user","content":"steer"}]}"#
+        {
+            c.error(format!("steer: {steer}"));
+        }
+        c.write(r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+            .await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("siwc-steer");
+    let mut credential = credential(&up.url);
+    credential.metadata.insert("use_siwc".into(), true.into());
+    credential
+        .metadata
+        .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at"}));
+    let mut req = request(
+        r#"{"model":"gpt-6-astra","temperature":0.5,"input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"type":"message","role":"user","content":"hi"}]}"#,
+    );
+    (req.model, req.requested_model, req.execution_session) =
+        (MODEL.into(), MODEL.into(), Some(client.session.clone()));
+    let session = ExecSession {
+        id: client.session.clone(),
+        continuation: false,
+        lease: None,
+    };
+    let response = client
+        .executor
+        .execute_in_session(&credential, req, &Config::parse(STEERING).unwrap(), &session)
+        .await
+        .unwrap();
+    let ResponseBody::Stream(mut stream) = response.body else {
+        panic!("websocket turns stream");
+    };
+    while let Some(chunk) = next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        match get(&chunk, "type").as_str() {
+            "response.created" => {
+                client
+                    .send(r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"message","role":"user","content":"steer"}]}"#)
+                    .await
+            }
+            "response.completed" => break,
+            _ => {}
+        }
+    }
+    drop(stream);
+    up.finish().await;
+}
