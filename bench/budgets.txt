@@ -50,7 +50,13 @@ size.x86_64-unknown-linux-gnu.archive_bytes  18_169_191  2
 # Crates linked into the binary in two or more versions; a new one fails until it is
 # justified here. 2026-10-05: base64, block-buffer, cpufeatures, crypto-common, digest,
 # getrandom, hashbrown (3), rand, rand_core, sha2, thiserror.
-deps.x86_64-unknown-linux-gnu.duplicate_crates  11  0
+# 2026-10-23: gcl2api Antigravity proxy-group SQLite sidecar adds rusqlite
+# 0.40.2, which requires fallible-iterator 0.3 while the existing Postgres
+# path still uses 0.2; one extra duplicate. GitHub Linux size run 39818655454
+# measured binary 43,538,320, text 29,056,759 and archive 18,481,855 bytes,
+# all within the unchanged upstream size budgets. This change acknowledges
+# the measured dependency cost; it does not relax any byte/RSS budget.
+deps.x86_64-unknown-linux-gnu.duplicate_crates  12  0
 
 # Idle, Linux (every pull request): 30 s without requests, after 30 s of warm-up,
 # with 1 and with 2,000 auth files. RSS gets 10% of room: three 1-file runs on the Ubuntu

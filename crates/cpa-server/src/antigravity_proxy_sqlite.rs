@@ -266,6 +266,10 @@ impl ProxyGroupDb {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transaction helper carries the complete optimistic binding/version preconditions"
+    )]
     fn invalidate_inner(
         &self,
         name: &str,
