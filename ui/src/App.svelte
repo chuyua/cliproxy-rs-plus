@@ -35,7 +35,7 @@
   const View = $derived(views[store.route.page]);
   const current = $derived(store.route.page === "connect" ? "credentials" : store.route.page);
   const title = $derived(
-    store.route.page === "connect" ? "Connect an account" : pages.find((p) => p[0] === current)?.[1],
+    store.t(store.route.page === "connect" ? "Connect an account" : pages.find((p) => p[0] === current)?.[1] ?? ""),
   );
   const host = location.host;
   const version = $derived(/^\d/.test(store.meta.version) ? `v${store.meta.version}` : store.meta.version);
@@ -93,10 +93,17 @@
       stroke-linecap="round"
     /><circle cx="20" cy="20" r="4.5" fill="var(--accent)" /></svg
   >cliproxy-rs{/snippet}
+{#snippet language()}<select
+    class="key quiet"
+    aria-label={store.t("Language")}
+    value={store.lang}
+    onchange={(e) => store.setLanguage(e.currentTarget.value === "en" ? "en" : "zh-CN")}
+  ><option value="zh-CN">中文</option><option value="en">English</option></select
+  >{/snippet}
 {#snippet theme()}<button
     class="key quiet round"
     onclick={() => store.toggleTheme()}
-    aria-label={store.theme === "dark" ? "Use light theme" : "Use dark theme"}
+    aria-label={store.t(store.theme === "dark" ? "Use light theme" : "Use dark theme")}
     ><svg class="i" aria-hidden="true"><use href={`#i-${store.theme === "dark" ? "sun" : "moon"}`} /></svg></button
   >{/snippet}
 
@@ -105,11 +112,12 @@
     <form onsubmit={login}>
       <div class="top-row">
         <h1 class="brand">{@render mark()}</h1>
+        {@render language()}
         {@render theme()}
       </div>
       <div class="window">
         <label class="field"
-          >Management key<input
+          >{store.t("Management key")}<input
             type="password"
             required
             bind:value={secret}
@@ -120,12 +128,11 @@
             <span class="lamp bad"></span>{failure}
           </p>{/if}
         <button class="key primary" disabled={connecting}
-          >{connecting ? "Connecting…" : "Connect"}</button
+          >{store.t(connecting ? "Connecting…" : "Connect")}</button
         >
       </div>
       <p class="small muted">
-        Use <code>management.secret-key</code> from the server’s config.yaml. It stays in this tab’s memory only; reloading
-        signs you out.
+        {store.t("Use management.secret-key from the server’s config.yaml. It stays in this tab’s memory only; reloading signs you out.")}
       </p>
     </form>
   </main>
@@ -140,14 +147,15 @@
         {#each pages as [id, name]}{#if id}<a
               href={`#${id}`}
               aria-current={current === id ? "page" : undefined}
-              >{name}{#if id === "credentials" && store.creds.data?.length}<small
+              >{store.t(name)}{#if id === "credentials" && store.creds.data?.length}<small
                   >{store.creds.data.length}</small
                 >{/if}</a
             >{:else}<hr />{/if}{/each}
       </div>
       <div class="side-foot">
+        {@render language()}
         {@render theme()}
-        <button class="key quiet" onclick={() => (!store.dirty || confirm("Discard unsaved changes?")) && store.logout()}><svg class="i" aria-hidden="true"><use href="#i-out" /></svg>Sign out</button>
+        <button class="key quiet" onclick={() => (!store.dirty || confirm(store.t("Discard unsaved changes?"))) && store.logout()}><svg class="i" aria-hidden="true"><use href="#i-out" /></svg>{store.t("Sign out")}</button>
       </div>
     </nav>
     <div class="main">
@@ -155,13 +163,13 @@
         <a class="brand" href="#overview">{@render mark()}</a>
         <span class="row" role="status">
           <span class="lamp {store.online ? 'ok' : 'bad'}"></span>
-          {#if store.online}<span class="sr">Connected to</span><span class="host"
+          {#if store.online}<span class="sr">{store.t("Connected to")}</span><span class="host"
               >{host}{version ? ` · ${version}` : ""}</span
-            >{:else}Connection lost{/if}
+            >{:else}{store.t("Connection lost")}{/if}
         </span>
         <button
           class="key round menu"
-          aria-label="Pages"
+          aria-label={store.t("Pages")}
           aria-expanded={menu}
           aria-controls="pages"
           onclick={() => (menu = !menu) && tick().then(() => document.querySelector<HTMLElement>(".nav a")?.focus())}><svg class="i" aria-hidden="true"><use href={`#i-${menu ? "close" : "menu"}`} /></svg></button
@@ -177,7 +185,7 @@
     <span class="lamp {store.toast.bad ? 'bad' : 'ok'}"></span>{store.toast.text}
     {#if store.toast.bad}<button
         class="key quiet round small"
-        aria-label="Dismiss"
+        aria-label={store.t("Dismiss")}
         onclick={() => (store.toast = null)}><svg class="i" aria-hidden="true"><use href="#i-close" /></svg></button
       >{/if}
   </div>{/if}

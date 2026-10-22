@@ -7,8 +7,8 @@
 //! files in auth-dir; cliproxy-rs keeps the callback with the pending session in
 //! memory, so nothing extra appears in the watched directory.
 //!
-//! ponytail: the antigravity login and Vertex import answer `provider_not_found` (no
-//! executor or auth module for them yet); no plugin logins.
+//! Vertex import remains unsupported; Antigravity reuses the existing CLI
+//! OAuth implementation and the management callback session machinery.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +31,7 @@ const COMPLETED_TTL: Duration = Duration::from_secs(60);
 const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
 const ANTHROPIC_CALLBACK_PORT: u16 = 54545;
 const CODEX_CALLBACK_PORT: u16 = 1455;
+const ANTIGRAVITY_CALLBACK_PORT: u16 = cpa_exec::antigravity_auth::DEFAULT_CALLBACK_PORT;
 
 #[derive(Clone)]
 struct Session {
@@ -340,6 +341,7 @@ pub(crate) async fn auth_url(State(state): State<Arc<Management>>, RawQuery(raw)
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
         "claude" => start_claude(state, webui).await,
         "codex" => start_codex(state, webui).await,
+        "antigravity" => start_antigravity(state, webui).await,
         "kimi" => {
             // Go `RequestKimiToken`: `domain`, else `channel`, else kimi.com.
             let domain = [q.first("domain"), q.first("channel")]
@@ -427,6 +429,62 @@ fn started(url: String, sid: String) -> Response {
         StatusCode::OK,
         [("status", "ok".into()), ("url", url.into()), ("state", sid.into())],
     )
+}
+
+/// Go `RequestAntigravityToken`, reusing the CLI's existing OAuth exchange.
+async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
+    use cpa_exec::antigravity_auth::{self, OAuth};
+    let Some(sid) = random_state() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
+    };
+    let redirect = antigravity_auth::redirect_uri(ANTIGRAVITY_CALLBACK_PORT);
+    let url = antigravity_auth::auth_url(&sid, &redirect);
+    let forwarder = if webui {
+        match start_forwarder(&state, ANTIGRAVITY_CALLBACK_PORT, "/antigravity/callback").await {
+            Ok(id) => Some(id),
+            Err(message) => return fail(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    } else {
+        None
+    };
+    state.oauth.register(&sid, "antigravity");
+    let worker = state.clone();
+    let flow = sid.clone();
+    tokio::spawn(async move {
+        if let Some(code) = wait_for_callback(&worker, &flow, "antigravity", "Authentication failed").await {
+            let client = login_client(&worker);
+            let oauth = match &worker.login_base {
+                Some(base) => OAuth::with_endpoints(
+                    client,
+                    &format!("{base}/antigravity/token"),
+                    &format!("{base}/antigravity/userinfo"),
+                    base,
+                ),
+                None => OAuth::new(client),
+            };
+            let outcome =
+                match antigravity_auth::complete_management(&oauth, &code, &redirect, chrono::Utc::now()).await {
+                    Ok((file_name, metadata)) => {
+                        save_if_pending(
+                            &worker,
+                            &flow,
+                            "antigravity",
+                            (file_name, metadata),
+                            |dir, (file_name, metadata)| antigravity_auth::save_login(&dir, &file_name, &metadata),
+                            "Failed to save authentication tokens",
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Antigravity OAuth login failed");
+                        Outcome::Failed("Antigravity authentication failed".to_owned())
+                    }
+                };
+            settle(&worker, &flow, outcome);
+        }
+        stop_forwarder(&worker, ANTIGRAVITY_CALLBACK_PORT, forwarder);
+    });
+    started(url, sid)
 }
 
 /// Go `RequestAnthropicToken`.

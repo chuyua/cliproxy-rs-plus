@@ -26,11 +26,11 @@
         // Go knows every built-in provider; a server that lacks one answers provider_not_found.
         if (e instanceof ApiError && e.code === "provider_not_found") {
           gone = [...gone, p];
-          throw new Error(`${label(p)} sign-in is not available on this server.`);
+          throw new Error(`${label(p)}: ${store.t("sign-in is not available on this server.")}`);
         }
         throw e;
       });
-      if (!/^https?:/.test(new URL(r.url).protocol)) throw new Error("The server returned an unsafe sign-in URL.");
+      if (!/^https?:/.test(new URL(r.url).protocol)) throw new Error(store.t("The server returned an unsafe sign-in URL."));
       session = { ...r, provider: p, started: Date.now() };
       status = "wait";
       problem = callback = "";
@@ -46,7 +46,7 @@
       if (s === session && r.cancelled !== false) finish("cancelled");
       return true;
     } catch (e) {
-      store.notify(`Sign-in not cancelled: ${e instanceof Error ? e.message : e}`, true);
+      store.notify(`${store.t("Sign-in not cancelled:")} ${e instanceof Error ? e.message : e}`, true);
       return false;
     }
   }
@@ -66,7 +66,7 @@
       problem = r.error || "";
       finish(r.status);
       if (r.status === "ok") {
-        store.notify(`${label(s.provider)} account connected.`);
+        store.notify(`${label(s.provider)} ${store.t("account connected.")}`);
         store.creds.load(true);
       }
     }),
@@ -81,19 +81,19 @@
       await api("/oauth/import?provider=vertex", "POST", form).catch((e) => {
         if (!(e instanceof ApiError && e.code === "provider_not_found")) throw e;
         gone = [...gone, "vertex"];
-        throw new Error("Vertex import is not available on this server.");
+        throw new Error(store.t("Vertex import is not available on this server."));
       });
       await store.creds.load(true);
-    }, "Vertex service account imported.");
+    }, store.t("Vertex service account imported."));
   }
 </script>
 
-<div class="head"><h1>Connect an account</h1></div>
-<Missing actions={[["GET", "/oauth/auth-url", "provider sign-in"], ["POST", "/oauth/import", "Vertex import"]]} />
+<div class="head"><h1>{store.t("Connect an account")}</h1></div>
+<Missing actions={[["GET", "/oauth/auth-url", store.t("provider sign-in")], ["POST", "/oauth/import", store.t("Vertex import")]]} />
 
 <section class="section">
-  <h2>Sign in with a provider</h2>
-  <p class="muted">You approve access on the provider’s own page (OAuth). The proxy stores the resulting token and renews it; it never sees your password.</p>
+  <h2>{store.t("Sign in with a provider")}</h2>
+  <p class="muted">{store.t("You approve access on the provider’s own page (OAuth). The proxy stores the resulting token and renews it; it never sees your password.")}</p>
   <div class="providers">
     {#each providers as p}
       <button
@@ -112,53 +112,53 @@
       <h2>{label(session.provider)}</h2>
       <span class="row">
         <span class="lamp {status === 'ok' ? 'ok' : status === 'wait' ? 'warn live' : status === 'error' ? 'bad' : 'off'}"></span>
-        {status === "wait" ? "Waiting for approval" : status === "ok" ? "Connected" : status === "error" ? "Failed" : "Cancelled"}
+        {store.t(status === "wait" ? "Waiting for approval" : status === "ok" ? "Connected" : status === "error" ? "Failed" : "Cancelled")}
       </span>
     </div>
     {#if status === "wait"}
       <ol class="steps">
         <li>
-          <span>Open the provider’s page and approve access{session.user_code ? " with this code" : ""}.</span>
+          <span>{store.t("Open the provider’s page and approve access")}{session.user_code ? store.t("with this code") : ""}.</span>
           {#if session.user_code}<code class="code-big">{session.user_code}</code>{/if}
           <div class="row">
-            <a class="key primary" href={session.url} target="_blank" rel="noopener noreferrer"><svg class="i" aria-hidden="true"><use href="#i-open" /></svg>Open sign-in page</a>
-            <button class="key" onclick={() => store.act(() => navigator.clipboard.writeText(session!.url), "Link copied.")}><svg class="i" aria-hidden="true"><use href="#i-copy" /></svg>Copy link</button>
+            <a class="key primary" href={session.url} target="_blank" rel="noopener noreferrer"><svg class="i" aria-hidden="true"><use href="#i-open" /></svg>{store.t("Open sign-in page")}</a>
+            <button class="key" onclick={() => store.act(() => navigator.clipboard.writeText(session!.url), store.t("Link copied."))}><svg class="i" aria-hidden="true"><use href="#i-copy" /></svg>{store.t("Copy link")}</button>
           </div>
         </li>
         {#if session.flow !== "device"}
           <li>
-            <span>If the browser ends on a page that fails to load, paste its full address here.</span>
+            <span>{store.t("If the browser ends on a page that fails to load, paste its full address here.")}</span>
             <form
               class="form"
               onsubmit={(e) => {
                 e.preventDefault();
-                store.act(() => api("/oauth/callback", "POST", { provider: session!.provider, redirect_url: callback.trim() }), "Callback sent. Finishing sign-in…");
+                store.act(() => api("/oauth/callback", "POST", { provider: session!.provider, redirect_url: callback.trim() }), store.t("Callback sent. Finishing sign-in…"));
               }}
             >
-              <label class="field"><span class="sr">Callback address</span><input type="url" required bind:value={callback} placeholder="http://localhost:…/callback?code=…" /></label>
-              <button class="key" disabled={store.busy}>Send</button>
+              <label class="field"><span class="sr">{store.t("Callback address")}</span><input type="url" required bind:value={callback} placeholder="http://localhost:…/callback?code=…" /></label>
+              <button class="key" disabled={store.busy}>{store.t("Send")}</button>
             </form>
           </li>
         {/if}
       </ol>
-      <div class="row"><button class="key quiet" onclick={cancel}>Cancel sign-in</button></div>
+      <div class="row"><button class="key quiet" onclick={cancel}>{store.t("Cancel sign-in")}</button></div>
     {:else if status === "ok"}
-      <p>Saved on the server and in rotation.</p>
-      <div class="row"><a class="key primary" href="#credentials">View credentials</a></div>
+      <p>{store.t("Saved on the server and in rotation.")}</p>
+      <div class="row"><a class="key primary" href="#credentials">{store.t("View credentials")}</a></div>
     {:else}
       {#if problem}<p class="error">{problem}</p>{/if}
-      <div class="row"><button class="key" onclick={() => start(session!.provider)}>Start again</button></div>
+      <div class="row"><button class="key" onclick={() => start(session!.provider)}>{store.t("Start again")}</button></div>
     {/if}
   </section>
 {/if}
 
 <section class="section">
-  <h2>Other ways</h2>
+  <h2>{store.t("Other ways")}</h2>
   <ul class="list">
     <li class="item">
-      <span class="grow">Use a Google Cloud service-account JSON for Vertex AI.</span>
+      <span class="grow">{store.t("Use a Google Cloud service-account JSON for Vertex AI.")}</span>
       <label class="key" aria-disabled={!store.can("POST", "/oauth/import") || gone.includes("vertex")}
-        ><svg class="i" aria-hidden="true"><use href="#i-upload" /></svg>Import service account<input
+        ><svg class="i" aria-hidden="true"><use href="#i-upload" /></svg>{store.t("Import service account")}<input
           class="file"
           type="file"
           accept=".json,application/json"
@@ -168,8 +168,8 @@
       >
     </li>
     <li class="item">
-      <span class="grow">Use an API key instead of an account.</span>
-      <a class="key" href="#providers">Providers</a>
+      <span class="grow">{store.t("Use an API key instead of an account.")}</span>
+      <a class="key" href="#providers">{store.t("Providers")}</a>
     </li>
   </ul>
 </section>

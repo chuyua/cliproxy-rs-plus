@@ -248,6 +248,10 @@ fn default_tier(load: Option<&GoMap>) -> String {
 /// The OAuth and Cloud Code calls of `AntigravityAuth`, over one client.
 pub struct OAuth {
     client: wreq::Client,
+    token_endpoint: String,
+    userinfo_endpoint: String,
+    api_endpoint: String,
+    daily_api_endpoint: String,
     /// Pause between onboarding polls (two seconds; tests shorten it).
     poll_delay: Duration,
 }
@@ -256,8 +260,23 @@ impl OAuth {
     pub fn new(client: wreq::Client) -> Self {
         Self {
             client,
+            token_endpoint: TOKEN_ENDPOINT.to_owned(),
+            userinfo_endpoint: USERINFO_ENDPOINT.to_owned(),
+            api_endpoint: API_ENDPOINT.to_owned(),
+            daily_api_endpoint: DAILY_API_ENDPOINT.to_owned(),
             poll_delay: Duration::from_secs(2),
         }
+    }
+
+    /// Test-only endpoint override for local integration fixtures. Production
+    /// calls `new` and retains the original Google/Cloud Code endpoints.
+    pub fn with_endpoints(client: wreq::Client, token: &str, userinfo: &str, cloud: &str) -> Self {
+        let mut oauth = Self::new(client);
+        oauth.token_endpoint = token.to_owned();
+        oauth.userinfo_endpoint = userinfo.to_owned();
+        oauth.api_endpoint = cloud.to_owned();
+        oauth.daily_api_endpoint = cloud.to_owned();
+        oauth
     }
 
     #[cfg(test)]
@@ -297,7 +316,7 @@ impl OAuth {
         let mut headers = GoHeaders::new();
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         let upstream = self
-            .post(TOKEN_ENDPOINT, headers, form.into_bytes(), None)
+            .post(&self.token_endpoint, headers, form.into_bytes(), None)
             .await
             .map_err(|e| AuthError::plain(format!("{STEP}: execute request: {}", transport_text(&e))))?;
         let status = upstream.status;
@@ -327,9 +346,16 @@ impl OAuth {
         let mut headers = GoHeaders::new();
         headers.set("Authorization", format!("Bearer {access_token}"));
         headers.set("User-Agent", version::request_user_agent(""));
-        let upstream = proxy::request(&self.client, wreq::Method::GET, USERINFO_ENDPOINT, headers, None, None)
-            .await
-            .map_err(|e| AuthError::plain(format!("{STEP}: execute request: {}", transport_text(&e))))?;
+        let upstream = proxy::request(
+            &self.client,
+            wreq::Method::GET,
+            &self.userinfo_endpoint,
+            headers,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AuthError::plain(format!("{STEP}: execute request: {}", transport_text(&e))))?;
         let status = upstream.status;
         if !(200..300).contains(&status) {
             let body = proxy::read_all(upstream.body, 8 << 10, false)
@@ -360,7 +386,7 @@ impl OAuth {
         headers.set("Accept", "*/*");
         headers.set("Content-Type", "application/json");
         headers.set("User-Agent", version::request_user_agent(""));
-        let url = format!("{API_ENDPOINT}/{API_VERSION}:loadCodeAssist");
+        let url = format!("{}/{API_VERSION}:loadCodeAssist", self.api_endpoint);
         let upstream = self
             .post(&url, headers, body, None)
             .await
@@ -410,7 +436,7 @@ impl OAuth {
             ("metadata".to_owned(), GoValue::Object(metadata)),
         ]))
         .marshal();
-        let url = format!("{DAILY_API_ENDPOINT}/{API_VERSION}:onboardUser");
+        let url = format!("{}/{API_VERSION}:onboardUser", self.daily_api_endpoint);
         for attempt in 1..=ONBOARD_ATTEMPTS {
             tracing::debug!("Polling attempt {attempt}/{ONBOARD_ATTEMPTS}");
             let mut headers = GoHeaders::new();
@@ -811,6 +837,38 @@ pub async fn complete(
     Ok(build_auth(&tokens, &email, project, now))
 }
 
+/// Go's management RequestAntigravityToken tolerates a failed project lookup:
+/// it saves the OAuth credential and lets the executor resolve project ID later.
+/// Keep the CLI `complete` behavior unchanged.
+pub async fn complete_management(
+    oauth: &OAuth,
+    code: &str,
+    redirect_uri: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, Map<String, Value>), AuthError> {
+    let tokens = oauth
+        .exchange_code(code, redirect_uri)
+        .await
+        .map_err(|e| e.wrap("antigravity: token exchange failed"))?;
+    if tokens.access_token.trim().is_empty() {
+        return Err(AuthError::plain(
+            "antigravity: token exchange returned empty access token",
+        ));
+    }
+    let email = oauth
+        .user_info(&tokens.access_token)
+        .await
+        .map_err(|e| e.wrap("antigravity: fetch user info failed"))?;
+    let project = match oauth.project_id(&tokens.access_token).await {
+        Ok(project) => project,
+        Err(error) => {
+            tracing::warn!(error = %error, "Antigravity project discovery deferred");
+            String::new()
+        }
+    };
+    Ok(build_auth(&tokens, &email, &project, now))
+}
+
 /// `BuildAntigravityAuth`: file name and metadata of a new credential.
 pub fn build_auth(tokens: &Tokens, email: &str, project: &str, now: DateTime<Utc>) -> (String, Map<String, Value>) {
     let mut metadata = refresh_patch(tokens, now).set;
@@ -825,6 +883,11 @@ pub fn build_auth(tokens: &Tokens, email: &str, project: &str, now: DateTime<Utc
         metadata.insert("project_id".into(), Value::String(project.into()));
     }
     (credential_file_name(email), metadata)
+}
+
+/// Persist management logins through the existing CLI credential writer.
+pub fn save_login(auth_dir: &Path, file_name: &str, metadata: &Map<String, Value>) -> Result<PathBuf, String> {
+    crate::devin_auth::save_metadata_file(auth_dir, file_name, metadata, PROVIDER)
 }
 
 /// One OAuth callback (`callbackResult`).

@@ -57,6 +57,8 @@ jobs:
         run: cargo test --locked -p cpa-server --lib antigravity_cli_probe -- --nocapture
       - name: Antigravity verified CLI version SQLite tests
         run: cargo test --locked -p cpa-server --lib antigravity_cli_state -- --nocapture
+      - name: Antigravity management OAuth regression
+        run: cargo test --locked -p cpa-server --test management antigravity_management -- --nocapture
       - name: Compile release Linux executable
         run: cargo build --release --locked -p cliproxy
       - name: Smoke test and checksum

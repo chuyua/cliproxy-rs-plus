@@ -5,7 +5,7 @@ cliproxy-rs follows CLIProxyAPI at commit `6fecc6e` (v8.0.10). It reads the same
 ## What carries over
 
 - `config.yaml`. The v8 layout and the older flat layout (top-level `port`, `auth-dir`, an `api-keys` list, `remote-management`) are both read. Every v8 setting is accepted, including settings for features cliproxy-rs does not have yet (listed below); those are kept in the file but have no effect.
-- Credential files in `oauth.auth-dir` (default `~/.cli-proxy-api`). Claude, Codex, Kimi, Meta, xAI, Devin, Vertex and AI Studio files are used as they are. Antigravity files, a provider cliproxy-rs does not serve yet, are listed in the dashboard but not used for requests.
+- Credential files in `oauth.auth-dir` (default `~/.cli-proxy-api`). Claude, Codex, Antigravity, Kimi, Meta, xAI, Devin, Vertex and AI Studio files are used as they are.
 - The hashed management key. Go and cliproxy-rs both hash a plaintext `management.secret-key` with bcrypt on start and write the hash back, and each accepts the other's hash.
 - Client keys in `access.api-keys`, provider keys under `api-keys`, OpenAI-compatible upstreams, model aliases and exclusions, payload rules, proxies, routing strategy, retries and cooldowns.
 - The client routes (`/v1/...`, `/v1beta/...`, `/backend-api/codex/...`) and the Responses WebSocket, so clients need no changes.
@@ -31,7 +31,7 @@ Do not run Go and cliproxy-rs with credentials for the same account at the same 
 
 cliproxy-rs accepts every CLIProxyAPI flag, in Go's single-dash spelling (`-config`) or with two dashes. These work as in Go: `-config`, `-claude-login`, `-codex-login`, `-codex-device-login`, `-kimi-login`, `-kimi-ai-login`, `-xai-login`, `-meta-login`, `-devin-login`, `-vertex-import` (with `-vertex-import-prefix`), `-no-browser`, `-oauth-callback-port`, `-password`, `--local-model`, `-home-jwt` (or `HOME_JWT`), and LAN discovery with `-discover` (or the `discover` subcommand) and its `-discover-*` options.
 
-`-antigravity-login` exits with a "not supported by cliproxy-rs yet" error and status 1. `-tui` and `-tui -standalone` open the terminal UI as in Go, with the differences listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
+`-antigravity-login` uses the existing Rust Antigravity OAuth implementation. `-tui` and `-tui -standalone` open the terminal UI as in Go, with the differences listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
 ## Not available yet
 
@@ -51,7 +51,7 @@ The one provider that is not available yet, Antigravity, is listed in the README
 
 ## Management API differences
 
-The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs, model definitions and plugins behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Kimi, Meta, xAI and Devin. Antigravity sign-in and the Vertex import (`oauth/import`) return `404` with `provider_not_found`.
+The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs, model definitions and plugins behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Antigravity, Kimi, Meta, xAI and Devin. Antigravity uses Google's localhost:51121 callback; on a remote server the dashboard also accepts a manually pasted callback URL. Vertex import (`oauth/import`) returns `404` with `provider_not_found`.
 
 Not available on cliproxy-rs:
 

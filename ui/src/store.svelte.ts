@@ -1,5 +1,6 @@
 import { api, connect, disconnect, configValue, route, ApiError } from "./api";
 import { equal, fieldPath, reconcile, type Data, type Window } from "./core";
+import { initialLanguage, translate, type Language } from "./i18n";
 
 export const pages = [
   ["overview", "Overview"],
@@ -56,6 +57,19 @@ function parse(hash: string) {
 class Store {
   logged = $state(false);
   theme = $state(document.documentElement.dataset.theme || "dark");
+  lang = $state<Language>(initialLanguage());
+  t(text: string): string {
+    return translate(text, this.lang);
+  }
+  setLanguage(lang: Language) {
+    this.lang = lang;
+    document.documentElement.lang = lang;
+    try {
+      localStorage.setItem("cliproxy-language", lang);
+    } catch {
+      // A private browsing session can reject persistent storage.
+    }
+  }
   route = $state(parse(location.hash));
   meta = $state({ version: "", commit: "", built: "" });
   /**

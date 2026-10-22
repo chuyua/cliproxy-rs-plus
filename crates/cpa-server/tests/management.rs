@@ -1673,6 +1673,10 @@ async fn fake_logins() -> (
                     "expires_in": 600, "interval": 1}),
                 "/oauth2/token" => json!({"access_token": "fake-xai-at", "refresh_token": "fake-xai-rt",
                     "id_token": xai_id_token, "token_type": "Bearer", "expires_in": 3600}),
+                "/antigravity/token" => json!({"access_token":"fake-antigravity-at",
+                    "refresh_token":"fake-antigravity-rt","token_type":"Bearer","expires_in":3600}),
+                "/antigravity/userinfo" => json!({"email":"antigravity@example.invalid"}),
+                "/v1internal:loadCodeAssist" => json!({"cloudaicompanionProject":"test-project-123"}),
                 // Devin: code exchange and profile (the user-status RPC gets `{}` and fails,
                 // which the login tolerates).
                 "/auth/cli/token" => json!({"token": "fake-devin-session"}),
@@ -1731,6 +1735,76 @@ async fn final_status(base: &str, state: &str, secs: u64) -> Value {
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// Antigravity OAuth in the management panel uses the same provider callback
+/// and credential persistence path as the existing CLI flow.
+#[tokio::test]
+async fn antigravity_management_signin_saves_a_usable_credential() {
+    let (fake, seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("antigravity-login");
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
+    assert_eq!(started["status"], "ok");
+    let sid = started["state"].as_str().unwrap();
+    assert_eq!(sid.len(), 32);
+    let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.domain(), Some("accounts.google.com"));
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["redirect_uri"], "http://localhost:51121/oauth-callback");
+    assert_eq!(query["state"], sid);
+    assert!(!f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+        provider: "codex",
+        state: sid.to_owned(),
+        code: "wrong-provider".into(),
+        error: String::new(),
+    }));
+    assert_eq!(
+        oauth_get(&base, &format!("/oauth/status?state={sid}")).await["status"],
+        "wait"
+    );
+    let callback = wreq::Client::new()
+        .post(format!("{base}/v8/management/oauth/callback"))
+        .bearer_auth("fake-management-only")
+        .json(&json!({"provider":"antigravity",
+            "redirect_url":format!("http://localhost:51121/oauth-callback?code=test-antigravity-code&state={sid}")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), 200);
+    assert_eq!(final_status(&base, sid, 10).await, json!({"status":"ok"}));
+    let saved_path = f.dir.join("auth/antigravity-antigravity@example.invalid.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
+    assert_eq!(saved["type"], "antigravity");
+    assert_eq!(saved["refresh_token"], "fake-antigravity-rt");
+    assert_eq!(saved["project_id"], "test-project-123");
+    assert!(f.rt.store().snapshot().iter().any(|c| c.provider == "antigravity"));
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|(path, form)| path == "/antigravity/token"
+        && form.contains("test-antigravity-code")
+        && form.contains("redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback")));
+    server.abort();
+    fake_server.abort();
+}
+
+/// A denied Antigravity authorization must not persist any credentials.
+#[tokio::test]
+async fn antigravity_management_denial_does_not_save_a_credential() {
+    let (fake, _, fake_server) = fake_logins().await;
+    let f = Fixture::new("antigravity-denied");
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
+    let sid = started["state"].as_str().unwrap();
+    assert!(f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+        provider: "antigravity",
+        state: sid.to_owned(),
+        code: String::new(),
+        error: "access_denied".into(),
+    }));
+    assert_eq!(final_status(&base, sid, 5).await["status"], "error");
+    assert!(f.rt.store().snapshot().iter().all(|c| c.provider != "antigravity"));
+    server.abort();
+    fake_server.abort();
 }
 
 /// xAI: Go `RequestXAIToken` answers with the device URL and code, and the poller
