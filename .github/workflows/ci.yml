@@ -219,6 +219,19 @@ jobs:
         env:
           AUTH_FILES: ${{ matrix.auth-files }}
         run: bench/gate.sh idle linux target/release/cliproxy "$AUTH_FILES"
+      # A failed budget stays failed. Two more fresh processes help distinguish
+      # a stable RSS regression from a noisy hosted runner without weakening
+      # the one-shot fail-closed threshold.
+      - name: Diagnose failed one-account RSS without waiving the gate
+        if: ${{ failure() && matrix.auth-files == 1 }}
+        run: |
+          if [ -x target/release/cliproxy ]; then
+            for i in 1 2; do
+              echo "::group::Additional isolated idle sample $i"
+              bench/idle.sh target/release/cliproxy 1 30
+              echo "::endgroup::"
+            done
+          fi
 
   # Clippy over every target (tests, examples, benches) with warnings as errors, so code
   # that only builds on Windows, test-only code included, is held to the Linux rules.

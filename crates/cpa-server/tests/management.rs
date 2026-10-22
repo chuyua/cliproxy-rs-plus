@@ -2321,9 +2321,12 @@ async fn fake_logins() -> (
                     "expires_in": 600, "interval": 1}),
                 "/oauth2/token" => json!({"access_token": "fake-xai-at", "refresh_token": "fake-xai-rt",
                     "id_token": xai_id_token, "token_type": "Bearer", "expires_in": 3600}),
-                "/antigravity/token" => json!({"access_token":"fake-antigravity-at",
+                // These paths mirror the production OAuth URL shapes after the
+                // login_base host is replaced with this loopback fixture.
+                // Unknown endpoints deliberately return {}, failing the login.
+                "/token" => json!({"access_token":"fake-antigravity-at",
                     "refresh_token":"fake-antigravity-rt","token_type":"Bearer","expires_in":3600}),
-                "/antigravity/userinfo" => json!({"email":"antigravity@example.invalid"}),
+                "/oauth2/v2/userinfo" => json!({"email":"antigravity@example.invalid"}),
                 "/v1internal:loadCodeAssist" => json!({"cloudaicompanionProject":"test-project-123"}),
                 // Devin: code exchange and profile (the user-status RPC gets `{}` and fails,
                 // which the login tolerates).
@@ -2475,9 +2478,11 @@ async fn antigravity_management_signin_saves_a_usable_credential() {
     assert_eq!(saved["project_id"], "test-project-123");
     assert!(f.rt.store().snapshot().iter().any(|c| c.provider == "antigravity"));
     let seen = seen.lock().unwrap();
-    assert!(seen.iter().any(|(path, form)| path == "/antigravity/token"
+    assert!(seen.iter().any(|(path, form)| path == "/token"
         && form.contains("test-antigravity-code")
         && form.contains("redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback")));
+    assert!(seen.iter().any(|(path, _)| path == "/oauth2/v2/userinfo"));
+    assert!(seen.iter().any(|(path, _)| path == "/v1internal:loadCodeAssist"));
     server.abort();
     fake_server.abort();
 }
@@ -2485,7 +2490,7 @@ async fn antigravity_management_signin_saves_a_usable_credential() {
 /// A denied Antigravity authorization must not persist any credentials.
 #[tokio::test]
 async fn antigravity_management_denial_does_not_save_a_credential() {
-    let (fake, _, fake_server) = fake_logins().await;
+    let (fake, seen, fake_server) = fake_logins().await;
     let f = Fixture::new("antigravity-denied");
     let (base, _state, server) = login_server(&f, &fake).await;
     let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
@@ -2501,6 +2506,10 @@ async fn antigravity_management_denial_does_not_save_a_credential() {
     );
     assert_eq!(final_status(&base, sid, 5).await["status"], "error");
     assert!(f.rt.store().snapshot().iter().all(|c| c.provider != "antigravity"));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "authorization denial must never make upstream token or userinfo calls"
+    );
     server.abort();
     fake_server.abort();
 }
