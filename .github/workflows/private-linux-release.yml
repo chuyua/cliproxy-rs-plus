@@ -1,0 +1,109 @@
+name: Private Linux preview release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Tested source commit SHA (full 40 hex characters)
+        required: true
+        type: string
+      build_run_id:
+        description: Successful private Linux CI run ID
+        required: true
+        type: string
+      release_tag:
+        description: New immutable preview tag (vX.Y.Z-linux-preview.YYYYMMDD)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: private-linux-preview-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RUN_ID: ${{ inputs.build_run_id }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Verify private repository and successful exact CI source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "invalid source SHA"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "invalid CI run ID"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-linux-preview\.[0-9]{8}$ ]] || { echo "invalid preview tag"; exit 1; }
+          test "$(gh api "repos/$REPO" --jq .private)" = true
+          test "$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .conclusion)" = success
+          test "$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .head_sha)" = "$SOURCE_SHA"
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            echo "release already exists; refusing overwrite"
+            exit 1
+          fi
+          if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag already exists; refusing overwrite"
+            exit 1
+          fi
+
+      - name: Download exact CI Linux x86_64 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$RUN_ID" -R "$REPO" -n gcl2api-rust-linux-x86_64 -D dist
+          test -f dist/cliproxy-linux-x86_64
+          test -f dist/SHA256SUMS
+
+      - name: Verify integrity, ELF machine and startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          file dist/cliproxy-linux-x86_64 | grep -E 'ELF 64-bit.*x86-64'
+          test "$(stat -c %s dist/cliproxy-linux-x86_64)" -gt 100000
+          chmod +x dist/cliproxy-linux-x86_64
+          ./dist/cliproxy-linux-x86_64 --help >/dev/null
+          sha256sum dist/cliproxy-linux-x86_64
+          echo "Verified tested Linux x86_64 ELF; source SHA $SOURCE_SHA"
+
+      - name: Create draft release with Linux binary and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          ## Linux x86_64 preview
+
+          Source commit: \`$SOURCE_SHA\`
+          Verified private Ubuntu 24.04 CI run: https://github.com/$REPO/actions/runs/$RUN_ID
+
+          Assets:
+          - \`cliproxy-linux-x86_64\`: Linux x86_64 ELF executable
+          - \`SHA256SUMS\`: artifact SHA256 checksum
+
+          After downloading both assets, verify with \`sha256sum -c SHA256SUMS\` and run \`chmod +x cliproxy-linux-x86_64\`.
+
+          **Preview limitations:** the Rust port is not yet feature-identical to Python gcl2api-plus. Proxy-group SQLite and adopted CLI version state do not yet drive the live request scheduler automatically. The binary was compiled on Ubuntu 24.04; compatibility with older glibc distributions has not been established. No production deployment is included.
+          EOF
+          gh release create "$TAG" dist/cliproxy-linux-x86_64 dist/SHA256SUMS \
+            -R "$REPO" --target "$SOURCE_SHA" --prerelease --draft \
+            --title "gcl2api Rust Linux x86_64 preview $TAG" --notes-file release-notes.md
+
+      - name: Check assets and publish the pre-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name')"
+          grep -Fqx 'cliproxy-linux-x86_64' <<<"$assets"
+          grep -Fqx 'SHA256SUMS' <<<"$assets"
+          gh release edit "$TAG" -R "$REPO" --draft=false
+          gh release view "$TAG" -R "$REPO" --json tagName,isDraft,isPrerelease,targetCommitish,url,assets \
+            --jq '{tagName,isDraft,isPrerelease,targetCommitish,url,assets:[.assets[]|{name,size}]}'

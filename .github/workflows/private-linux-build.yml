@@ -1,0 +1,75 @@
+name: Private Rust build (Linux x64)
+
+on:
+  push:
+    branches:
+      - feature/gcl2api-antigravity-403-20261019
+      - 'sync/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile:
+    name: Compile and test on Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev perl nasm pkg-config
+      - name: Rust compiler
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+          rustup default 1.99.0
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Antigravity 403 scheduler regression
+        run: cargo test --locked -p cpa-server --lib gcl2api_antigravity -- --nocapture
+      - name: Antigravity health and egress state tests
+        run: cargo test --locked -p cpa-server --lib antigravity_health -- --nocapture
+      - name: Antigravity proxy group selection tests
+        run: cargo test --locked -p cpa-server --lib antigravity_proxy_group -- --nocapture
+      - name: Antigravity SQLite binding transaction tests
+        run: cargo test --locked -p cpa-server --lib antigravity_proxy_sqlite -- --nocapture
+      - name: Antigravity read-only proxy bridge tests
+        run: cargo test --locked -p cpa-server --lib antigravity_proxy_bridge -- --nocapture
+      - name: Antigravity CLI identity compatibility
+        run: cargo test --locked -p cpa-exec --lib antigravity_cli_ua -- --nocapture
+      - name: Antigravity fail-closed grouped proxy regression
+        run: cargo test --locked -p cpa-exec --lib group_proxy_fail_closed -- --nocapture
+      - name: Antigravity Go differential executor regression
+        run: cargo test --locked -p cpa-exec --lib antigravity_tests -- --nocapture
+      - name: Antigravity CLI manifest and isolated version probe
+        run: cargo test --locked -p cpa-server --lib antigravity_cli_probe -- --nocapture
+      - name: Antigravity verified CLI version SQLite tests
+        run: cargo test --locked -p cpa-server --lib antigravity_cli_state -- --nocapture
+      - name: Compile release Linux executable
+        run: cargo build --release --locked -p cliproxy
+      - name: Smoke test and checksum
+        run: |
+          ./target/release/cliproxy --help > /dev/null
+          mkdir -p dist
+          cp target/release/cliproxy dist/cliproxy-linux-x86_64
+          (cd dist && sha256sum cliproxy-linux-x86_64 > SHA256SUMS)
+      - name: Save executable for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcl2api-rust-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1456,7 +1456,22 @@ impl Scheduler {
         let hint = error.retry_after.filter(|d| !d.is_zero());
         let mut quota = false;
         let mut cloudflare = false;
-        let duration = if crate::classify::is_model_support(status, &text) {
+        // gcl2api-plus 776430a: an explicit Antigravity model denial should only
+        // cool that model for 300s, and an account-verification challenge for
+        // 600s. Other 403 categories retain the current Go fallback until the
+        // account health / proxy rebind flow is ported.
+        let antigravity_403_cooldown = if status == 403 && c.provider.eq_ignore_ascii_case("antigravity") {
+            let (binding, eligibility) = crate::antigravity_health::cached_statuses(c);
+            crate::antigravity_403::classify(&text, binding, eligibility)
+                .category
+                .model_cooldown_seconds()
+                .map(Duration::from_secs)
+        } else {
+            None
+        };
+        let duration = if let Some(specific) = antigravity_403_cooldown {
+            (!disabled).then_some(specific)
+        } else if crate::classify::is_model_support(status, &text) {
             (!disabled).then(|| hint.unwrap_or(Duration::from_secs(43200)))
         } else if crate::classify::is_cloudflare(status, &text) {
             quota = true;
@@ -2414,6 +2429,85 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    /// gcl2api-plus Antigravity 403 rules override only model-specific cooldowns.
+    #[test]
+    fn gcl2api_antigravity_model_and_validation_cooldowns() {
+        let mut account = cred("antigravity-account", serde_json::json!({}));
+        account.provider = "antigravity".into();
+        let other = cred("claude-account", serde_json::json!({}));
+        let policy = Policy::default();
+        let at = Instant::now();
+        for (message, expected) in [
+            ("Model gemini-image is not available for this account", 300),
+            ("Account validation is required: VALIDATION_REQUIRED", 600),
+            ("Please verify your account to continue", 600),
+            ("Forbidden", 1800),
+        ] {
+            let mut scheduler = Scheduler::default();
+            let failure = Outcome::Failure(ExecError::local(403, FailureScope::Credential, message));
+            scheduler.record(&account, "gemini-image", &failure, &policy, at);
+            assert_eq!(
+                scheduler.wait(&account, "gemini-image", at),
+                Some(secs(expected)),
+                "{message}"
+            );
+            assert_eq!(
+                scheduler.wait(&account, "unrelated-model", at),
+                None,
+                "403 model cooldown must not spread to other models"
+            );
+        }
+        let mut unchanged = Scheduler::default();
+        let failure = Outcome::Failure(ExecError::local(
+            403,
+            FailureScope::Credential,
+            "Account validation is required: VALIDATION_REQUIRED",
+        ));
+        unchanged.record(&other, "claude-sonnet", &failure, &policy, at);
+        assert_eq!(unchanged.wait(&other, "claude-sonnet", at), Some(secs(1800)));
+    }
+
+    /// Health cache is optional. When present, Python's explicit proxy
+    /// failure evidence takes precedence over the response's model markers.
+    #[test]
+    fn gcl2api_antigravity_403_honors_cached_binding_precedence() {
+        let mut account = cred(
+            "antigravity-account",
+            serde_json::json!({
+                "gcl2api_account_health": {
+                    "binding_status": "proxy_drift",
+                    "eligibility_status": "eligible"
+                }
+            }),
+        );
+        account.provider = "antigravity".into();
+        let policy = Policy::default();
+        let at = Instant::now();
+        let fault = Outcome::Failure(ExecError::local(
+            403,
+            FailureScope::Credential,
+            "Model gemini-image is not available for this account",
+        ));
+        let mut s = Scheduler::default();
+        s.record(&account, "gemini-image", &fault, &policy, at);
+        assert_eq!(s.wait(&account, "gemini-image", at), Some(secs(1800)));
+
+        account.metadata.insert(
+            "gcl2api_account_health".into(),
+            serde_json::json!({
+                "binding_status": "healthy",
+                "eligibility_status": "geo_blocked"
+            }),
+        );
+        let mut s = Scheduler::default();
+        s.record(&account, "gemini-image", &fault, &policy, at);
+        assert_eq!(
+            s.wait(&account, "gemini-image", at),
+            Some(secs(300)),
+            "explicit model denial must override stale cached geo status"
+        );
     }
 
     /// A 429 whose stated reset is `stated` from `at`.

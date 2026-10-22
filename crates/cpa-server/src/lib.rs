@@ -2,6 +2,13 @@
 
 mod access;
 mod affinity;
+mod antigravity_403;
+pub mod antigravity_cli_probe;
+pub mod antigravity_cli_state;
+pub mod antigravity_health;
+pub mod antigravity_proxy_bridge;
+pub mod antigravity_proxy_group;
+pub mod antigravity_proxy_sqlite;
 pub mod body_limit;
 pub mod capabilities;
 mod classify;

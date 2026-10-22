@@ -4,6 +4,89 @@ The compatibility target is frozen at CLIProxyAPI v8.0.35, commit `ae3ee3be303fb
 
 ## Additions in cliproxy-rs
 
+- Private gcl2api-plus migration branch: Antigravity 403 messages explicitly
+  indicating model denial use a model-only 300-second cooldown; account
+  verification challenges (`VALIDATION_REQUIRED`, `validation_url`, or
+  `verify your account`) use a model-only 600-second cooldown. Go's generic
+  403 cooldown is 1800 seconds. All other categories currently retain the
+  Go fallback; account health probes, proxy rebinding, and persistent account
+  disablement from gcl2api-plus are **not** ported yet. The classifier is
+  intentionally conservative for unknown 403 responses. See
+  [GCL2API porting checkpoint](GCL2API_PORTING.md).
+- Private migration account-health probe (not wired to request routing): unlike the
+  Python gcl2api-plus helper, a drifted IP is stored as `observed_egress_ip`
+  while `egress_ip` remains the last accepted binding. Repeated probes cannot
+  clear `proxy_drift` without a separate explicit rebind/eligibility step.
+  An Antigravity credential `proxy_url` edit now atomically clears the prior bound
+  IP, observed IP and cached eligibility to `unchecked` within the same file
+  write; the next explicit health check must re-establish identity. Unchanged
+  proxy edits keep the current binding. Python has a similar reset on network
+  configuration updates; upstream Go has no gcl2api account-health metadata.
+  Python proxy-group cooldown/reselection is not yet implemented in Rust.
+  Network probe results also carry the credential revision captured before
+  HTTP I/O. When a concurrent credential/proxy edit changes that revision,
+  the stale probe result is rejected rather than overwriting the newer
+  binding. The Python SQLite account-health flow has no equivalent CAS gate.
+  The optional Rust eligibility probe runs `loadCodeAssist` only after a
+  stable account-bound IP echo. It stores only a generic HTTP status reason,
+  not the upstream response body (which Python stores up to 1000 characters).
+  The opt-in Rust eligibility probe now calls `fetchUserInfo` and
+  `listExperiments` with a validated project ID, as Python does; both are
+  best effort and bounded. The helper is still not connected to an
+  automatic request-time scheduler or Python proxy-group management.
+  The explicit Rust probe also checks that the supplied access token matches
+  the selected credential before any network I/O, preventing a token for one
+  account from being sent through another account's effective proxy.
+  A new opt-in explicit drift acceptance helper re-probes the approved observed
+  IP and only accepts the new binding after a successful credential-backed
+  eligibility check and atomic credential-revision match; the Python group
+  rebinder instead releases the old proxy node, cools it and chooses another.
+  No automatic proxy group selection is asserted by the Rust helper.
+  The `antigravity_proxy_group` helper now models Python's node strategies and
+  failed-node cooldown as pure functions. It does not yet persist the group
+  cursor, node cooldown or account-to-node binding in one SQLite transaction,
+  nor does it take effect on production request routing.
+  The Rust-only opt-in `antigravity_proxy_sqlite` companion database does
+  atomically persist group cursor, node cooldown, account-node binding and
+  a reset of its own cached health using SQLite immediate transactions. It
+  deliberately uses separate `rust_ag_*` tables and refuses unrelated DBs:
+  it is not compatible with Python's live SQLite database, and it does not
+  commit the corresponding Rust auth-dir credential JSON in the same SQL
+  transaction. Actual group routing and management APIs remain unwired.
+  Explicit failed-node rebinding takes the original node ID and refuses to
+  cool a later replacement after a binding change. An automatic dispatcher
+  must additionally carry a binding generation to protect same-node ABA;
+  this helper remains isolated from live request routing.
+  The isolated SQLite companion v2 now persists that generation, increments
+  it on binding changes and rejects old failures even when the node ID is
+  reused. Existing v1 companion files migrate under BEGIN IMMEDIATE.
+  Live auth JSON and production routing are still not integrated.
+  The opt-in Rust-only proxy bridge instead reads a companion SQLite binding
+  and overlays its URL on an ephemeral credential clone. It never writes the
+  OAuth JSON, preventing two conflicting persistent proxy authorities.
+  Selection stays explicit; absent/disabled/cooling/mismatched bindings are
+  rejected rather than silently sent without the group proxy. This is not
+  yet a live routing feature or Python schema compatibility.
+  A new pre-admission lease check rejects changes to the Rust credential
+  revision or SQLite node/generation/URL since the proxy view was formed.
+  It is read-only and cannot claim atomicity across JSON and SQLite.
+  The optional CLI version candidate probe checks bounded manifest JSON and
+  2xx model-fetch evidence using explicit dummy or supplied accounts. It does
+  not yet implement Python's global adopted-version persistence, periodic
+  validated adoption or automatic User-Agent switching.
+  An optional isolated SQLite version store can now retain only evidence-backed
+  adopted versions and safely reopen after restart; it does not use Python's
+  config storage or change the running User-Agent. The scheduled validator
+  and user-visible management controls remain unwired.
+  For Antigravity credentials explicitly configured with `proxy_mode=group`,
+  the executor and background probes deliberately reject missing or invalid
+  request-scoped group bindings instead of using GoClients' Go-compatible
+  default transport. Only a supported `proxy_url` in the ephemeral
+  credential attributes may select a group proxy; failure to build that client
+  also fails closed. Ordinary non-group/Go-compatible proxy fallback remains
+  unchanged. This guard does not activate live group selection by itself.
+  This metadata is opt-in and is not part of the Go credential format.
+
 - Routing strategy `soonest-reset` (alias `reset-first`), experimental and opt-in: select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).
 - Codex connection reuse, opt-in: `oauth.providers.codex.chatgpt-keep-alive: true` makes the Codex client for `chatgpt.com` (the Chrome TLS fingerprint) keep up to 2 idle connections per host and proxy for 90 seconds and send later requests on them, several at once over HTTP/2. The ClientHello, the request headers and the proxy are the same, and connections never cross proxies. Off, the default, it does what Go does: a dedicated connection per request, closed with the response body (`helps/utls_client.go`). The setting applies from the next request after a config reload. Go starts with the key in the file and ignores it. A config edit through Go's v8 Management API moves the key into a comment, so the setting is off again when you return to cliproxy-rs; edits through Go's v0 endpoints keep it. Setting the key through Go's v8 API is refused, as for any key Go does not know.
 

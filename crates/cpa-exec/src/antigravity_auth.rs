@@ -707,7 +707,32 @@ pub(crate) async fn prepare(
     credential: &Credential,
     cfg: &Config,
 ) -> Result<MetadataPatch, ExecError> {
-    let oauth = OAuth::new(clients.get(&Proxy::effective(credential, cfg)));
+    let proxy = Proxy::effective(credential, cfg);
+    let client = if credential.str("proxy_mode") == Some("group") {
+        // Standalone auth preparation may run outside the executor's
+        // preflight. Do not allow an absent group binding to select a global
+        // proxy, or an invalid bound proxy to fall back to direct.
+        if !matches!(
+            credential.attributes.get("proxy_url").map(|url| Proxy::parse(url)),
+            Some(Proxy::Url(_))
+        ) {
+            return Err(ExecError::local(
+                503,
+                FailureScope::Credential,
+                "Antigravity group proxy binding unavailable",
+            ));
+        }
+        clients.try_get(&proxy).ok_or_else(|| {
+            ExecError::local(
+                503,
+                FailureScope::Credential,
+                "Antigravity group proxy transport unavailable",
+            )
+        })?
+    } else {
+        clients.get(&proxy)
+    };
+    let oauth = OAuth::new(client);
     let now = Utc::now();
     let mut patch = MetadataPatch::default();
     let mut access = meta_string(credential, "access_token").to_owned();

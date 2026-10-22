@@ -16,6 +16,83 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use super::*;
 use crate::gemini::tests::{Captured, Captures, Mock, UsageReports, check_attempt, client_bytes};
 
+/// Group mode is a deliberate extension to Go's normal proxy semantics:
+/// missing/invalid companion bindings may never use a direct/default client.
+#[tokio::test]
+async fn group_proxy_fail_closed_for_prepare_generate_stream_and_count() {
+    let cfg = Config::parse("requests:\n  proxy-url: http://global.invalid:9999\n").unwrap();
+    let executor = AntigravityExecutor::default();
+    let metadata = serde_json::json!({
+        "type": "antigravity",
+        "proxy_mode": "group",
+        "proxy_group_id": 9,
+        "access_token": "dummy-access",
+        "refresh_token": "dummy-refresh",
+        "proxy_url": "http://metadata-proxy.invalid:8080"
+    });
+    let mut group = Credential::from_file(
+        std::path::Path::new("/mock"),
+        std::path::Path::new("/mock/group.json"),
+        metadata.as_object().unwrap().clone(),
+    )
+    .unwrap();
+    let assert_rejected = |result: Result<wreq::Client, ExecError>| {
+        let error = result.err().expect("group without bound proxy must fail closed");
+        assert_eq!(error.status, 503);
+        assert_eq!(error.scope, FailureScope::Credential);
+    };
+    assert_rejected(executor.client(&group, &cfg));
+    assert_eq!(
+        executor
+            .prepare(&group, &cfg)
+            .await
+            .err()
+            .expect("prepare must reject group")
+            .status,
+        503
+    );
+    let source = &scenarios()[0];
+    for operation in [Operation::Generate, Operation::CountTokens] {
+        let mut req = request(source);
+        req.operation = operation;
+        assert_eq!(
+            executor
+                .execute(&group, req, &cfg)
+                .await
+                .err()
+                .expect("execute must reject group")
+                .status,
+            503
+        );
+    }
+    let mut req = request(source);
+    req.stream = true;
+    assert_eq!(
+        executor
+            .execute(&group, req, &cfg)
+            .await
+            .err()
+            .expect("stream must reject group")
+            .status,
+        503
+    );
+
+    for invalid in ["direct", "none", "ftp://proxy.invalid", ""] {
+        group.attributes.insert("proxy_url".into(), invalid.into());
+        assert_rejected(executor.client(&group, &cfg));
+    }
+    // A bridge-owned, ephemeral URL is accepted, without making any request.
+    group
+        .attributes
+        .insert("proxy_url".into(), "http://127.0.0.1:23123".into());
+    assert!(executor.client(&group, &cfg).is_ok());
+    assert!(executor.grounding_client(&group, &cfg).is_some());
+    // Non-group credentials retain the Go-compatible default transport.
+    group.metadata.remove("proxy_mode");
+    group.attributes.remove("proxy_url");
+    assert!(executor.client(&group, &cfg).is_ok());
+}
+
 fn fixture() -> &'static Value {
     static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| serde_json::from_str(include_str!("../tests/fixtures/antigravity_go.json")).unwrap())
@@ -591,6 +668,57 @@ async fn web_search_grounding_matches_go() {
         assert_eq!(names, ["host", "user-agent"], "{raw}");
         assert!(raw.contains("User-Agent: Go-http-client/1.1\r\n"), "{raw}");
     }
+}
+
+#[tokio::test]
+async fn oversized_background_credits_body_keeps_quota_unknown() {
+    use axum::extract::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&lookups);
+    let huge = "x".repeat(MAX_CREDITS_RESPONSE_BYTES + 8192);
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let large = huge.clone();
+        let seen = Arc::clone(&seen);
+        async move {
+            if req.uri().path().ends_with(":loadCodeAssist") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                large
+            } else {
+                r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}"#.to_owned()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut scenario = scenario("gemini_execute_basic").clone();
+    scenario["auth_id"] = Value::String("ag-credits-oversize".into());
+    scenario["attributes"] = serde_json::json!({"base_url":base});
+    let cfg = Config::parse("quota-exceeded:\n  antigravity-credits: true\n").unwrap();
+    let credential = credential(&scenario, "");
+    assert!(credits::hint(&credential.id).is_none());
+    let executor = AntigravityExecutor::default();
+    executor.execute(&credential, request(&scenario), &cfg).await.unwrap();
+    for _ in 0..300 {
+        if lookups.load(Ordering::SeqCst) > 0 && !credits::refreshing(&credential.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "large background response must be exercised"
+    );
+    assert!(
+        !credits::refreshing(&credential.id),
+        "background lookup must release its gate"
+    );
+    assert!(
+        credits::hint(&credential.id).is_none(),
+        "oversized/truncated response must not mark the account as out of credits"
+    );
 }
 
 /// Go `maybeRefreshAntigravityCreditsHint` / `updateAntigravityCreditsBalanceForTask`
