@@ -17,6 +17,7 @@ pub enum Category {
 }
 
 impl Category {
+    #[cfg(test)]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProxyDrift => "proxy_drift",

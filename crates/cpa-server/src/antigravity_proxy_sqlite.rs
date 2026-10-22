@@ -266,6 +266,10 @@ impl ProxyGroupDb {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal transactional compare-and-swap inputs"
+    )]
     fn invalidate_inner(
         &self,
         name: &str,

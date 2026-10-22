@@ -140,7 +140,7 @@ pub struct EgressObservation {
 pub fn observe_egress(previous_ip: Option<&str>, ip: IpAddr, country: Option<String>) -> EgressObservation {
     let changed = previous_ip
         .filter(|s| !s.is_empty())
-        .is_some_and(|previous| previous.parse::<IpAddr>().map_or(true, |saved| saved != ip));
+        .is_some_and(|previous| previous.parse::<IpAddr>() != Ok(ip));
     EgressObservation {
         ip,
         country,
@@ -488,10 +488,10 @@ pub async fn fetch_eligibility(
     let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     let text = String::from_utf8_lossy(&body);
     let eligibility_status = eligibility_from_response(status, &payload, &text);
-    if status == 200 {
-        if let Some(project_id) = warmup_project_id(&payload) {
-            warmup_antigravity_environment(&client, api_base_url, project_id, access_token, user_agent).await;
-        }
+    if status == 200
+        && let Some(project_id) = warmup_project_id(&payload)
+    {
+        warmup_antigravity_environment(&client, api_base_url, project_id, access_token, user_agent).await;
     }
     Ok(EligibilityObservation {
         http_status: status,
@@ -504,6 +504,7 @@ pub async fn fetch_eligibility(
 /// echo and eligibility POST. A changed IP skips the POST entirely, and every
 /// result is persisted with the pre-network revision to reject stale probes.
 /// This is not yet scheduled automatically on the request path.
+#[expect(clippy::too_many_arguments, reason = "existing external account-health API")]
 pub async fn check_account_health_and_persist(
     store: Arc<CredentialStore>,
     clients: &GoClients,
@@ -570,6 +571,7 @@ pub async fn check_account_health_and_persist(
 /// through this credential's effective proxy and a successful eligibility
 /// probe. This does not select another proxy node or run automatically.
 /// The caller must explicitly authorize the exact observed IP.
+#[expect(clippy::too_many_arguments, reason = "existing external egress rebind API")]
 pub async fn confirm_egress_rebind_and_persist(
     store: Arc<CredentialStore>,
     clients: &GoClients,

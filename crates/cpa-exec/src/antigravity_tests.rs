@@ -46,8 +46,7 @@ async fn group_proxy_fail_closed_for_prepare_generate_stream_and_count() {
         executor
             .prepare(&group, &cfg)
             .await
-            .err()
-            .expect("prepare must reject group")
+            .expect_err("prepare must reject group")
             .status,
         503
     );
