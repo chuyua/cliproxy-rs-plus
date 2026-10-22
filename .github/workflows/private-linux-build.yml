@@ -5,6 +5,7 @@ on:
     branches:
       - feature/gcl2api-antigravity-403-20261019
       - 'sync/**'
+      - 'integration/**'
   workflow_dispatch:
 
 permissions:
