@@ -761,13 +761,14 @@ async fn read_text(socket: &mut wreq::ws::WebSocket) -> String {
 /// Turns that are not interrupted keep master's upstream bytes, here on the Claude
 /// executor: a first turn and a continuation the handler merges into a full transcript.
 /// The pinned bodies were recorded on master before the downstream reader handled
-/// `response.interrupt` and before `response.incomplete` ended a turn.
+/// `response.interrupt` and before `response.incomplete` ended a turn; `max_tokens` is
+/// the model's registered output limit since a881c036 and 0d18d3b3 (#75).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uninterrupted_claude_turns_send_masters_bytes() {
     use futures_util::StreamExt;
     use wreq::ws::message::Message as WsMessage;
-    const FIRST: &str = r#"{"model":"claude-opus-5-5","max_tokens":32000,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"metadata":{"user_id":"2b35ba29f7cec38e9220a584fafaa8f9eb2a8d01350e9d1c3653ae728471c5bb"},"stream":true,"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}]}"#;
-    const SECOND: &str = r#"{"model":"claude-opus-5-5","max_tokens":32000,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":[{"type":"text","text":"again","cache_control":{"type":"ephemeral"}}]}],"metadata":{"user_id":"2b35ba29f7cec38e9220a584fafaa8f9eb2a8d01350e9d1c3653ae728471c5bb"},"stream":true,"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}]}"#;
+    const FIRST: &str = r#"{"model":"claude-opus-5-5","max_tokens":128000,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"metadata":{"user_id":"2b35ba29f7cec38e9220a584fafaa8f9eb2a8d01350e9d1c3653ae728471c5bb"},"stream":true,"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}]}"#;
+    const SECOND: &str = r#"{"model":"claude-opus-5-5","max_tokens":128000,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":[{"type":"text","text":"again","cache_control":{"type":"ephemeral"}}]}],"metadata":{"user_id":"2b35ba29f7cec38e9220a584fafaa8f9eb2a8d01350e9d1c3653ae728471c5bb"},"stream":true,"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}]}"#;
     let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let upstream = {
         let seen = seen.clone();

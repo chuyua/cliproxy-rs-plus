@@ -37,7 +37,10 @@ pub(crate) fn request(
 
 /// Go `originalTranslated` from `TranslateRequestPairWithAPIKeyModelCompatibility`: the
 /// client's original payload translated like the working one (`translated`), which
-/// payload rules read for `original` conditions.
+/// payload rules read for `original` conditions. Without the `max_tokens` the
+/// translator synthesized for a client that sent no limit
+/// (`stripTranslatedDefaultMaxTokens`, 0d18d3b3), so a `payload.default` rule for
+/// `max_tokens` still applies.
 pub(crate) fn original(
     req: &ExecRequest,
     translated: &Bytes,
@@ -47,10 +50,38 @@ pub(crate) fn original(
 ) -> Result<Bytes, ExecError> {
     // Go reuses the translation when both payloads are the same slice; equal bytes
     // translate identically.
-    if req.original_body.is_empty() || req.original_body == req.body {
-        return Ok(translated.clone());
+    let (payload, original) = if req.original_body.is_empty() || req.original_body == req.body {
+        (&req.body, translated.clone())
+    } else {
+        // Only the working payload is sent, so a baseline refusal alone is ignored
+        // (TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent).
+        // ponytail: Go keeps the refused baseline's partial translation; the working
+        // translation stands in. Payload rules read the baseline for `original`
+        // conditions and to gate `default`/`default-raw` on field existence, so a field
+        // only the working body sets (such as `max_tokens`) suppresses a default Go would
+        // apply. No server path sends distinct bodies that refuse only the baseline today.
+        // Return the partial body with translator errors if one does.
+        match translate_body(req, &req.original_body, codex, model, is_compat) {
+            Ok(original) => (&req.original_body, original),
+            Err(_) => (&req.body, translated.clone()),
+        }
+    };
+    let limits: &[&str] = match req.source_format {
+        Format::OpenAI => &["max_tokens", "max_completion_tokens"],
+        Format::OpenAIResponse => &["max_output_tokens"],
+        Format::Gemini => &["generationConfig.maxOutputTokens"],
+        _ => return Ok(original),
+    };
+    let payload = String::from_utf8_lossy(payload);
+    if original.is_empty()
+        || limits.iter().any(|path| {
+            let limit = gjson::get(&payload, path);
+            limit.exists() && limit.kind() != gjson::Kind::Null
+        })
+    {
+        return Ok(original);
     }
-    translate_body(req, &req.original_body, codex, model, is_compat)
+    Ok(cpa_common::json::delete_changed(&original, "max_tokens").map_or(original, Bytes::from))
 }
 
 fn translate_body(
@@ -600,6 +631,21 @@ mod tests {
         assert_eq!(error.status, 502);
         assert_eq!(error.scope, FailureScope::Credential);
         assert_eq!(failures.count(), 1);
+    }
+
+    #[test]
+    fn a_refused_baseline_alone_does_not_refuse_the_request() {
+        let mut req = req(false, Operation::Generate);
+        req.original_body = Bytes::from_static(
+            br#"{"model":"m","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-absent"}}]}]}"#,
+        );
+        req.body = Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#);
+        let codex = Default::default();
+        let translated = request(&req, codex, "m", false).unwrap();
+        assert_eq!(original(&req, &translated, codex, "m", false).unwrap(), translated);
+        // The working payload's refusal still counts.
+        std::mem::swap(&mut req.body, &mut req.original_body);
+        assert!(request(&req, codex, "m", false).is_err());
     }
 
     #[test]

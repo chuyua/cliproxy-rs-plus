@@ -463,7 +463,10 @@ impl State {
                 || self.thinking_started
                 || self.content_len > 0
                 || !self.interleaved.is_empty());
-        if !self.delta_sent && (!self.finish_reason.is_empty() || trailing_usage) && has_usage {
+        // A finish_reason with preliminary usage does not end the message: authoritative
+        // counts (such as cached tokens) can arrive in the trailing usage-only chunk,
+        // and [DONE] ends it otherwise.
+        if !self.delta_sent && trailing_usage {
             self.finalize_blocks(out);
             self.message_delta(out);
             self.message_stop(out);

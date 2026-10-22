@@ -89,7 +89,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "5398f78f-f7c0-4504-a4f2-32995281ce0c"
+          "f6cfd99f-f704-4a4f-8af1-ebdcd5a02336"
          ]
         },
         "host": "api.anthropic.com",
@@ -235,7 +235,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "12eadf17-889e-4b99-86a9-a619058ca121"
+          "60f8a601-5478-4dd7-943e-7b6dfec56927"
          ]
         },
         "host": "api.anthropic.com",
@@ -386,7 +386,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "c6534163-4ba6-4cf9-826d-5e012c6a5ab4"
+          "24dd4c60-2ec3-450a-8009-755498a2c848"
          ]
         },
         "host": "api.anthropic.com",
@@ -531,7 +531,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "22d9db25-fd3d-4126-8f2e-523b7e08077b"
+          "5fbe5720-60d4-4eaf-8a0f-07ec2a931a7e"
          ]
         },
         "host": "api.anthropic.com",
@@ -615,12 +615,12 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-opus-5-5\",\"max_tokens\":64,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.411; cc_entrypoint=cli; cch=bb1ed; cc_prompt_id=d657d3c5-97aa-4297-be7c-b726d0b9fc5b; cc_turn_origin=human;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}],\"output_config\":{\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"updates\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<conversation-checkpoint>Earlier we said hello.</conversation-checkpoint>\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Reply with just: ok\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"caller guidance\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]}],\"fallbacks\":[{\"model\":\"claude-opus-4-8\"}],\"context_management\":{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]},\"diagnostics\":{\"previous_message_id\":null},\"stream\":false,\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0000000000000000000000000000000000000000000000000000000000000001\\\",\\\"account_uuid\\\":\\\"11111111-2222-4333-8444-555555555555\\\",\\\"session_id\\\":\\\"403550a7-cb04-5b76-bff0-a180c2bdf585\\\"}\"}}",
+        "body": "{\"model\":\"claude-opus-5-5\",\"max_tokens\":64,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.411; cc_entrypoint=cli; cch=a5154; cc_prompt_id=d657d3c5-97aa-4297-be7c-b726d0b9fc5b; cc_turn_origin=human;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}],\"output_config\":{\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"updates\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<conversation-checkpoint>Earlier we said hello.</conversation-checkpoint>\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Reply with just: ok\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"caller guidance\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]}],\"fallbacks\":[{\"model\":\"claude-opus-4-8\"}],\"context_management\":{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]},\"diagnostics\":{\"previous_message_id\":null},\"stream\":false,\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0000000000000000000000000000000000000000000000000000000000000001\\\",\\\"account_uuid\\\":\\\"11111111-2222-4333-8444-555555555555\\\",\\\"session_id\\\":\\\"403550a7-cb04-5b76-bff0-a180c2bdf585\\\"}\"}}",
         "headers": {
          "Accept": [
           "application/json"
@@ -680,7 +680,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "344d2c21-4cd5-4104-a81b-ef17f4b8c3a1"
+          "fac1feff-d5c0-485c-95ed-7b5eca32b384"
          ]
         },
         "host": "api.anthropic.com",
@@ -754,7 +754,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": [
        {
@@ -764,7 +764,7 @@
       ],
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-opus-5-5\",\"max_tokens\":64,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.411; cc_entrypoint=cli; cch=16ade; cc_prompt_id=d657d3c5-97aa-4297-be7c-b726d0b9fc5b; cc_turn_origin=human;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}],\"output_config\":{\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"updates\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<conversation-checkpoint>Earlier we said hello.</conversation-checkpoint>\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Reply with just: ok\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"caller guidance\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]}],\"fallbacks\":[{\"model\":\"claude-opus-4-8\"}],\"context_management\":{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]},\"diagnostics\":{\"previous_message_id\":null},\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0000000000000000000000000000000000000000000000000000000000000001\\\",\\\"account_uuid\\\":\\\"11111111-2222-4333-8444-555555555555\\\",\\\"session_id\\\":\\\"403550a7-cb04-5b76-bff0-a180c2bdf585\\\"}\"}}",
+        "body": "{\"model\":\"claude-opus-5-5\",\"max_tokens\":64,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.411; cc_entrypoint=cli; cch=e13e0; cc_prompt_id=d657d3c5-97aa-4297-be7c-b726d0b9fc5b; cc_turn_origin=human;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}],\"output_config\":{\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"updates\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<conversation-checkpoint>Earlier we said hello.</conversation-checkpoint>\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Reply with just: ok\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"caller guidance\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]}],\"fallbacks\":[{\"model\":\"claude-opus-4-8\"}],\"context_management\":{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]},\"diagnostics\":{\"previous_message_id\":null},\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0000000000000000000000000000000000000000000000000000000000000001\\\",\\\"account_uuid\\\":\\\"11111111-2222-4333-8444-555555555555\\\",\\\"session_id\\\":\\\"403550a7-cb04-5b76-bff0-a180c2bdf585\\\"}\"}}",
         "headers": {
          "Accept": [
           "application/json"
@@ -824,7 +824,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "7d901d38-9f94-43f5-baac-b7300edacbb7"
+          "2b3eedd6-6261-4f66-9613-a8d4a7b71f2f"
          ]
         },
         "host": "api.anthropic.com",
@@ -897,7 +897,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -959,7 +959,7 @@
           "cli"
          ],
          "x-client-request-id": [
-          "ea017cf4-40bb-4792-a643-b9455a1b1ac9"
+          "4245969f-4c37-4601-a518-87b9d31486a8"
          ]
         },
         "host": "api.anthropic.com",
@@ -1020,7 +1020,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-spoofed-client",
-       "base_url": "http://127.0.0.1:41501",
+       "base_url": "http://127.0.0.1:43711",
        "cloak_mode": "always"
       },
       "disabled": false,
@@ -1033,12 +1033,12 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-opus-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"spoofed-system\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"x\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"8f094e5e96dfda08f1c22caf3e9d9a4bb6b0f6a6a0fb9c2d17289a4fdf52fa81\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"5c620d35-ef03-456b-86b2-c02ed93e8a96\\\"}\"},\"stream\":false}",
+        "body": "{\"model\":\"claude-opus-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"spoofed-system\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"x\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"fba80a2a2b8ff7a5ce57808967cddf918e9d06109bf8e06489c4aac778cb499f\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"d8b244d1-cae0-4428-9e8d-6e196234092f\\\"}\"},\"stream\":false}",
         "headers": {
          "Accept": [
           "application/json"
@@ -1071,7 +1071,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "5c620d35-ef03-456b-86b2-c02ed93e8a96"
+          "d8b244d1-cae0-4428-9e8d-6e196234092f"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -1098,7 +1098,7 @@
           "600"
          ]
         },
-        "host": "127.0.0.1:41501",
+        "host": "127.0.0.1:43711",
         "method": "POST",
         "response_body": "{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-6\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
         "response_headers": {
@@ -1109,11 +1109,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:41501/v1/messages?beta=true"
+        "url": "http://127.0.0.1:43711/v1/messages?beta=true"
        }
       ]
      },
@@ -1159,7 +1159,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-6\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
@@ -1174,7 +1174,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:39477"
+       "base_url": "http://127.0.0.1:40451"
       },
       "disabled": false,
       "id": "",
@@ -1186,7 +1186,7 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -1224,7 +1224,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -1248,7 +1248,7 @@
           "v26.3.0"
          ]
         },
-        "host": "127.0.0.1:39477",
+        "host": "127.0.0.1:40451",
         "method": "POST",
         "response_body": "{\"input_tokens\": 20}",
         "response_headers": {
@@ -1259,11 +1259,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:39477/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:40451/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1299,7 +1299,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\": 20}"
@@ -1312,7 +1312,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:35077"
+       "base_url": "http://127.0.0.1:37741"
       },
       "disabled": false,
       "id": "",
@@ -1324,12 +1324,12 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-3-5-haiku-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nCount tokens legacy system instructions\\n</system-reminder>\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}},{\"type\":\"text\",\"text\":\"User prompt\"}]}],\"metadata\":{\"user_id\":\"c1b0b422fc95d62deaf1d8f54a36b667bddfd4c99330739ab1ebbec654bb3bc9\"},\"stream\":true}",
+        "body": "{\"model\":\"claude-3-5-haiku-20241022\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nCount tokens legacy system instructions\\n</system-reminder>\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}},{\"type\":\"text\",\"text\":\"User prompt\"}]}],\"metadata\":{\"user_id\":\"c1b0b422fc95d62deaf1d8f54a36b667bddfd4c99330739ab1ebbec654bb3bc9\"},\"stream\":true}",
         "headers": {
          "Accept": [
           "application/json"
@@ -1362,7 +1362,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -1386,7 +1386,7 @@
           "v26.3.0"
          ]
         },
-        "host": "127.0.0.1:35077",
+        "host": "127.0.0.1:37741",
         "method": "POST",
         "response_body": "{\"input_tokens\": 20}",
         "response_headers": {
@@ -1397,11 +1397,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:35077/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:37741/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1437,7 +1437,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\": 20}"
@@ -1450,7 +1450,7 @@
      "auth": {
       "attributes": {
        "api_key": "sk-ant-oat-count-tokens",
-       "base_url": "http://127.0.0.1:40169"
+       "base_url": "http://127.0.0.1:37353"
       },
       "disabled": false,
       "id": "",
@@ -1467,7 +1467,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -1529,7 +1529,7 @@
           "v26.3.0"
          ]
         },
-        "host": "127.0.0.1:40169",
+        "host": "127.0.0.1:37353",
         "method": "POST",
         "response_body": "{\"input_tokens\":20}",
         "response_headers": {
@@ -1540,11 +1540,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:40169/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:37353/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1580,7 +1580,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\":20}"
@@ -1591,7 +1591,7 @@
      "auth": {
       "attributes": {
        "api_key": "sk-ant-oat-count-tokens",
-       "base_url": "http://127.0.0.1:39593"
+       "base_url": "http://127.0.0.1:32933"
       },
       "disabled": false,
       "id": "",
@@ -1608,7 +1608,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -1670,7 +1670,7 @@
           "v26.3.0"
          ]
         },
-        "host": "127.0.0.1:39593",
+        "host": "127.0.0.1:32933",
         "method": "POST",
         "response_body": "{\"input_tokens\":20}",
         "response_headers": {
@@ -1681,11 +1681,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:39593/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:32933/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1721,7 +1721,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\":20}"
@@ -1732,7 +1732,7 @@
      "auth": {
       "attributes": {
        "api_key": "sk-ant-oat-count-tokens",
-       "base_url": "http://127.0.0.1:44835"
+       "base_url": "http://127.0.0.1:43019"
       },
       "disabled": false,
       "id": "",
@@ -1749,7 +1749,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -1811,7 +1811,7 @@
           "v26.3.0"
          ]
         },
-        "host": "127.0.0.1:44835",
+        "host": "127.0.0.1:43019",
         "method": "POST",
         "response_body": "{\"input_tokens\":20}",
         "response_headers": {
@@ -1822,11 +1822,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:44835/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:43019/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1862,7 +1862,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\":20}"
@@ -1875,7 +1875,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:38723"
+       "base_url": "http://127.0.0.1:33249"
       },
       "disabled": false,
       "id": "",
@@ -1887,7 +1887,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\npayload:\n    override:\n        - models:\n            - name: claude-3-5-sonnet-20241022\n          params:\n            prompt_cache_options.mode: explicit\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -1916,7 +1916,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:38723",
+        "host": "127.0.0.1:33249",
         "method": "POST",
         "response_body": "{\"input_tokens\": 15}",
         "response_headers": {
@@ -1927,11 +1927,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:38723/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:33249/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -1967,7 +1967,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\": 15}"
@@ -1980,7 +1980,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:35267"
+       "base_url": "http://127.0.0.1:39533"
       },
       "disabled": false,
       "id": "",
@@ -1992,7 +1992,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": null
@@ -2030,7 +2030,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:35267"
+       "base_url": "http://127.0.0.1:39533"
       },
       "disabled": false,
       "id": "",
@@ -2042,7 +2042,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -2071,7 +2071,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:35267",
+        "host": "127.0.0.1:39533",
         "method": "POST",
         "response_body": "{\"input_tokens\": 15}",
         "response_headers": {
@@ -2082,11 +2082,11 @@
           "application/json"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:35267/v1/messages/count_tokens?beta=true"
+        "url": "http://127.0.0.1:39533/v1/messages/count_tokens?beta=true"
        }
       ]
      },
@@ -2122,7 +2122,7 @@
         "application/json"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
       "payload": "{\"input_tokens\": 15}"
@@ -2135,7 +2135,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:32957"
+       "base_url": "http://127.0.0.1:44573"
       },
       "disabled": false,
       "id": "",
@@ -2147,7 +2147,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -2173,7 +2173,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:32957",
+        "host": "127.0.0.1:44573",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2184,11 +2184,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:32957/v1/messages?beta=true"
+        "url": "http://127.0.0.1:44573/v1/messages?beta=true"
        }
       ]
      },
@@ -2224,10 +2224,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2237,7 +2237,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:35927"
+       "base_url": "http://127.0.0.1:39875"
       },
       "disabled": false,
       "id": "",
@@ -2249,12 +2249,12 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-3-5-haiku-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<system-reminder>\\nLegacy system instructions with scope\\n</system-reminder>\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}},{\"type\":\"text\",\"text\":\"User prompt\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"ae25d4b5a4bfef048f798288ab806271cd1b32d6ff1da98db980bb925bbf6579\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"d93a4324-59fd-4d4d-bbc3-8434b0d0c744\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.d7d; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
+        "body": "{\"model\":\"claude-3-5-haiku-20241022\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"<system-reminder>\\nLegacy system instructions with scope\\n</system-reminder>\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}},{\"type\":\"text\",\"text\":\"User prompt\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"c16c6ffe3426b69e1b7c883096828eb46e676c772ccf041bb2cbe127ecf315ec\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"91e8f5c6-74d0-4662-966e-9eb07fad7431\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.d7d; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
         "headers": {
          "Accept": [
           "text/event-stream"
@@ -2287,7 +2287,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -2314,7 +2314,7 @@
           "600"
          ]
         },
-        "host": "127.0.0.1:35927",
+        "host": "127.0.0.1:39875",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2325,11 +2325,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:35927/v1/messages?beta=true"
+        "url": "http://127.0.0.1:39875/v1/messages?beta=true"
        }
       ]
      },
@@ -2365,10 +2365,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2378,7 +2378,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:34783"
+       "base_url": "http://127.0.0.1:43955"
       },
       "disabled": false,
       "id": "",
@@ -2390,12 +2390,12 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"First turn\"}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"You are a helpful assistant.\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Understood.\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Specific cached user query\",\"cache_control\":{\"type\": \"ephemeral\"}}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"8677aa5c90f6cc7e317ada7cec08330e2604e7e1f6fdcffe6c82d8fd83f724cb\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"d93a4324-59fd-4d4d-bbc3-8434b0d0c744\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.3c7; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
+        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"First turn\"}]},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"You are a helpful assistant.\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Understood.\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Specific cached user query\",\"cache_control\":{\"type\": \"ephemeral\"}}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"1b00508a016e2c65d23aec1259399209578f5be74f65a28028e29683ae8978b0\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"91e8f5c6-74d0-4662-966e-9eb07fad7431\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.3c7; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
         "headers": {
          "Accept": [
           "text/event-stream"
@@ -2428,7 +2428,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -2455,7 +2455,7 @@
           "600"
          ]
         },
-        "host": "127.0.0.1:34783",
+        "host": "127.0.0.1:43955",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2466,11 +2466,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:34783/v1/messages?beta=true"
+        "url": "http://127.0.0.1:43955/v1/messages?beta=true"
        }
       ]
      },
@@ -2506,10 +2506,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2519,7 +2519,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:46213"
+       "base_url": "http://127.0.0.1:35975"
       },
       "disabled": false,
       "id": "",
@@ -2531,12 +2531,12 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"Regular user query\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"dfe89178ebe2c6f588092cfb25529cf3358fb6c80325acdfdf5ac4101d235667\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"d93a4324-59fd-4d4d-bbc3-8434b0d0c744\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.fe6; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"Special client system prompt with breakpoint\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}}]}",
+        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"Regular user query\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"b91543ea13b6f86fd3b2d8c4c868751b40566aecc3f11d11079a5e44e83d1738\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"91e8f5c6-74d0-4662-966e-9eb07fad7431\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.fe6; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"Special client system prompt with breakpoint\",\"cache_control\":{\"type\": \"ephemeral\", \"scope\": \"global\"}}]}",
         "headers": {
          "Accept": [
           "text/event-stream"
@@ -2569,7 +2569,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -2596,7 +2596,7 @@
           "600"
          ]
         },
-        "host": "127.0.0.1:46213",
+        "host": "127.0.0.1:35975",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2607,11 +2607,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:46213/v1/messages?beta=true"
+        "url": "http://127.0.0.1:35975/v1/messages?beta=true"
        }
       ]
      },
@@ -2647,10 +2647,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2660,7 +2660,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:37013"
+       "base_url": "http://127.0.0.1:44633"
       },
       "disabled": false,
       "id": "",
@@ -2672,12 +2672,12 @@
      },
      "caller": "",
      "config": "claude-api-key:\n    - api-key: key-123\n      cloak:\n        mode: always\ncredential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
        {
-        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-13.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"Hello in cloaked mode\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"5a4852c119cb9f51c2cfdb84c51573f2c7ee9d06ed27156987b4bdca1f3c4ac8\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"d93a4324-59fd-4d4d-bbc3-8434b0d0c744\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.305; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"You are a helpful assistant.\"}]}",
+        "body": "{\"model\":\"claude-3-5-sonnet-20241022\",\"max_tokens\":32000,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>\\nAs you answer the user's questions, you can use the following context:\\n# currentDate\\nToday's date is 2026-10-20.\\n\\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\\n</system-reminder>\\n\\n\"},{\"type\":\"text\",\"text\":\"Hello in cloaked mode\"}]}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"eb68d8ea3c84da77721208f9fbdb9e54355505bafae42b7e7a3afa114e4373fd\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"91e8f5c6-74d0-4662-966e-9eb07fad7431\\\"}\"},\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.305; cc_entrypoint=cli;\"},{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"You are a helpful assistant.\"}]}",
         "headers": {
          "Accept": [
           "text/event-stream"
@@ -2710,7 +2710,7 @@
           "cli"
          ],
          "X-Claude-Code-Session-Id": [
-          "d93a4324-59fd-4d4d-bbc3-8434b0d0c744"
+          "91e8f5c6-74d0-4662-966e-9eb07fad7431"
          ],
          "X-Stainless-Arch": [
           "arm64"
@@ -2737,7 +2737,7 @@
           "600"
          ]
         },
-        "host": "127.0.0.1:37013",
+        "host": "127.0.0.1:44633",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2748,11 +2748,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:37013/v1/messages?beta=true"
+        "url": "http://127.0.0.1:44633/v1/messages?beta=true"
        }
       ]
      },
@@ -2788,10 +2788,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2801,7 +2801,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:36215"
+       "base_url": "http://127.0.0.1:40499"
       },
       "disabled": false,
       "id": "",
@@ -2813,7 +2813,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -2839,7 +2839,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:36215",
+        "host": "127.0.0.1:40499",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2850,11 +2850,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:36215/v1/messages?beta=true"
+        "url": "http://127.0.0.1:40499/v1/messages?beta=true"
        }
       ]
      },
@@ -2890,10 +2890,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -2903,7 +2903,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:35139"
+       "base_url": "http://127.0.0.1:33209"
       },
       "disabled": false,
       "id": "",
@@ -2915,7 +2915,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -2944,7 +2944,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:35139",
+        "host": "127.0.0.1:33209",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -2955,11 +2955,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:35139/v1/messages?beta=true"
+        "url": "http://127.0.0.1:33209/v1/messages?beta=true"
        }
       ]
      },
@@ -2995,10 +2995,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -3008,7 +3008,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:44739"
+       "base_url": "http://127.0.0.1:40609"
       },
       "disabled": false,
       "id": "",
@@ -3020,7 +3020,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -3046,7 +3046,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:44739",
+        "host": "127.0.0.1:40609",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -3057,11 +3057,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:44739/v1/messages?beta=true"
+        "url": "http://127.0.0.1:40609/v1/messages?beta=true"
        }
       ]
      },
@@ -3097,10 +3097,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -3110,7 +3110,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:39475"
+       "base_url": "http://127.0.0.1:39523"
       },
       "disabled": false,
       "id": "",
@@ -3122,7 +3122,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -3148,7 +3148,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:39475",
+        "host": "127.0.0.1:39523",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -3159,11 +3159,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:39475/v1/messages?beta=true"
+        "url": "http://127.0.0.1:39523/v1/messages?beta=true"
        }
       ]
      },
@@ -3199,10 +3199,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -3212,7 +3212,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:38077"
+       "base_url": "http://127.0.0.1:41213"
       },
       "disabled": false,
       "id": "",
@@ -3224,7 +3224,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -3250,7 +3250,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:38077",
+        "host": "127.0.0.1:41213",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -3261,11 +3261,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:38077/v1/messages?beta=true"
+        "url": "http://127.0.0.1:41213/v1/messages?beta=true"
        }
       ]
      },
@@ -3301,10 +3301,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     },
@@ -3312,7 +3312,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:40067"
+       "base_url": "http://127.0.0.1:40357"
       },
       "disabled": false,
       "id": "",
@@ -3324,7 +3324,7 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": null,
       "exchanges": [
@@ -3350,7 +3350,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:40067",
+        "host": "127.0.0.1:40357",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -3361,11 +3361,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:40067/v1/messages?beta=true"
+        "url": "http://127.0.0.1:40357/v1/messages?beta=true"
        }
       ]
      },
@@ -3401,10 +3401,10 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       },
-      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+      "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
      },
      "test_helper": null
     }
@@ -3414,7 +3414,7 @@
      "auth": {
       "attributes": {
        "api_key": "key-123",
-       "base_url": "http://127.0.0.1:45043"
+       "base_url": "http://127.0.0.1:40739"
       },
       "disabled": false,
       "id": "",
@@ -3426,24 +3426,24 @@
      },
      "caller": "",
      "config": "credential-concurrency:\n    busy-retry-max: 0s\n    busy-retry-min: 0s\n    cleanup-interval: 0s\n    cpa-cancel-bound: 0s\n    cpa-heartbeat-timeout: 0s\n    reclaim-grace: 0s\n    release-flush-interval: 0s\n    release-max-backoff: 0s\n",
-     "date": "2026-10-13",
+     "date": "2026-10-20",
      "exchanges": {
       "chunks": [
        {
         "error": null,
-        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}"
+        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}"
        },
        {
         "error": null,
-        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}"
+        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}"
        },
        {
         "error": null,
-        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
        },
        {
         "error": null,
-        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1791915515,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
+        "payload": "{\"id\":\"msg_1\",\"object\":\"chat.completion.chunk\",\"created\":1792529328,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cached_creation_tokens\":0,\"cache_write_tokens\":0}}}"
        }
       ],
       "exchanges": [
@@ -3469,7 +3469,7 @@
           "CLIProxyAPI/dev"
          ]
         },
-        "host": "127.0.0.1:45043",
+        "host": "127.0.0.1:40739",
         "method": "POST",
         "response_body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "response_headers": {
@@ -3480,11 +3480,11 @@
           "text/event-stream"
          ],
          "Date": [
-          "Tue, 13 Oct 2026 18:18:35 GMT"
+          "Tue, 20 Oct 2026 20:48:48 GMT"
          ]
         },
         "status": 200,
-        "url": "http://127.0.0.1:45043/v1/messages?beta=true"
+        "url": "http://127.0.0.1:40739/v1/messages?beta=true"
        }
       ]
      },
@@ -3520,7 +3520,7 @@
         "text/event-stream"
        ],
        "Date": [
-        "Tue, 13 Oct 2026 18:18:35 GMT"
+        "Tue, 20 Oct 2026 20:48:48 GMT"
        ]
       }
      },
@@ -3530,5 +3530,5 @@
   }
  },
  "go_failures": [],
- "source": "CLIProxyAPI v8.0.27, Go's own tests in internal/runtime/executor"
+ "source": "CLIProxyAPI v8.0.27 with 0d18d3b3, Go's own tests in internal/runtime/executor"
 }

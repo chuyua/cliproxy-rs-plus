@@ -116,9 +116,12 @@ fn parse_host(scheme: &str, host: &str) -> Option<String> {
             Some(zone) => unescape(&inner[..zone], Mode::Host)? + &unescape(&inner[zone..], Mode::Zone)?,
             None => unescape(inner, Mode::Host)?,
         };
-        // netip.ParseAddr: an IPv6 address, optionally zoned; never plain IPv4.
-        let addr = unescaped.split_once('%').map_or(unescaped.as_str(), |(a, _)| a);
-        if addr.parse::<Ipv6Addr>().is_err() || addr.parse::<Ipv4Addr>().is_ok() {
+        // netip.ParseAddr: an IPv6 address, optionally with a non-empty zone after the
+        // first '%'; never plain IPv4.
+        let (addr, zone) = unescaped
+            .split_once('%')
+            .map_or((unescaped.as_str(), None), |(a, z)| (a, Some(z)));
+        if zone == Some("") || addr.parse::<Ipv6Addr>().is_err() || addr.parse::<Ipv4Addr>().is_ok() {
             return None;
         }
         return Some(format!("[{unescaped}]{colon_port}"));
@@ -199,12 +202,14 @@ mod tests {
         assert_eq!(host("api.kimi.com/coding").as_deref(), Some(""));
         assert_eq!(host("https://[::1]:8080/x").as_deref(), Some("::1"));
         assert_eq!(host("https://[fe80::1%25en0]/").as_deref(), Some("fe80::1%en0"));
+        assert_eq!(host("https://[::1%25%25]/").as_deref(), Some("::1%%"));
         for bad in [
             "https://api.kimi.ai/%zz",
             "https://api.kimi.com:abc/v1",
             "https://a:1:2/",
             "https://[1.2.3.4]/",
             "https://[::1/",
+            "https://[::1%25]/",
             "https://a b/",
             "https://a%41/",
             "https://u{@h/",

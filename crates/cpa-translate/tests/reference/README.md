@@ -2,7 +2,22 @@
 
 `../fixtures/pairs/<client>-<upstream>.json` holds outputs produced by CLIProxyAPI at
 `6fecc6e`, built with Go 1.26 (the toolchain upstream releases use; Go 1.27 changes how
-encoding/json writes invalid UTF-8). The generator calls only translator code through
+encoding/json writes invalid UTF-8). A file with a `reference` field was generated from
+that commit instead: the pairs translating to and from Claude
+(`openai-claude`, `openai-response-claude`, `gemini-claude`, `interactions-claude`,
+`claude-openai`, `claude-codex`, `claude-gemini`, `claude-interactions`) follow v8.0.35
+(`ae3ee3be`) and say so. Regenerate those files from a v8.0.35 checkout and the others
+from `6fecc6e`, each with its own harvest: run the script below once per reference, with
+`pairs` restricted to that reference's files (as written, it lists every pair file, which
+would rewrite the other reference's files too). The generator builds against v8.0.35, whose
+`...WithCompat` converters return an error; a `6fecc6e` file needs the generator as it was
+before that change (`git log -- tests/reference`).
+
+A request Go refuses (v8.0.35's `ErrIfNothingLeft`: a user turn left empty because its
+attachments cannot be sent) is recorded as `request_error`, and the Rust error must carry
+the same message. `PENDING` in `golden.rs` names the fixtures of these files that wait
+for a later port, with the Go commits they need; every fixture an entry names must still fail, so a port that
+makes one pass also has to remove it from the list. The generator calls only translator code through
 `sdk/translator`'s registry, the same entry points executors use, and never contacts a
 provider.
 
@@ -79,12 +94,14 @@ panics on a pair Go does not register.
 Static mining cannot evaluate table-driven tests or inputs built by helpers, so
 `harvest/main.go` records them at run time. It instruments a scratch copy of the reference
 (never the checkout itself): every converter registered in `internal/translator/**/init.go`,
-the exported `...WithCompat` request converters and sdk/translator's
-`TranslateRequest`/`TranslateStream`/`TranslateNonStream` get a same-signature wrapper that
+the exported `...WithCompat` request converters, the exported byte-form request converters
+of a pair registered as an envelope (`claude/openai/responses`), and sdk/translator's
+`TranslateRequest`/`TranslateRequestEnvelope`/`TranslateStream`/`TranslateNonStream` get a
+same-signature wrapper that
 logs calls made directly from a `_test.go` file, with the enclosing Test function and call
 line. With `HARVEST_JSONL` set, the generator appends one fixture per recorded request or
 non-stream call, and one per stream (calls sharing a `param` pointer within a test), named
-`Test:line`, unless an existing fixture already has the same input and test name. Inputs
+`Test:line` (an envelope call without `ModelInfo` becomes a `request` fixture), unless an existing fixture already has the same input and test name. Inputs
 over 256 KiB are skipped, and a test contributes at most 24 fixtures per path. Outputs
 still come from `run()` through the registry, so harvested fixtures differ from mined
 ones only in where their input came from.

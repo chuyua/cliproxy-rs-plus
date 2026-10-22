@@ -2,7 +2,7 @@
 
 This inventory spans the previous reference, [`6fecc6e`](https://github.com/router-for-me/CLIProxyAPI/commit/6fecc6e5567912661654a4eaf9b8f5436facd1c2) (v8.0.10), through the frozen target [v8.0.35](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.35), published on 19 October 2026, at [`ae3ee3be`](https://github.com/router-for-me/CLIProxyAPI/commit/ae3ee3be303fb07fb8173279923413005bf32177). It lists all 288 intervening commits, including 32 merges. The extension after v8.0.27 adds 110 non-merge commits and 11 merges. The [checklist](checklist.md) now targets v8.0.35; the [reference update](reference-v8.0.35.md) records its new items and judgments.
 
-"Ported here" means implemented before this documentation-only audit, not implemented by this PR. The original 12 Claude commits have v8.0.27 goldens or Go-case Rust tests (`crates/cpa-exec/tests/reference/claude/README.md`). Seven Antigravity commits are also already implemented and tested; [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md#antigravity) identifies them and the outstanding v8.0.27 work. A cloaked API key's caller system prompt deliberately stays as at `6fecc6e`: Go's later placement changes between turns and misses the prompt cache.
+"Ported here" means implemented in cliproxy-rs: before this audit, or in the later PR named in the notes. The original 12 Claude commits have v8.0.27 goldens or Go-case Rust tests (`crates/cpa-exec/tests/reference/claude/README.md`). Seven Antigravity commits are also already implemented and tested; [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md#antigravity) identifies them and the outstanding v8.0.27 work. A cloaked API key's caller system prompt deliberately stays as at `6fecc6e`: Go's later placement changes between turns and misses the prompt cache.
 
 Columns:
 
@@ -17,9 +17,9 @@ Columns:
 | Claude: prompt cache and prompt shaping | 10 | 6 | 0 | 0 | 1 | 3 |
 | Claude: thread continuation | 4 | 4 | 0 | 0 | 0 | 0 |
 | Claude: rate limits and error answers | 2 | 2 | 0 | 0 | 0 | 0 |
-| Claude: other executor work | 13 | 4 | 9 | 0 | 0 | 0 |
+| Claude: other executor work | 13 | 5 | 8 | 0 | 0 | 0 |
 | Claude: Responses tool_search | 13 | 0 | 13 | 0 | 0 | 0 |
-| Translation to and from Claude | 17 | 0 | 17 | 0 | 0 | 0 |
+| Translation to and from Claude | 17 | 10 | 7 | 0 | 0 | 0 |
 | Payload rules | 1 | 0 | 1 | 0 | 0 | 0 |
 | Codex | 19 | 16 | 3 | 0 | 0 | 0 |
 | Gemini, Vertex and AI Studio | 20 | 0 | 20 | 0 | 0 | 0 |
@@ -37,7 +37,7 @@ Columns:
 | Go tests only | 7 | 0 | 0 | 0 | 7 | 0 |
 | Merge commits | 32 | 0 | 0 | 0 | 32 | 0 |
 | Reasoning signature carriage | 8 | 0 | 8 | 0 | 0 | 0 |
-| **All** | **288** | **67** | **155** | **0** | **63** | **3** |
+| **All** | **288** | **78** | **144** | **0** | **63** | **3** |
 
 Suggested order: credential epochs, watcher reconciliation and cooldown fencing first; SIWC security and v8 config concurrency next; plugin model/auth wiring and Home integration alongside them. Port the shared schema cleaner and reasoning-signature carriage series together, then Codex SSE/tool history, Gemini/Vertex tools and OpenAPI models, and the remaining providers. Keep the Antigravity entitlement/probe series (7e857c37, 9521fe29, ad381435, 091ff27f) together. Keep the Claude payload barrier (868e137), Responses tool_search series and deferred-tool cache fix (97ba1e89) together; verify stable prefixes before changing cache semantics. Finish the remaining Claude thinking/date/web-search cache work and catalogs, then SDK, discovery and non-visible performance parity. Sizes are Go diff sizes, not priorities or Rust effort estimates.
 
@@ -79,7 +79,7 @@ Suggested order: credential epochs, watcher reconciliation and cooldown fencing 
 | [`2bc236d2`](https://github.com/router-for-me/CLIProxyAPI/commit/2bc236d2) | feat(claude): support responses compaction in claude executor | yes | ported here | L (+318 −4) | `/responses/compact` and compaction triggers through Claude: a non-stream summary turn sealed into a CPA capsule; replayed capsules expand, foreign ones are dropped; replays Go's compaction tests |
 | [`e9c8769a`](https://github.com/router-for-me/CLIProxyAPI/commit/e9c8769a) | fix(executor): normalize and restore non-portable tool call IDs | yes | to port | M (+129 −3) | tool_use IDs rewritten to Anthropic's charset and restored (also Devin) |
 | [`02fc76b1`](https://github.com/router-for-me/CLIProxyAPI/commit/02fc76b1) | fix(claude): restore passthrough MCP tools wrapped with their full mcp__ name | yes | ported here | S (+22 −0) | a caller tool kept under its full `mcp__` name inside the virtual server restores first; ambiguity still fails; replays its two Go tests |
-| [`0d18d3b3`](https://github.com/router-for-me/CLIProxyAPI/commit/0d18d3b3) | feat(claude): support model-specific default max tokens from registry in OpenAI chat completions | yes | to port | M (+68 −4) | support model-specific default max tokens from registry in OpenAI chat completions |
+| [`0d18d3b3`](https://github.com/router-for-me/CLIProxyAPI/commit/0d18d3b3) | feat(claude): support model-specific default max tokens from registry in OpenAI chat completions | yes | ported here | M (+68 −4) | support model-specific default max tokens from registry in OpenAI chat completions; #75 |
 | [`345cc9d5`](https://github.com/router-for-me/CLIProxyAPI/commit/345cc9d5) | feat(claude): add timeout and retry logic for silent TLS handshakes | yes | ported here | L (+326 −8) | silent TLS handshake bound on the Claude Code and Chrome transports; the failure is a transport fault (retry, no cooldown); the bound also covers dialing (M4-0514) |
 | [`7604d3df`](https://github.com/router-for-me/CLIProxyAPI/commit/7604d3df) | feat(claude): add session date pin retention to preserve continuity across credential switches | yes | to port | L (+325 −19) | date-pin retention across credential switches and configurable retention; not just session-local pinning |
 | [`911f49cb`](https://github.com/router-for-me/CLIProxyAPI/commit/911f49cb) | feat(claude): add automatic thinking block binding and beta policy for preserved-thinking models | yes | to port | M (+103 −2) | preserved-thinking block binding and beta policy; followed by e13bc9a1 and ad9e456d |
@@ -112,20 +112,20 @@ Suggested order: credential epochs, watcher reconciliation and cooldown fencing 
 
 | Commit | Subject | User-visible | This PR | Size | Notes |
 |---|---|---|---|---|---|
-| [`e6f6f26a`](https://github.com/router-for-me/CLIProxyAPI/commit/e6f6f26a) | fix(claude): handle pause_turn stop reason in responses translation | yes | to port | S (+7 −1) | Claude `pause_turn` in Responses output |
-| [`2c1dcc7c`](https://github.com/router-for-me/CLIProxyAPI/commit/2c1dcc7c) | fix(claude): include web search sources in codex request when search tool is present | yes | to port | S (+7 −1) | Claude to Codex: web search sources requested |
-| [`61a70dc6`](https://github.com/router-for-me/CLIProxyAPI/commit/61a70dc6) | feat(claude): adapt native messages JSON to SSE for non-stream translation | yes | to port | M (+90 −0) | non-stream Claude JSON adapted to SSE for Chat and Responses |
-| [`33ec5502`](https://github.com/router-for-me/CLIProxyAPI/commit/33ec5502) | fix(claude): refine model version parsing for assistant prefill rejection | yes | to port | S (+31 −4) | model version parsing for the assistant prefill rule |
-| [`68afd0d1`](https://github.com/router-for-me/CLIProxyAPI/commit/68afd0d1) | feat(codex): support action sources in Claude web search translation | yes | to port | S (+11 −3) | Codex web search action sources in Claude output |
-| [`ba1bbd75`](https://github.com/router-for-me/CLIProxyAPI/commit/ba1bbd75) | fix(gemini): support document blocks in Claude request translation | yes | to port | S (+4 −2) | Claude to Gemini: document blocks |
-| [`d510dccf`](https://github.com/router-for-me/CLIProxyAPI/commit/d510dccf) | fix(gemini): support camelCase systemInstruction in request translation | yes | to port | S (+5 −1) | Gemini to Claude: camelCase `systemInstruction` |
+| [`e6f6f26a`](https://github.com/router-for-me/CLIProxyAPI/commit/e6f6f26a) | fix(claude): handle pause_turn stop reason in responses translation | yes | ported here | S (+7 −1) | Claude `pause_turn` in Responses output; #75 |
+| [`2c1dcc7c`](https://github.com/router-for-me/CLIProxyAPI/commit/2c1dcc7c) | fix(claude): include web search sources in codex request when search tool is present | yes | ported here | S (+7 −1) | Claude to Codex: web search sources requested; #75 |
+| [`61a70dc6`](https://github.com/router-for-me/CLIProxyAPI/commit/61a70dc6) | feat(claude): adapt native messages JSON to SSE for non-stream translation | yes | ported here | M (+90 −0) | non-stream Claude JSON adapted to SSE for Chat and Responses; #75 |
+| [`33ec5502`](https://github.com/router-for-me/CLIProxyAPI/commit/33ec5502) | fix(claude): refine model version parsing for assistant prefill rejection | yes | ported here | S (+31 −4) | model version parsing for the assistant prefill rule; #75 |
+| [`68afd0d1`](https://github.com/router-for-me/CLIProxyAPI/commit/68afd0d1) | feat(codex): support action sources in Claude web search translation | yes | ported here | S (+11 −3) | Codex web search action sources in Claude output; #75 |
+| [`ba1bbd75`](https://github.com/router-for-me/CLIProxyAPI/commit/ba1bbd75) | fix(gemini): support document blocks in Claude request translation | yes | ported here | S (+4 −2) | Claude to Gemini: document blocks; #75 |
+| [`d510dccf`](https://github.com/router-for-me/CLIProxyAPI/commit/d510dccf) | fix(gemini): support camelCase systemInstruction in request translation | yes | ported here | S (+5 −1) | Gemini to Claude: camelCase `systemInstruction`; #75 |
 | [`a0d31924`](https://github.com/router-for-me/CLIProxyAPI/commit/a0d31924) | fix(gemini): map refusal finish reasons and handle partless stream completion in Claude response translation | yes | to port | M (+87 −41) | Gemini to Claude: refusal finish reasons, partless completion |
 | [`68ea171d`](https://github.com/router-for-me/CLIProxyAPI/commit/68ea171d) | fix(gemini): handle carrier thinking blocks for signed visible text and tool calls in Claude response translation | yes | to port | M (+156 −89) | Gemini to Claude: signed carrier thinking blocks |
-| [`3b69068e`](https://github.com/router-for-me/CLIProxyAPI/commit/3b69068e) | fix(translator): stop dropping attachments and empty turns | yes | to port | L (+453 −141) | attachments and empty turns no longer dropped (many translators, Claude executor) |
-| [`a881c036`](https://github.com/router-for-me/CLIProxyAPI/commit/a881c036) | fix(claude): respect registry completion limit for default responses max tokens | yes | to port | S (+12 −4) | Responses to Claude: default `max_tokens` from the registry |
-| [`9a7db8e3`](https://github.com/router-for-me/CLIProxyAPI/commit/9a7db8e3) | fix(claude): defer stream message delta emission to trailing usage chunk | yes | to port | S (+5 −3) | OpenAI to Claude stream: `message_delta` waits for trailing usage |
+| [`3b69068e`](https://github.com/router-for-me/CLIProxyAPI/commit/3b69068e) | fix(translator): stop dropping attachments and empty turns | yes | to port | L (+453 −141) | attachments and empty turns no longer dropped (many translators, Claude executor); the Claude translators and the executors that report a refusal as 400 in #75; still to port: OpenAI to Gemini and the plugin host adapter (`internal/pluginhost/adapters_executors.go`), which forwards a refused body |
+| [`a881c036`](https://github.com/router-for-me/CLIProxyAPI/commit/a881c036) | fix(claude): respect registry completion limit for default responses max tokens | yes | ported here | S (+12 −4) | Responses to Claude: default `max_tokens` from the registry; #75 |
+| [`9a7db8e3`](https://github.com/router-for-me/CLIProxyAPI/commit/9a7db8e3) | fix(claude): defer stream message delta emission to trailing usage chunk | yes | ported here | S (+5 −3) | OpenAI to Claude stream: `message_delta` waits for trailing usage; #75 |
 | [`58257007`](https://github.com/router-for-me/CLIProxyAPI/commit/58257007) | feat(claude): ensure unique tool use IDs across turns in Gemini response translator | yes | to port | S (+1 −3) | ensure unique tool use IDs across turns in Gemini response translator |
-| [`59930ba3`](https://github.com/router-for-me/CLIProxyAPI/commit/59930ba3) | feat(claude): map incomplete OpenAI Responses tool status to tool_result is_error | yes | to port | S (+9 −2) | map incomplete OpenAI Responses tool status to tool_result is_error |
+| [`59930ba3`](https://github.com/router-for-me/CLIProxyAPI/commit/59930ba3) | feat(claude): map incomplete OpenAI Responses tool status to tool_result is_error | yes | ported here | S (+9 −2) | map incomplete OpenAI Responses tool status to tool_result is_error; #75 |
 | [`7a511e4d`](https://github.com/router-for-me/CLIProxyAPI/commit/7a511e4d) | feat(claude): pin validated request body per-stream in OpenAI Responses translation | no | to port | S (+7 −3) | pin validated request body per-stream in OpenAI Responses translation |
 | [`202b8b8c`](https://github.com/router-for-me/CLIProxyAPI/commit/202b8b8c) | feat(claude): clean and normalize Claude tool arguments against original schemas | yes | to port | L (+1367 −20) | clean and normalize Claude tool arguments against original schemas |
 | [`030d17ed`](https://github.com/router-for-me/CLIProxyAPI/commit/030d17ed) | perf(openai): cache stream preferences and tool maps per stream in Claude response translator | no | to port | S (+22 −7) | cache stream preferences and tool maps per stream in Claude response translator |

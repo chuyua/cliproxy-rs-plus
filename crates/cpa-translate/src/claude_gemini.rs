@@ -9,7 +9,7 @@ use cpa_common::signature::{BlockKind, gemini_replay_signature_or_bypass};
 
 use crate::claude_interactions::Accumulator;
 use crate::common::{
-    derive_claude_user_id, format_rfc3339_utc, go_lower, is_gemini_thought_part, now_unix,
+    UserTurnDrops, derive_claude_user_id, format_rfc3339_utc, go_lower, is_gemini_thought_part, now_unix,
     sanitize_claude_function_name, trim_space,
 };
 use crate::stream::GoStream;
@@ -17,7 +17,7 @@ use crate::{Error, Registered, ResponseCtx, thinking};
 
 pub static PAIR: Registered = registered!(
     Gemini -> Claude,
-    request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream)),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: Some(crate::gemini::token_count),
@@ -30,8 +30,9 @@ fn string(res: &Res<'_>) -> Vec<u8> {
 // ---------------------------------------------------------------------------------------
 // Request
 
-/// ConvertGeminiRequestToClaude.
-fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
+/// ConvertGeminiRequestToClaude. A user turn left empty because its only attachment
+/// has no Claude equivalent is refused.
+fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
     let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", derive_claude_user_id(raw));
     let root = gj::parse(raw);
@@ -45,8 +46,8 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
         copy_generation_config(&mut out, &config, model);
     }
     let mut messages = Accumulator::default();
-    let parts = root.get("system_instruction.parts");
-    if root.get("system_instruction").exists() && parts.is_array() {
+    let parts = first(&root, "systemInstruction", "system_instruction").get("parts");
+    if parts.is_array() {
         let mut system = vec![];
         parts.each(|_, part| {
             if is_gemini_thought_part(&part) {
@@ -68,6 +69,7 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
             messages.flush();
         }
     }
+    let mut drops = UserTurnDrops::default();
     let contents = root.get("contents");
     if contents.is_array() {
         let mut ids = ToolIds::default();
@@ -78,12 +80,20 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
                 other => other.to_vec(),
             };
             let mut items = vec![];
+            // Whitespace-only text is forwarded but never sendable.
+            let mut sendable = 0;
             let parts = content.get("parts");
             if parts.is_array() {
                 parts.each(|_, part| {
-                    items.extend(ids.part(&part, &role));
+                    if let Some((item, counts)) = ids.part(&part, &role, &mut drops) {
+                        items.push(item);
+                        sendable += usize::from(counts);
+                    }
                     true
                 });
+            }
+            if role != b"assistant" {
+                drops.end_turn(sendable);
             }
             if !items.is_empty() {
                 let mut message = br#"{"role":"","content":[]}"#.to_vec();
@@ -106,7 +116,8 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
         }
     }
     gj::set_bool(&mut out, "stream", stream);
-    thinking::apply_translated_summary_to_claude(out, raw, "gemini", model)
+    drops.result()?;
+    Ok(thinking::apply_translated_summary_to_claude(out, raw, "gemini", model))
 }
 
 /// generationConfig: max tokens, top_p, stop sequences and thinking.
@@ -130,19 +141,28 @@ fn copy_generation_config(out: &mut Vec<u8>, config: &Res<'_>, model: &str) {
     if !thinking_config.is_object() {
         return;
     }
-    let levels = thinking::lookup_model_info(model, "claude")
+    let support = thinking::lookup_model_info(model, "claude")
         .and_then(|m| m.thinking)
-        .map(|t| t.levels)
         .unwrap_or_default();
+    let levels = support.levels;
     let adaptive = !levels.is_empty();
     let supports_max = adaptive && thinking::has_level(&levels, "max");
+    let dynamic = adaptive && support.dynamic_allowed;
+    // A level the model lists is sent as is; only unlisted ones are mapped.
     let set_adaptive = |out: &mut Vec<u8>, level: &[u8]| {
         let mapped = std::str::from_utf8(level)
             .ok()
+            .filter(|l| !thinking::has_level(&levels, l))
             .and_then(|l| thinking::map_to_claude_effort(l, supports_max));
         gj::set_str(out, "thinking.type", "adaptive");
         gj::delete(out, "thinking.budget_tokens");
         gj::set_str(out, "output_config.effort", mapped.map_or(level, str::as_bytes));
+    };
+    // Dynamic thinking on an adaptive model leaves the effort to the model.
+    let model_default = |out: &mut Vec<u8>| {
+        gj::set_str(out, "thinking.type", "adaptive");
+        gj::delete(out, "thinking.budget_tokens");
+        gj::delete(out, "output_config.effort");
     };
     let disable = |out: &mut Vec<u8>| {
         gj::set_str(out, "thinking.type", "disabled");
@@ -160,6 +180,7 @@ fn copy_generation_config(out: &mut Vec<u8>, config: &Res<'_>, model: &str) {
         match level.as_slice() {
             b"" => {}
             b"none" => disable(out),
+            b"auto" if dynamic => model_default(out),
             _ if adaptive => set_adaptive(out, &level),
             b"auto" => {
                 gj::set_str(out, "thinking.type", "enabled");
@@ -187,6 +208,7 @@ fn copy_generation_config(out: &mut Vec<u8>, config: &Res<'_>, model: &str) {
     let budget = budget.int();
     match budget {
         0 => disable(out),
+        -1 if dynamic => model_default(out),
         _ if adaptive => {
             if let Some(level) = thinking::convert_budget_to_level(budget) {
                 set_adaptive(out, level.as_bytes());
@@ -226,19 +248,28 @@ impl ToolIds {
         format!("toolu_gemini_{:016}", self.counter).into_bytes()
     }
 
-    /// One Gemini part as Claude content, if it converts.
-    fn part(&mut self, part: &Res<'_>, role: &[u8]) -> Option<Vec<u8>> {
+    /// One Gemini part as Claude content, if it converts, and whether it counts as
+    /// sendable. A user attachment Claude cannot read is recorded in `drops`.
+    fn part(&mut self, part: &Res<'_>, role: &[u8], drops: &mut UserTurnDrops) -> Option<(Vec<u8>, bool)> {
         if is_gemini_thought_part(part) {
             return None;
         }
         let text = part.get("text");
         if text.exists() {
             let mut out = br#"{"type":"text","text":""}"#.to_vec();
-            gj::set_str(&mut out, "text", text.bytes());
-            return Some(out);
+            let text = text.bytes();
+            gj::set_str(&mut out, "text", &text);
+            return Some((out, !trim_space(&text).is_empty()));
         }
+        let assistant = role == b"assistant";
+        let attachment = |converted: Option<Vec<u8>>, kind: &str, drops: &mut UserTurnDrops| {
+            if converted.is_none() && !assistant {
+                drops.drop_part(kind);
+            }
+            converted.map(|item| (item, true))
+        };
         let call = part.get("functionCall");
-        if call.exists() && role == b"assistant" {
+        if call.exists() && assistant {
             let mut out = br#"{"type":"tool_use","id":"","name":"","input":{}}"#.to_vec();
             let mut id = gemini_tool_id(&call);
             if id.is_empty() {
@@ -254,7 +285,7 @@ impl ToolIds {
             if args.is_object() {
                 gj::set_raw(&mut out, "input", &args.raw);
             }
-            return Some(out);
+            return Some((out, true));
         }
         let response = part.get("functionResponse");
         if response.exists() {
@@ -278,15 +309,15 @@ impl ToolIds {
             } else if body.exists() {
                 gj::set_str(&mut out, "content", &body.raw);
             }
-            return Some(out);
+            return Some((out, true));
         }
         let inline = first(part, "inlineData", "inline_data");
         if inline.exists() {
-            return inline_part(&inline);
+            return attachment(inline_part(&inline, assistant), "inlineData", drops);
         }
         let file = first(part, "fileData", "file_data");
         if file.exists() {
-            return file_part(&file);
+            return attachment(file_part(&file), "fileData", drops);
         }
         None
     }
@@ -320,8 +351,9 @@ fn media_kind(mime: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// claudeContentPartFromGeminiInlineData.
-fn inline_part(inline: &Res<'_>) -> Option<Vec<u8>> {
+/// claudeContentPartFromGeminiInlineData: media Claude cannot read becomes placeholder
+/// text only in model content; a user attachment is never replaced by text.
+fn inline_part(inline: &Res<'_>, keep_placeholder: bool) -> Option<Vec<u8>> {
     let mime = first_string(inline, "mimeType", "mime_type");
     let data = string(&inline.get("data"));
     if mime.is_empty() || data.is_empty() {
@@ -335,7 +367,8 @@ fn inline_part(inline: &Res<'_>) -> Option<Vec<u8>> {
             gj::set_str(&mut out, "source.data", &data);
             out
         }
-        None => text_part(&[&b"Media content: inline data (Type: "[..], &mime, b")"].concat()),
+        None if keep_placeholder => text_part(&[&b"Media content: inline data (Type: "[..], &mime, b")"].concat()),
+        None => return None,
     })
 }
 

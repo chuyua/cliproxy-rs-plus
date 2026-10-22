@@ -474,10 +474,7 @@ async fn a_failing_plugin_credential_fails_over_to_the_next() {
 /// refuses it (an attachment the target cannot carry, leaving the turn empty), the route
 /// answers 400 naming the part and the plugin is never called (`prepareExecutorCall`
 /// returns the envelope's error).
-// ponytail: no translator on master refuses a body yet; #75 ports the Claude refusals.
-// Enable this when it merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the translator refusals from #75"]
 async fn a_refused_translation_answers_400_without_calling_the_routed_executor() {
     // `rt` routes and executes in Claude format; `exo` executes in chat-completions.
     let Some(env) = env(
