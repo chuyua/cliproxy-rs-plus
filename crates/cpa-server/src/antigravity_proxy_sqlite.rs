@@ -140,6 +140,7 @@ impl ProxyGroupDb {
     }
 
     pub fn add_group(&self, id: i64, name: &str, strategy: Strategy, enabled: bool) -> Result<()> {
+        ensure!(id > 0, "group ID must be positive");
         ensure!(!name.trim().is_empty(), "group name required");
         let label = match strategy {
             Strategy::RoundRobin => "round_robin",
@@ -154,6 +155,7 @@ impl ProxyGroupDb {
     }
 
     pub fn add_node(&self, node: Node, proxy_url: &str) -> Result<()> {
+        ensure!(node.id > 0 && node.group_id > 0, "node and group IDs must be positive");
         ensure!(
             matches!(cpa_exec::proxy::Proxy::parse(proxy_url), cpa_exec::proxy::Proxy::Url(_)),
             "proxy node requires a supported proxy URL"
@@ -175,6 +177,7 @@ impl ProxyGroupDb {
     }
 
     pub fn add_account(&self, name: &str, group_id: i64) -> Result<()> {
+        ensure!(group_id > 0, "group ID must be positive");
         ensure!(!name.trim().is_empty(), "credential name required");
         ensure!(
             Path::new(name).file_name().is_some_and(|base| base == name),
@@ -504,6 +507,33 @@ mod tests {
             );
         }
         assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonpositive_identifiers_before_writing_sqlite() {
+        let (db, dir) = sandbox();
+        assert!(db.add_group(0, "invalid", Strategy::RoundRobin, true).is_err());
+        assert!(db.add_account("invalid.json", 0).is_err());
+        for (id, group_id) in [(0, 10), (-1, 10), (100, 0), (100, -1)] {
+            assert!(
+                db.add_node(
+                    Node {
+                        id,
+                        group_id,
+                        enabled: true,
+                        cooldown_until: None,
+                        failure_count: 0,
+                    },
+                    "http://127.0.0.1:8080"
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_groups"), 1);
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_accounts"), 1);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }
