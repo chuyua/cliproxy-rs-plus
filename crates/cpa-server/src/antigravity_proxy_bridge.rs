@@ -83,6 +83,26 @@ pub fn lease_is_current(db: &ProxyGroupDb, store: &CredentialStore, lease: &Grou
         && lease.credential.attributes.get("proxy_url") == Some(&active.binding.proxy_url))
 }
 
+/// Apply a failure to the exact lease generation that served the request.
+/// A late callback cannot invalidate a newer binding. A replacement must
+/// receive a fresh lease and be revalidated before dispatch.
+pub fn rebind_failed_group_proxy(
+    db: &ProxyGroupDb,
+    lease: &GroupProxyLease,
+    now: i64,
+    cooldown_seconds: i64,
+    random_slot: usize,
+) -> Result<Option<crate::antigravity_proxy_sqlite::BoundProxy>> {
+    db.invalidate_and_rebind(
+        &lease.credential.id,
+        lease.node_id,
+        lease.binding_generation,
+        now,
+        cooldown_seconds,
+        random_slot,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +144,23 @@ mod tests {
     fn finish(db: ProxyGroupDb, dir: PathBuf) {
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn late_failure_cannot_cool_replacement_binding() {
+        let (db, credential, dir) = sandbox();
+        let first = db.select_and_bind(&credential.id, 100, 0).unwrap().unwrap();
+        let stale_lease = resolve_group_proxy_lease(&db, &credential, 100).unwrap();
+        let replacement = rebind_failed_group_proxy(&db, &stale_lease, 101, 300, 0).unwrap();
+        assert!(replacement.is_none());
+        assert!(
+            rebind_failed_group_proxy(&db, &stale_lease, 102, 300, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(first.node_id, stale_lease.node_id);
+        assert!(db.active_bound_proxy(&credential.id, 102).unwrap().is_none());
+        finish(db, dir);
     }
 
     #[test]
