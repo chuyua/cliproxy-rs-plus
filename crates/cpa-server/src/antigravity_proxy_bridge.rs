@@ -149,6 +149,8 @@ pub fn rebind_failed_group_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use crate::antigravity_proxy_group::{Node, Strategy};
     use cpa_core::config::Config;
     use cpa_core::credential::MetadataPatch;
@@ -187,6 +189,30 @@ mod tests {
     fn finish(db: ProxyGroupDb, dir: PathBuf) {
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_use_never_splits_proxy_generation() {
+        let (db, credential, dir) = sandbox();
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|slot| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                let credential = credential.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let lease = bind_and_resolve_group_proxy_lease(&db, &credential, 100, slot).unwrap();
+                    (lease.node_id, lease.binding_generation)
+                })
+            })
+            .collect();
+        let leases: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert!(leases.iter().all(|lease| *lease == leases[0]));
+        assert!(leases[0].1 > 0);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("outstanding DB handles"));
+        finish(db, dir);
     }
 
     #[test]
