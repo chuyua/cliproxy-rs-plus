@@ -10,6 +10,49 @@ use cpa_exec::proxy::Proxy;
 use crate::antigravity_proxy_sqlite::ProxyGroupDb;
 use crate::runtime::CredentialStore;
 
+/// Bind an eligible proxy on first use without persisting it in auth JSON.
+/// Callers must revalidate the returned generation before dispatch.
+pub fn bind_and_resolve_group_proxy_lease(
+    db: &ProxyGroupDb,
+    credential: &Credential,
+    now: i64,
+    random_slot: usize,
+) -> Result<GroupProxyLease> {
+    ensure!(credential.provider == "antigravity", "group mode requires Antigravity");
+    ensure!(credential.str("proxy_mode") == Some("group"), "group mode not opted in");
+    ensure!(!credential.disabled, "group credential disabled");
+    ensure!(
+        matches!(credential.source, Source::File(_)),
+        "group credential must be file backed"
+    );
+    ensure!(
+        credential
+            .attributes
+            .get("proxy_url")
+            .is_none_or(|p| p.trim().is_empty()),
+        "explicit proxy conflicts with group mode"
+    );
+    ensure!(
+        credential.str("proxy_url").is_none_or(|p| p.trim().is_empty()),
+        "explicit proxy conflicts with group mode"
+    );
+    let configured_group = credential.metadata.get("proxy_group_id").context("group ID missing")?;
+    let group_id = configured_group
+        .as_i64()
+        .or_else(|| configured_group.as_str().and_then(|s| s.parse::<i64>().ok()))
+        .context("invalid group ID")?;
+    ensure!(group_id > 0, "group ID must be positive");
+    // Reject mismatched groups before any selection transaction mutates
+    // the cursor or creates a binding for an invalid credential.
+    ensure!(
+        db.account_group_id(&credential.id)? == group_id,
+        "credential and SQLite groups differ"
+    );
+    db.select_and_bind(&credential.id, now, random_slot)?
+        .context("no eligible group proxy; direct fallback forbidden")?;
+    resolve_group_proxy_lease(db, credential, now)
+}
+
 /// Ephemeral, request-scoped view. Carries secrets; never log or serialize.
 pub struct GroupProxyLease {
     pub credential: Credential,
@@ -111,6 +154,8 @@ mod tests {
     use cpa_core::credential::MetadataPatch;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sandbox() -> (ProxyGroupDb, Credential, PathBuf) {
@@ -144,6 +189,61 @@ mod tests {
     fn finish(db: ProxyGroupDb, dir: PathBuf) {
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_use_never_splits_proxy_generation() {
+        let (db, credential, dir) = sandbox();
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|slot| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                let credential = credential.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let lease = bind_and_resolve_group_proxy_lease(&db, &credential, 100, slot).unwrap();
+                    (lease.node_id, lease.binding_generation)
+                })
+            })
+            .collect();
+        let leases: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert!(leases.iter().all(|lease| *lease == leases[0]));
+        assert!(leases[0].1 > 0);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("outstanding DB handles"));
+        finish(db, dir);
+    }
+
+    #[test]
+    fn first_use_binds_and_reuses_generation() {
+        let (db, credential, dir) = sandbox();
+        assert!(resolve_group_proxy_lease(&db, &credential, 100).is_err());
+        let first = bind_and_resolve_group_proxy_lease(&db, &credential, 100, 0).unwrap();
+        let again = bind_and_resolve_group_proxy_lease(&db, &credential, 100, 9).unwrap();
+        assert_eq!(first.node_id, again.node_id);
+        assert_eq!(first.binding_generation, again.binding_generation);
+        assert_eq!(first.node_id, 11);
+        finish(db, dir);
+    }
+
+    #[test]
+    fn mismatched_group_does_not_create_binding() {
+        let (db, mut credential, dir) = sandbox();
+        credential.metadata.insert("proxy_group_id".into(), json!(999));
+        assert!(bind_and_resolve_group_proxy_lease(&db, &credential, 100, 0).is_err());
+        assert_eq!(db.binding(&credential.id).unwrap().binding_generation, 0);
+        assert!(db.active_bound_proxy(&credential.id, 100).unwrap().is_none());
+        finish(db, dir);
+    }
+
+    #[test]
+    fn disabled_account_cannot_bind_on_first_use() {
+        let (db, mut credential, dir) = sandbox();
+        credential.disabled = true;
+        assert!(bind_and_resolve_group_proxy_lease(&db, &credential, 100, 0).is_err());
+        assert!(db.active_bound_proxy(&credential.id, 100).unwrap().is_none());
+        finish(db, dir);
     }
 
     #[test]

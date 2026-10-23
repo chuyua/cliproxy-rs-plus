@@ -1764,6 +1764,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_large_response_capture_stays_bounded_and_returns_empty_body() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().route(
+            "/head-large",
+            axum::routing::head(|| async {
+                let chunk = Bytes::from(vec![b'h'; 1 << 20]);
+                let chunks = futures_util::stream::iter((0..16).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+                Response::new(Body::from_stream(chunks))
+            }),
+        );
+        let mut app = router(&state, crate::app(state.rt.clone(), app));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.call(
+                HttpRequest::builder()
+                    .method("HEAD")
+                    .uri("/head-large")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(body.is_empty(), "HEAD must never forward the handler body");
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if logs(&dir)
+                    .iter()
+                    .any(|path| std::fs::read_to_string(path).is_ok_and(|s| s.contains(marker)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_response_logging_is_bounded_without_truncating_client_bytes() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().fallback(|| async {
+            let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+            let chunks = futures_util::stream::iter((0..9).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+            Response::new(Body::from_stream(chunks))
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivered = axum::body::to_bytes(response.into_body(), 10 << 20).await.unwrap();
+        assert_eq!(delivered.len(), 9 << 20, "logging must not truncate the HTTP response");
+
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        let content = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = logs(&dir).first()
+                    && let Ok(content) = std::fs::read_to_string(path)
+                    && content.contains(marker)
+                {
+                    return content;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(content.len() < (9 << 20), "log storage must be bounded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_response_log_has_an_inflation_ceiling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let (body, error) = decode(
+            include_bytes!("../tests/fixtures/response_bomb.gz").to_vec(),
+            &headers,
+            false,
+            Some(RESPONSE_CAPTURE_LIMIT as u64),
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(&body[..8], &[0; 8]);
+        assert!(body.ends_with(b"[DECOMPRESSED RESPONSE BODY TRUNCATED]"));
+        assert!(body.len() < (9 << 20), "gzip inflation must be bounded");
+    }
+
+    #[tokio::test]
     async fn enabled_logging_does_not_wait_for_unconsumed_request_bodies() {
         let dir = scratch();
         let state = management(&dir, true, false);
