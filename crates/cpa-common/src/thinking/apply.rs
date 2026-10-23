@@ -12,7 +12,7 @@ use super::{
     Config, Error, LEVEL_AUTO, LEVEL_HIGH, LEVEL_MAX, LEVEL_NONE, LEVEL_XHIGH, Mode, ModelCaps, SuffixResult,
     convert_budget_to_level, convert_level_to_budget, extract_configuration_update_config, is_responses_format,
     is_user_defined_model, lookup_model_info, parse_level_suffix, parse_numeric_suffix, parse_special_suffix,
-    parse_suffix, strip_configuration_updates, strip_responses_effort, strip_thinking_config,
+    parse_suffix, strip_configuration_updates, strip_responses_effort, strip_thinking_config, with_str,
 };
 use crate::gostr::GoStr;
 use crate::json;
@@ -355,13 +355,26 @@ fn run(
         config.level = map_configured_high_intent(&config.level, info);
     }
 
+    let requested_off = config.mode == Mode::None || (config.mode == Mode::Budget && config.budget == 0);
     let validated = validate_config(config, Some(info), &from, &target, suffix.has_suffix).map_err(|mut e| {
         e.body = Some(body.clone());
         e
     })?;
-    let applied = apply_fn(&body, &validated, Some(info))?;
+    let mut applied = apply_fn.apply(&body, &validated, Some(info))?;
     if fully_disabled(&validated) || native_responses {
         return Ok(applied);
+    }
+    let mut summary = summary;
+    if target == "claude" && requested_off {
+        // The model cannot turn thinking off, so validation fell back to its lowest
+        // level: drop a stale block_binding and keep the caller's intent of seeing no
+        // thinking, since without an explicit omitted display cloaking would add
+        // progress updates (Go ad9e456d).
+        applied = super::without(&applied, "thinking.block_binding");
+        summary = SummaryConfig {
+            mode: SummaryMode::Disabled,
+            ..Default::default()
+        };
     }
     Ok(apply_summary_config_for_provider(
         &applied,
@@ -462,7 +475,7 @@ fn apply_user_defined_model(
         return Ok(body.to_vec());
     };
     let config = normalize_user_defined_config(config, to);
-    let applied = apply_fn(body, &config, info)?;
+    let applied = apply_fn.apply(body, &config, info)?;
     if fully_disabled(&config) || native_responses {
         return Ok(applied);
     }
@@ -520,6 +533,31 @@ pub fn extract_reasoning_effort(body: &[u8], provider: &str, model: &str) -> Str
     effort_from_config(&config)
 }
 
+/// `HasThinkingSuffix`: the model carries a suffix that parses to a thinking config.
+pub fn has_thinking_suffix(model: &str) -> bool {
+    let suffix = parse_suffix(model);
+    suffix.has_suffix && parse_suffix_to_config(&suffix.raw_suffix).is_set()
+}
+
+/// `StripConfigurationUpdates`: drops `configuration_update` input items, reasoning untouched.
+pub fn strip_configuration_update_items(body: &[u8]) -> Vec<u8> {
+    strip_configuration_updates(body)
+}
+
+/// `CollapseConfigurationUpdates`: drops `configuration_update` input items and, unless
+/// `keep_top_level_effort`, sets the last item's effort as the top-level `reasoning.effort`.
+pub fn collapse_configuration_updates(body: &[u8], keep_top_level_effort: bool) -> Vec<u8> {
+    let updated = strip_configuration_updates(body);
+    if keep_top_level_effort {
+        return updated;
+    }
+    let effort = effort_from_config(&extract_configuration_update_config(body));
+    if effort.is_empty() {
+        return updated;
+    }
+    with_str(&updated, "reasoning.effort", &effort)
+}
+
 /// `ExtractTranslatedReasoningEffort`: the final provider payload's effort.
 pub fn extract_translated_reasoning_effort(body: &[u8], provider: &str) -> String {
     let provider = provider.trim().go_lower();
@@ -536,6 +574,8 @@ pub fn extract_translated_reasoning_effort(body: &[u8], provider: &str) -> Strin
 fn extract_for_usage(body: &[u8], provider: &str) -> Config {
     match provider.trim().go_lower().as_str() {
         "codex" | "xai" | "openai-response" => extract_codex_usage_config(body),
+        // between_tools is how claude-sonnet-5-5 turns thinking off.
+        "claude" if json::get(body, "thinking.type").str() == "between_tools" => Config::none(),
         p => extract_thinking_config(body, p),
     }
 }

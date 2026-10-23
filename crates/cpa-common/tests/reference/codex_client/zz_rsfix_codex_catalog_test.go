@@ -1,7 +1,7 @@
 package models
 
 // Vectors for cpa_common::codex_catalog. Copy into internal/client/codex/models/ of
-// CLIProxyAPI 6fecc6e and run with RSFIX_OUT=<dir>; it writes codex_catalog_go.json.
+// CLIProxyAPI v8.0.35 (ae3ee3be) and run with RSFIX_OUT=<dir>; it writes codex_catalog_go.json.
 // The registry facts the builder reads are recorded with each vector so the Rust
 // replay looks up exactly what Go saw. Pure functions only: no network.
 
@@ -126,7 +126,7 @@ func TestRSFixCodexCatalog(t *testing.T) {
 		if c.patch {
 			patchFn = applyPatchFn
 		}
-		out, err := MarshalCompact(BuildResponseForClientWithToolCapabilities(available, reg.GetModelProviders, webSearchFn, patchFn, c.optimize, c.version))
+		out, err := MarshalCompact(BuildResponseForClientWithToolCapabilities(available, reg.GetModelProviders, webSearchFn, patchFn, nil, c.optimize, c.version))
 		if err != nil {
 			t.Fatal(err)
 		}

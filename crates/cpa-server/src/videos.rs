@@ -355,23 +355,54 @@ fn content_type(headers: &HeaderMap) -> String {
     raw[..end].trim().go_lower()
 }
 
-/// `videosCreateRequestFromForm` over gin's `c.PostForm` (multipart values, or the
-/// urlencoded body; a form that fails to parse has no values).
-fn create_request_from_form(headers: &HeaderMap, body: &[u8]) -> Vec<u8> {
+/// `videosCreateRequestFromForm` over gin's `c.PostForm`: the multipart values or the
+/// urlencoded body. A form that fails to parse is Go's `ParseMultipartForm` or
+/// `ParseForm` error, which also covers the URL query. `limit` is the request's body
+/// limit; without one, Go reads at most 10 MB of a urlencoded body.
+fn create_request_from_form(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    body: &[u8],
+    limit: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    use cpa_exec::openai_compat_multipart::{MediaType, parse_media_type};
     let raw_type = headers
         .get(header::CONTENT_TYPE)
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
         .unwrap_or_default();
-    let form = multipart_form(&raw_type, body).ok();
+    let query_error = crate::access::query_error(query.unwrap_or_default().as_bytes());
+    let form = if content_type(headers) == "multipart/form-data" {
+        let form = multipart_form(&raw_type, body)?;
+        if let Some(e) = query_error {
+            return Err(e);
+        }
+        Some(form)
+    } else {
+        // Go `parsePostForm`: [`create`] answers an unusable media type before reading
+        // the body; a bad parameter still reads it, so the size error wins over it.
+        let error = match parse_media_type(&raw_type) {
+            MediaType::Invalid(reason) => return Err(reason.into()),
+            MediaType::BadParams(_) => Some("mime: invalid media parameter".to_owned()),
+            MediaType::Ok(..) => None,
+        };
+        const MAX_FORM: usize = 10 << 20;
+        // ponytail: Go also caps a limited body at 10 MB when request logging has
+        // replaced it before the handler; matching that needs the capture state here.
+        if limit.is_none() && body.len() > MAX_FORM {
+            return Err("http: POST too large".into());
+        }
+        if let Some(e) = error.or_else(|| crate::access::query_error(body)).or(query_error) {
+            return Err(e);
+        }
+        None
+    };
     let encoded = String::from_utf8_lossy(body).into_owned();
-    let urlencoded = content_type(headers) == "application/x-www-form-urlencoded";
     let post_form = |key: &str| -> String {
         match &form {
             Some(form) => form.value(key),
-            None if urlencoded => crate::access::query_get(&encoded, key)
+            None => crate::access::query_get(&encoded, key)
                 .map(|v| String::from_utf8_lossy(&v).into_owned())
                 .unwrap_or_default(),
-            None => String::new(),
         }
     };
     let first = |keys: &[&str]| {
@@ -402,7 +433,7 @@ fn create_request_from_form(headers: &HeaderMap, body: &[u8]) -> Vec<u8> {
             gj::set_str(&mut out, "reference_image_urls.-1", reference);
         }
     }
-    out
+    Ok(out)
 }
 
 // --- responses ----------------------------------------------------------------------------
@@ -810,22 +841,52 @@ pub async fn create(
     matched: Option<MatchedPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    limit: crate::body_limit::Limit,
+    client_request: axum::extract::Request,
 ) -> Response {
-    let raw = match content_type(&headers).as_str() {
-        "multipart/form-data" | "application/x-www-form-urlencoded" => match &body {
-            Ok(body) => Ok(create_request_from_form(&headers, body)),
-            Err(rejection) => Err(rejection.body_text()),
+    use axum::extract::FromRequest as _;
+    use cpa_exec::openai_compat_multipart::{MediaType, parse_media_type};
+    // Go answers these form types without reading the body: `parsePostForm` an unusable
+    // urlencoded media type, `ParseMultipartForm` a multipart type or boundary it refuses.
+    let raw_type = headers
+        .get(header::CONTENT_TYPE)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .unwrap_or_default();
+    let refused = match content_type(&headers).as_str() {
+        "application/x-www-form-urlencoded" => match parse_media_type(&raw_type) {
+            MediaType::Invalid(reason) => Some(reason.to_owned()),
+            _ => None,
         },
-        _ => match &body {
-            Ok(body) if gj::std_valid(body) => Ok(body.to_vec()),
-            Ok(_) => Err("body must be valid JSON".to_owned()),
-            Err(rejection) => Err(rejection.body_text()),
-        },
+        "multipart/form-data" => crate::images::multipart_boundary(&raw_type).err(),
+        _ => None,
+    };
+    if let Some(reason) = refused {
+        return failed(400, XAI_MODEL, &format!("Invalid request: {reason}"));
+    }
+    use crate::management::multipart::Failed;
+    let Ok(read) = crate::body_limit::Read::from_request(client_request, &()).await;
+    let body = match content_type(&headers).as_str() {
+        "multipart/form-data" => crate::management::multipart::body(read, &raw_type),
+        _ => read.body.map_err(Failed::Read),
+    };
+    let raw = match (content_type(&headers).as_str(), body) {
+        (_, Err(Failed::Read(rejection))) => Err(crate::claude::read_error(&rejection)),
+        (_, Err(Failed::Form(status, e))) => Err((status, e)),
+        ("multipart/form-data" | "application/x-www-form-urlencoded", Ok(body)) => {
+            create_request_from_form(&headers, uri.query(), &body, limit.0).map_err(|e| (400, e))
+        }
+        // Go `readVideosCreateRequest`: `ReadRequestBody`, then the JSON check.
+        (_, Ok(body)) => crate::openai::decode_body(&headers, body, limit.0).and_then(|body| {
+            if gj::std_valid(&body) {
+                Ok(body.to_vec())
+            } else {
+                Err((400, "body must be valid JSON".to_owned()))
+            }
+        }),
     };
     let raw = match raw {
         Ok(raw) => raw,
-        Err(e) => return failed(400, XAI_MODEL, &format!("Invalid request: {e}")),
+        Err((status, e)) => return failed(status, XAI_MODEL, &format!("Invalid request: {e}")),
     };
     let mut model = text(&raw, "model").trim().to_owned();
     if model.is_empty() {
@@ -875,10 +936,12 @@ pub async fn native_post(
     matched: Option<MatchedPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let body = match body {
-        Ok(body) => body,
+    let body = match body.map(|body| crate::openai::read_body(&headers, body, limit.0)) {
+        Ok(Ok(body)) => body,
+        Ok(Err(response)) => return *response,
         Err(rejection) => return read_failed(&rejection),
     };
     if !gj::std_valid(&body) {

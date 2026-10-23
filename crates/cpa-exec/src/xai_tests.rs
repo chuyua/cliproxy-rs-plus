@@ -15,6 +15,9 @@ use super::*;
 use crate::openai_compat_usage::{HttpAttempt, Logged, http_capture_problems, published};
 
 const FIXTURE: &str = include_str!("../tests/fixtures/xai_go.json");
+/// The scenarios the payload barrier changed, recorded at v8.0.35; they replace their
+/// 6fecc6e recordings.
+const FIXTURE_V8_0_35: &str = include_str!("../tests/fixtures/xai_go_v8.0.35.json");
 
 /// Shared helpers whose real port has not landed: scenarios that need them are skipped
 /// and listed, so integration can remove an entry and see the scenario run.
@@ -160,6 +163,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> ExecRequest {
         },
         source_format: source,
         response_format: response_format(s),
+        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,
@@ -176,6 +180,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> ExecRequest {
         caller: Caller {
             principal: s["caller_key"].as_str().unwrap_or_default().to_owned(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -201,7 +206,7 @@ fn redirect(url: &str, addr: &str) -> String {
 
 #[tokio::test]
 async fn go_reference_scenarios() {
-    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let fixture = crate::payload_barrier::with_v8_0_35(FIXTURE, FIXTURE_V8_0_35, "scenarios");
     let scenarios = fixture["scenarios"].as_array().unwrap();
     assert!(scenarios.len() >= 80, "fixture lost scenarios");
     // One executor for all scenarios: Go's replay cache is process-wide.
@@ -420,4 +425,123 @@ async fn empty_error_body_starts_ttft_without_first_byte() {
     assert_eq!(error.status, 500);
     let reports = recorder.0.lock().unwrap();
     assert_eq!(crate::openai_compat_usage::ttft_problem(&reports, true, false), None);
+}
+
+/// Go's TestXAISpeechRequestURLStaysOnOfficialAPI and
+/// TestXAIExecutorExecuteSpeechUpstreamErrorScope: an OAuth credential on the chat proxy
+/// still sends speech to the official `/tts`, every error keeps the upstream body, and
+/// only a 404 that names no model problem is request-scoped (an explicit request scope
+/// without upstream headers: neither rotated nor cooled).
+#[tokio::test]
+async fn speech_errors_keep_go_scope() {
+    let cases: [(u16, &str, u16, bool); 15] = [
+        (400, r#"{"error":"invalid language"}"#, 400, false),
+        (400, r#"{"error":"requested model is not supported"}"#, 400, false),
+        (404, r#"{"error":"voice not found"}"#, 404, true),
+        (
+            404,
+            r#"{"error":{"code":"model_not_found","message":"The model grok-tts does not exist"}}"#,
+            404,
+            false,
+        ),
+        (
+            404,
+            r#"{"code":"model_not_found","error":"model unavailable"}"#,
+            404,
+            false,
+        ),
+        (
+            404,
+            r#"{"error":"The model grok-tts is not available for your account"}"#,
+            404,
+            false,
+        ),
+        (404, "model is not available", 404, false),
+        (
+            404,
+            r#"{"error":{"message":"Unsupported model: grok-tts"}}"#,
+            404,
+            false,
+        ),
+        (422, r#"{"error":"text too long"}"#, 422, false),
+        (
+            422,
+            r#"{"code":"model_not_supported","error":"model is not supported"}"#,
+            422,
+            false,
+        ),
+        (401, r#"{"error":"unauthorized"}"#, 401, false),
+        (
+            403,
+            r#"{"code":"bad-credentials","error":"access token could not be validated"}"#,
+            401,
+            false,
+        ),
+        (403, r#"{"error":"forbidden"}"#, 403, false),
+        (429, r#"{"error":"rate limited"}"#, 429, false),
+        (500, r#"{"error":"boom"}"#, 500, false),
+    ];
+    let s = serde_json::json!({
+        "config_auth": -1,
+        "metadata": {"access_token": "xai-token"},
+        "attributes": {"base_url": CLI_CHAT_PROXY_BASE_URL, "auth_kind": "oauth"},
+        "op": "execute",
+        "source": "openai",
+        "payload": r#"{"text":"hello","voice_id":"nope","language":"auto"}"#,
+        "model": "grok-tts",
+    });
+    let cfg = Config::default();
+    for (status, body, want, scoped) in cases {
+        let reply =
+            serde_json::json!({"status": status, "headers": [["Content-Type", "application/json"]], "body": body});
+        let mock = Mock::start(&reply).await;
+        let (addr, target) = (mock.addr.clone(), Arc::new(Mutex::new(String::new())));
+        let seen = target.clone();
+        let executor = XaiExecutor::default().with_url_rewrite(move |url| {
+            *seen.lock().unwrap() = url.to_owned();
+            redirect(url, &addr)
+        });
+        let (_recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+        let error = executor
+            .speech(&credential(&s, &cfg), request(&s, sink), &cfg)
+            .await
+            .err()
+            .expect("an upstream error");
+        assert_eq!(*target.lock().unwrap(), format!("{DEFAULT_API_BASE_URL}/tts"));
+        assert_eq!(
+            (error.status, String::from_utf8_lossy(&error.body).as_ref()),
+            (want, body)
+        );
+        let request_scoped = error.scope == FailureScope::Request && error.headers.is_empty();
+        assert_eq!(request_scoped, scoped, "{status} {body}");
+    }
+}
+
+/// TestXAIExecutorCompactUsesCompactEndpoint (868e137): compact's deletes run before the
+/// payload rules, so a configured `top_k` survives while the deleted fields stay gone.
+#[tokio::test]
+async fn compact_keeps_a_configured_top_k() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let s = fixture["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "compact_oauth_uses_official_api")
+        .unwrap();
+    let mock = Mock::start(&s["upstream"]).await;
+    let addr = mock.addr.clone();
+    let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+    let cfg =
+        Config::parse("payload:\n  override:\n    - models: [{name: \"*\"}]\n      params: {top_k: 10}\n").unwrap();
+    let cred = credential(s, &cfg);
+    executor
+        .execute(&cred, request(s, Default::default()), &cfg, false)
+        .await
+        .unwrap();
+    let wire = mock.request().unwrap();
+    let body = wire.split_once("\r\n\r\n").unwrap().1.as_bytes().to_vec();
+    assert_eq!(gj::get(&body, "top_k").int(), 10, "{wire}");
+    for absent in ["stream", "tools", "max_output_tokens", "temperature", "top_p", "stop"] {
+        assert!(!gj::get(&body, absent).exists(), "{absent}: {wire}");
+    }
 }

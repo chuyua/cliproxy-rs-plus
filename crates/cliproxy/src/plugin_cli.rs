@@ -168,11 +168,10 @@ pub fn builtin_values(cmd: &clap::Command, matches: &clap::ArgMatches) -> Vec<(S
         .collect()
 }
 
-/// Go's `ExecuteCommandLine` step in main: applies the loaded config, then runs the
+/// Go's `ExecuteCommandLine` step in main, once the loaded config is applied: runs the
 /// plugins whose flags were given, writing their output and saving the auths they
 /// produce to the auth directory. Returns the exit code when a plugin handled the run.
-pub async fn execute(host: &Host, config: &Config, config_path: &Path, builtin: &[(String, String)]) -> Option<i32> {
-    host.apply_config(Arc::new(config.clone())).await;
+pub async fn execute(host: &Host, config_path: &Path, builtin: &[(String, String)]) -> Option<i32> {
     if !host.has_triggered_command_line_flags() {
         return None;
     }

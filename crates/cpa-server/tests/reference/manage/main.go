@@ -237,7 +237,12 @@ func runConfig(s configScenario) configScenario {
 	server := api.NewServer(cfg, coreauth.NewManager(nil, nil, nil), sdkaccess.NewManager(), path, api.WithPluginHost(pluginhost.New()))
 	for i := range s.Steps {
 		st := &s.Steps[i]
-		req := httptest.NewRequest(st.Method, "/v8/management"+st.Path, strings.NewReader(st.Body))
+		// Paths are v8 management routes unless they name their API version.
+		target := "/v8/management" + st.Path
+		if strings.HasPrefix(st.Path, "/v0/") {
+			target = st.Path
+		}
+		req := httptest.NewRequest(st.Method, target, strings.NewReader(st.Body))
 		req.RemoteAddr = "127.0.0.1:1"
 		req.Header.Set("Authorization", "Bearer fake-secret")
 		rec := httptest.NewRecorder()
@@ -747,7 +752,6 @@ type output struct {
 	YAMLMerges   []yamlMergeCase   `json:"yaml_merges"`
 	OAuthOnly    []oauthOnlyCase   `json:"oauth_only"`
 	Credentials  []credScenario    `json:"credentials"`
-	Materialized any               `json:"materialized_defaults"`
 	Config       []configScenario  `json:"config_writes"`
 	IPBytes      []ipBytesCase     `json:"client_ip_bytes"`
 	Routes       []routeScenario   `json:"routes"`
@@ -929,10 +933,6 @@ func main() {
 	} {
 		out.IPBytes = append(out.IPBytes, runIPBytes(c))
 	}
-	// Keys Go's saver adds to an otherwise untouched v8 document on any PUT/PATCH.
-	base := runConfig(configScenario{Name: "materialized", YAML: "config-version: 8\nmanagement:\n  secret-key: '$HASH'\n",
-		Steps: []configStep{{Method: http.MethodPatch, Path: "/config", Body: "{}"}}})
-	out.Materialized = base.Steps[0].File
 	out.YAMLBools = yamlBoolCases()
 	out.YAMLMerges = yamlMergeCases()
 	out.TypedScalars = typedScalarCases()
@@ -1091,6 +1091,23 @@ func main() {
 		"oauth: {providers: {codex: {live-media-relay: {enabled: false, max-sessions: -1, ice-servers: [{urls: []}]}}}}",
 		"oauth: {providers: {codex: {live-media-relay: {allow-private-remote-ips: true, disable-private-remote-ips: true}}}}",
 		"codex: {live-media-relay: {enabled: true, max-sessions: -1}}",
+		// v8.0.35 CatalogSources.Validate (internal/registry/catalog_config.go): each
+		// source is empty, an absolute local path (filepath.IsAbs) or an http(s) URL
+		// with a host; ConfigV8 UnmarshalYAML refuses the load otherwise.
+		"models: {catalog: relative.json}", "models: {catalog: ./models.json}", "models: {catalog: ~/models.json}",
+		"models: {catalog: 'ftp://example.invalid/models'}", "models: {catalog: 'file:///tmp/models.json'}", "models: {catalog: 'https:///models'}",
+		"models: {codex-catalog: relative.json}", "models: {codex-catalog: 'file:///tmp/models.json'}", "models: {codex-catalog: 'https:///models'}",
+		"models: {devin-catalog: ~/models.json}", "models: {devin-catalog: 'ftp://example.invalid/models'}", "models: {devin-catalog: 'https:///models'}",
+		"models: {}", "models: null", "models: {catalog: ''}", "models: {catalog: null}", "models: {catalog: /abs/models.json}",
+		"models: {codex-catalog: 'https://example.invalid/models.json'}", "models: {devin-catalog: 'HTTP://Example.INVALID:8080/x?y#z'}",
+		"models: {catalog: 'https://[::1]:443/x'}", "models: {catalog: 'https://:443/x'}", "models: {catalog: 'https://user@/x'}",
+		"models: {catalog: 'http://%zz/x'}", "models: {catalog: 'https://a b/x'}", "models: {catalog: 'https://example.invalid/%zz'}",
+		"models: {catalog: ' /abs/models.json'}", "models: {catalog: ' https://example.invalid/x'}", "models: {catalog: 'https://example.invalid/x '}",
+		"models: {catalog: 'c:/models.json'}", "models: {catalog: '\\\\host\\share\\m.json'}", "models: {catalog: '//host/share/m.json'}",
+		"models: {catalog: 'https:example.invalid/x'}", "models: {catalog: 'https://exa\tmple.invalid/'}", "models: {catalog: 'ws://example.invalid/x'}",
+		"models: {catalog: 'http://x[::1]'}", "models: {catalog: 'http://x[::1]:80/p'}", "models: {catalog: 'http://[::1]:80/p'}",
+		"models: {catalog: 5}", "models: {catalog: true}", "models: {catalog: [a]}", "models: []", "models: x", "models: {other: x}",
+		"config-version: 8\nmodels: {catalog: relative.json}", "config-version: 8\nmodels: {catalog: /abs/models.json, devin-catalog: 'https://h/x'}",
 	} {
 		dir, err := os.MkdirTemp("", "cpa-load-")
 		must(err)
@@ -1412,6 +1429,7 @@ func configScenarios() []configScenario {
 			put("/config/routing/retry/request-retry", `3`),
 			put("/config/routing/session-affinity-subagents", `"off"`),
 			put("/config/observability/logs/request-log", `"YES"`),
+			put("/config/upstream/xai/inject-x-search", `"on"`),
 			put("/config/routing/force-model-prefix", `"yEs"`),
 			put("/config/routing/force-model-prefix", `"true"`),
 			get("/config"),
@@ -1459,6 +1477,87 @@ func configScenarios() []configScenario {
 			put("/config.yaml", "config-version: 8\nmanagement: &m\n  secret-key: fake-secret\nrouting:\n  retry: &r {request-retry: 3}\n  <<: {strategy: fill-first}\n"),
 			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nrouting:\n  <<: 5\n"),
 			get("/config"),
+		}},
+		// JSON keys are quoted, so `<<` in a JSON body is a plain key until Go parses its
+		// own save, which writes it plain: a map then merges and a scalar is a 422 at any
+		// depth (a YAML upload's scalar merge is a 400 above).
+		// v8.0.35 7c41cd05: server.github-token, legacy root github-token. Go reads,
+		// migrates and writes it like any setting; v0 GET /config omits it (json:"-").
+		// v8.0.35 models (CatalogSources): three source strings read, written and
+		// validated like any setting; an invalid source is a 422 (ValidateV8Config).
+		{Name: "model_catalog_sources", YAML: "models:\n  catalog: /abs/models.json\n  devin-catalog: 'https://devin.example.invalid/x.json'\nremote-management:\n  secret-key: '$HASH'\n", Steps: []configStep{
+			get("/config"), get("/config/models"), get("/config/models/catalog"),
+			put("/config/routing/strategy", `"fill-first"`), get("/config.yaml"),
+			put("/config/models/codex-catalog", `"HTTPS://Codex.example.invalid/c.json"`), get("/config/models"),
+			put("/config/models/catalog", `"relative.json"`), put("/config/models/catalog", `"file:///tmp/models.json"`),
+			put("/config/models/devin-catalog", `"https:///models"`), put("/config/models/catalog", `5`),
+			put("/config/models/catalog", `"http://x[::1]:80/p"`),
+			put("/config/models/unknown", `"x"`), put("/config/models", `"x"`),
+			patch("/config/models", `{"catalog":"","devin-catalog":null}`), get("/config/models"),
+			patch("/config", `{"models":{"catalog":"~/m.json"}}`),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nmodels:\n  catalog: ./models.json\n"),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nmodels:\n  codex-catalog: /abs/codex.json\n"),
+			get("/config/models"), del("/config/models/codex-catalog"), get("/config/models"), get("/config.yaml"),
+			put("/config/models", `{"catalog":"/abs/a.json","codex-catalog":"http://h.example.invalid/c","devin-catalog":"/abs/d.json"}`),
+			del("/config/models"), get("/config/models"), get("/config.yaml"),
+			// The v0 upload decodes into Config first: a source error is its 400.
+			put("/v0/management/config.yaml", "remote-management:\n  secret-key: fake-secret\nmodels:\n  catalog: relative.json\n"),
+			put("/v0/management/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nmodels:\n  devin-catalog: 'http://x[::1]'\n"),
+			put("/v0/management/config.yaml", "remote-management:\n  secret-key: fake-secret\nmodels:\n  catalog: /abs/v0.json\n"),
+			get("/config/models"),
+		}},
+		{Name: "server_github_token", YAML: "github-token: ' fake-legacy-token '\nremote-management:\n  secret-key: '$HASH'\n", Steps: []configStep{
+			get("/config"), get("/config/server/github-token"),
+			put("/config/routing/strategy", `"fill-first"`),
+			patch("/config/server/github-token", `"fake-patched"`), get("/config/server"),
+			put("/config/server/github-token", `5`), get("/config/server/github-token"),
+			put("/config/server/github-token", `{"a":1}`),
+			patch("/config", `{"server":{"github-token":null}}`),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nserver:\n  github-token: fake-yaml-token\n"),
+			get("/config.yaml"), del("/config/server/github-token"),
+		}},
+		{Name: "merge_keys_in_json_bodies", YAML: "config-version: 8\nmanagement:\n  secret-key: '$HASH'\n", Steps: []configStep{
+			put("/config/plugins/configs/x", `{"<<":5}`),
+			put("/config/plugins/configs/x", `{"<<":{"a":1},"b":2}`),
+			get("/config/plugins"),
+			patch("/config", `{"<<":{"server":{"port":3}}}`),
+			patch("/config", `{"<<":5}`),
+			put("/config", `{"management":{"secret-key":"fake-secret"},"<<":{"server":{"port":4}}}`),
+			get("/config"),
+			// Keys already in the entry win over merged ones.
+			put("/config/plugins/configs/x", `{"a":1}`),
+			patch("/config/plugins/configs/x", `{"<<":{"a":2,"c":3}}`),
+			get("/config/plugins"),
+			// The root shape is checked before any merge.
+			put("/config", `[{"<<":5}]`),
+			patch("/config", `[{"<<":5}]`),
+		}},
+		// !!binary scalars, aliases of them included: views and save candidates see the
+		// decoded text, and a migrating save keeps the values.
+		{Name: "binary_scalars", YAML: "remote-management:\n  secret-key: \"$HASH\"\nproxy-url: !!binary aHR0cDovL3guZXhhbXBsZTo4MA==\napi-keys: [fake-client, &k !!binary ZmFrZS1iaW5hcnk=, *k]\nrequest-retry: 1\n", Steps: []configStep{
+			get("/config"), get("/config/access/api-keys"), get("/config.yaml"),
+			put("/config/routing/strategy", `"fill-first"`),
+			get("/config"),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nrequests:\n  proxy-url: &p !!binary aHR0cDovL3kuZXhhbXBsZTo4MA==\naccess:\n  api-keys: [*p, !!binary ZmFrZS11cGxvYWQ=]\n"),
+			get("/config"),
+			patch("/config", `{"routing":{"retry":{"request-retry":2}}}`),
+			get("/config"), get("/config.yaml"),
+			put("/config.yaml", "config-version: 8\nmanagement:\n  secret-key: fake-secret\nrequests:\n  proxy-url: !!binary aHR0cDovL3o=x\n"),
+			get("/config/requests"),
+			// A v0 upload checks the decoded catalog source.
+			put("/v0/management/config.yaml", "remote-management:\n  secret-key: fake-secret\nmodels:\n  catalog: !!binary aHR0cHM6Ly9jLmV4YW1wbGUvbW9kZWxzLmpzb24=\n"),
+			get("/config/models"),
+			put("/v0/management/config.yaml", "remote-management:\n  secret-key: fake-secret\nproxy-url: !!binary aHR0cDovL3o=x\n"),
+			// The root shape is checked before decoding.
+			put("/config.yaml", "!!binary '!!!'"),
+		}},
+		// Go reads a plugin's store.version from the raw node, so this pin stays
+		// base64 text (unpinned) there, and a migrating save that drops the anchor's
+		// unknown section keeps the tag. cliproxy-rs refuses the file.
+		{Name: "binary_plugin_pin", YAML: "remote-management:\n  secret-key: \"$HASH\"\npin: &v !!binary MS4yLjM=\nplugins:\n  configs:\n    x:\n      store:\n        version: *v\n", Steps: []configStep{
+			get("/config/plugins"),
+			put("/config/routing/strategy", `"fill-first"`),
+			get("/config/plugins"), get("/config.yaml"),
 		}},
 	}
 }
@@ -1591,6 +1690,50 @@ func credScenarios() []credScenario {
 			call(http.MethodPost, "/credentials/refresh", `{"name":"missing.json"}`),
 			call(http.MethodDelete, "/credentials?all=true", ""),
 			get("/credentials"),
+		},
+	}, {
+		// Go's store rewrites a saved auth file as json.Marshal of its metadata: keys
+		// sorted at every level, HTML escaped, numbers from the file as float64 and
+		// patched ones as written; an equal document leaves the file alone. Codex saves
+		// keep the disk's credentials when it holds a login.
+		Name: "save_bytes",
+		YAML: "remote-management:\n  secret-key: '$HASH'\nauth-dir: $AUTH\n",
+		Files: map[string]string{
+			"raw-plain.json":       "{\"type\":\"claude\",\"email\":\"p@example.invalid\",\"z\":{\"b\":1.50,\"a\":\"<x&y>\"},\"n\":1e2,\"big\":12345678901234567890123,\"sep\":\"\u2028\",\"proxy-url\":\"http://p.example.invalid\",\"disabled\":false}\n",
+			"raw-same.json":        "{\n  \"type\": \"claude\",\n  \"disabled\": false,\n  \"n\": 1.0\n}\n",
+			"raw-codex.json":       `{"type":"codex","email":"c@example.invalid","refresh_token":"fake-rt","access_token":"fake-at","account_id":"acc","note":"x"}`,
+			"raw-codex-blank.json": `{"type":"codex","email":"d@example.invalid","access_token":"","note":"x"}`,
+			// Loaded at startup: Go holds these numbers as float64, correctly rounded.
+			"raw-reload.json": `{"type":"claude","disabled":false,"big":18446744073709553665,"request_retry":9007199254740993,"x":0}`,
+		},
+		Steps: []credStep{
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-same.json","disabled":false}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-plain.json","disabled":true}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-plain.json","obj":{"z":1,"a":{"y":"<&>","b":2.50}},"num":1e2,"dec":1.50,"huge":123456789012345678901234567890,"neg":-0,"meta.inner":"\u2028\ud800","priority":5}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-codex.json","note":"n2","access_token":"fake-changed","plan_type":"pro"}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-codex.json","disabled":true}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-codex-blank.json","access_token":"fake-new","id_token":"fake-id","note":"y"}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-same.json","disabled":true}`),
+			// The record's flag is what the file gets, whatever the patch sent.
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-plain.json","disabled":"false"}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-same.json","disabled":null}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-codex-blank.json","disabled.x":1}`),
+			// Patched numbers keep the form they were sent in through later saves, until
+			// a new patch sends the same value in another form.
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-plain.json","num":100}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-plain.json","disabled":true}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-reload.json","disabled":true}`),
+			// 0 and -0 are equal documents, so the file is left alone; Go's metadata now
+			// holds -0, which the next save writes.
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-reload.json","x":-0}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-reload.json","disabled":false}`),
+			// Handler-owned values: a non-string headers value as decoded, request_retry
+			// as the decoded int.
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-reload.json","headers":{"x":1e2}}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-reload.json","request_retry":9007199254740993}`),
+			call(http.MethodPatch, "/credentials/status", `{"name":"raw-reload.json","disabled":true}`),
+			call(http.MethodPatch, "/credentials/fields", `{"name":"raw-codex-blank.json","disabled":"true"}`),
+			get("/credentials?name=raw-codex-blank.json"),
 		},
 	}, {
 		Name: "api_call_and_usage", Echo: true,

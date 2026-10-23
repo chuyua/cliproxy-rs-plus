@@ -7,6 +7,7 @@
 //! [`init`] installs the subscriber once; [`configure`] applies a config snapshot
 //! and acts only on the settings that changed, as Go's reload does.
 
+use cpa_core::gostr::GoStr;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -272,7 +273,7 @@ fn set_level(enabled: bool) {
         return;
     }
     let _ = handle.modify(|level| *level = next);
-    let name = |l: LevelFilter| l.to_string().to_lowercase();
+    let name = |l: LevelFilter| l.to_string().go_lower();
     tracing::info!(
         "log level changed from {} to {} (debug={})",
         name(current),
@@ -384,7 +385,7 @@ pub(crate) fn enforce_size_limit(
             let filename = entry.file_name();
             let name = filename.to_string_lossy();
             let normal_log = scan_dir == dir && {
-                let name = name.trim().to_lowercase();
+                let name = name.trim().go_lower();
                 name.ends_with(".log") || name.ends_with(".log.gz")
             };
             let process_file = process_log.as_ref().is_some_and(|path| {

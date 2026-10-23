@@ -1,6 +1,6 @@
 # Payload and custom header goldens
 
-`../../fixtures/payload_go.json` holds outputs of CLIProxyAPI at `6fecc6e`, produced
+`../../fixtures/payload_go.json` holds outputs of CLIProxyAPI v8.0.35 (`ae3ee3be`), produced
 in-process by `main.go` from real Go code only:
 
 - `payload`: `helps.ApplyPayloadConfigWithTrackedPathsForExecutor` over the rule set in
@@ -16,7 +16,7 @@ Regenerate with a temporary module inside the reference module's internal-packag
 boundary (the reference checkout is not modified):
 
 ```sh
-reference=/absolute/path/to/CLIProxyAPI   # at 6fecc6e
+reference=/absolute/path/to/CLIProxyAPI   # at ae3ee3be
 crate=/absolute/path/to/cliproxy-rs/crates/cpa-common
 tmp=$(mktemp -d)
 cp "$crate/tests/reference/payload/main.go" "$tmp/main.go"

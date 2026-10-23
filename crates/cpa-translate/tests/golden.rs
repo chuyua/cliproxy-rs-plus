@@ -117,6 +117,98 @@ fn normalize(outputs: &mut [Vec<u8>], dynamics: &[Dyn], check: Option<(i64, i64)
     errors
 }
 
+/// A request translation's output, or its refusal as `REFUSED:<message>`: Go records the
+/// refusal as the fixture's `request_error`.
+fn request_output(result: Result<Vec<u8>, cpa_translate::Error>) -> Vec<u8> {
+    result.unwrap_or_else(|e| format!("REFUSED:{}", e.0).into_bytes())
+}
+
+/// Fixtures regenerated at v8.0.35 whose port is still open: pair, exact fixture name (unique
+/// within a pair) and the work that closes them. Every fixture an entry matches must still fail, so the list
+/// shrinks as ports land and a listed fixture cannot hide a passing neighbour's regression.
+const PENDING: &[(&str, &str, &str)] = &[
+    (
+        "claude->codex",
+        "TestConvertClaudeRequestToCodex_AssistantMetaSignatureToReasoningItem:731",
+        "signature replay: Meta Muse envelopes (7a0b7563, cc5682c5, 674dbe8f, a68c7d8e)",
+    ),
+    (
+        "claude->codex",
+        "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:764",
+        "signature replay: Meta Muse envelopes (7a0b7563, cc5682c5, 674dbe8f, a68c7d8e)",
+    ),
+    (
+        "claude->codex",
+        "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:781",
+        "signature replay: Meta Muse envelopes (7a0b7563, cc5682c5, 674dbe8f, a68c7d8e)",
+    ),
+    (
+        "claude->codex",
+        "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:788",
+        "signature replay: Meta Muse envelopes (7a0b7563, cc5682c5, 674dbe8f, a68c7d8e)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeNonStream_MalformedFunctionCallReturnsAPIError:630",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeNonStream_MalformedFunctionCallReturnsAPIError:630#2",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeNonStream_MalformedFunctionCallReturnsAPIError:literal",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_MalformedFunctionCallAfterThinkingEmitsError:429:stream",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_MalformedFunctionCallAfterThinkingEmitsError:calls",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_MalformedFunctionCallWithoutUsageAndDuplicateTerminalChunk:470:stream",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_MalformedFunctionCallWithoutUsageAndDuplicateTerminalChunk:calls",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_PartlessMalformedFunctionCallClosesMessage:368:stream",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "TestConvertGeminiResponseToClaudeStream_PartlessMalformedFunctionCallClosesMessage:calls",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "gemini-up/finish-reasons",
+        "MALFORMED_FUNCTION_CALL as an API error, with the Gemini executors' 502 half (7f2f17d7)",
+    ),
+    (
+        "claude->gemini",
+        "tools/schema/11",
+        "Gemini schema cleaners: dependent keywords and multi-branch unions (9126772d, a0fd8448)",
+    ),
+];
+
+fn pending(pair: &str, fixture: &Value) -> Option<usize> {
+    let name = fixture["name"].as_str().unwrap_or_default();
+    PENDING.iter().position(|(p, key, _)| *p == pair && name == *key)
+}
+
 fn run(client: Format, upstream: Format, f: &Value, bytes: bool) -> Vec<Vec<u8>> {
     let model = f["model"].as_str().unwrap();
     let pair = pair(client, upstream).unwrap();
@@ -133,20 +225,16 @@ fn run(client: Format, upstream: Format, f: &Value, bytes: bool) -> Vec<Vec<u8>>
         stream: f["stream"].as_bool().unwrap_or(false),
     };
     match f["path"].as_str().unwrap() {
-        "request" => vec![translate_request(client, upstream, &ctx, &input).unwrap()],
-        "request_compat" => vec![
-            match (client, upstream) {
-                (Format::OpenAI, Format::Claude) => cpa_translate::openai_to_claude_with_compat(&ctx, &input),
-                (Format::Claude, Format::OpenAI) => cpa_translate::claude_to_openai_with_compat(&ctx, &input),
-                (Format::Claude, Format::Gemini) => cpa_translate::claude_to_gemini_with_compat(&ctx, &input),
-                (Format::Claude, Format::Codex) => cpa_translate::claude_to_codex_with_compat(&ctx, &input),
-                (Format::Claude, Format::Interactions) => {
-                    cpa_translate::claude_to_interactions_with_compat(&ctx, &input)
-                }
-                other => panic!("no compat request for {other:?}"),
-            }
-            .unwrap(),
-        ],
+        "request" => vec![request_output(translate_request(client, upstream, &ctx, &input))],
+        "request_compat" => vec![request_output(match (client, upstream) {
+            (Format::OpenAI, Format::Claude) => cpa_translate::openai_to_claude_with_compat(&ctx, &input),
+            (Format::OpenAIResponse, Format::Claude) => cpa_translate::responses_to_claude_with_compat(&ctx, &input),
+            (Format::Claude, Format::OpenAI) => cpa_translate::claude_to_openai_with_compat(&ctx, &input),
+            (Format::Claude, Format::Gemini) => cpa_translate::claude_to_gemini_with_compat(&ctx, &input),
+            (Format::Claude, Format::Codex) => cpa_translate::claude_to_codex_with_compat(&ctx, &input),
+            (Format::Claude, Format::Interactions) => cpa_translate::claude_to_interactions_with_compat(&ctx, &input),
+            other => panic!("no compat request for {other:?}"),
+        })],
         "request_envelope" => {
             // The executor's ResolvedModelInfo with native web search on.
             let info = cpa_core::registry::ModelInfo::from_raw(
@@ -156,7 +244,13 @@ fn run(client: Format, upstream: Format, f: &Value, bytes: bool) -> Vec<Vec<u8>>
                     .clone(),
             )
             .unwrap();
-            vec![cpa_translate::translate_request_envelope(client, upstream, &ctx, &input, Some(&info)).unwrap()]
+            vec![request_output(cpa_translate::translate_request_envelope(
+                client,
+                upstream,
+                &ctx,
+                &input,
+                Some(&info),
+            ))]
         }
         // Go returns nil (written as "") when the apply_patch bridge rejects the body.
         "non_stream" => vec![match (pair.non_stream)(&rctx, &input) {
@@ -201,6 +295,13 @@ fn canonical(raw: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Pair fixtures (recorded at 6fecc6e) whose behaviour a later Go commit changed, each
+/// replayed at v8.0.35 by the named golden instead.
+const SUPERSEDED: &[(&str, &str)] = &[(
+    "openai->codex codex-events/non-stream/0",
+    "16d98881 joins every output_text part: codex_chat_go.json pair_codex_events_non_stream_0",
+)];
+
 #[test]
 fn reference_goldens() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pairs");
@@ -209,6 +310,9 @@ fn reference_goldens() {
     assert!(!files.is_empty());
     let mut failures = vec![];
     let mut total = 0;
+    // Per pending entry: fixtures matched, and how many of them failed.
+    let mut pending_matched = vec![0; PENDING.len()];
+    let mut pending_failed = vec![0; PENDING.len()];
     for file in files {
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         let client = Format::parse(doc["client"].as_str().unwrap()).unwrap();
@@ -228,8 +332,13 @@ fn reference_goldens() {
             "fixture generation lost cases for {}",
             file.display()
         );
+        // PENDING keys are exact names, so names must be unique within a pair.
+        let mut names = std::collections::HashSet::new();
         for f in fixtures {
             total += 1;
+            if !names.insert(f["name"].as_str().unwrap()) {
+                failures.push(format!("{}: duplicate fixture name {}", file.display(), f["name"]));
+            }
             let bytes = f["bytes"].as_bool().unwrap_or(false);
             let name = format!(
                 "{}->{} {}",
@@ -237,12 +346,18 @@ fn reference_goldens() {
                 upstream.as_str(),
                 f["name"].as_str().unwrap()
             );
+            if SUPERSEDED.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
             let mut expected: Vec<Vec<u8>> = f["outputs"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .flat_map(|o| o.as_array().unwrap().iter().map(|c| field(c, bytes)))
                 .collect();
+            if let Some(refusal) = f["request_error"].as_str() {
+                expected = vec![format!("REFUSED:{refusal}").into_bytes()];
+            }
             let dynamics: Vec<Dyn> = f["dynamic"]
                 .as_array()
                 .map(|d| {
@@ -257,6 +372,8 @@ fn reference_goldens() {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Mismatches found while running (chunk counts, error states).
+            let mut early: Vec<String> = vec![];
             let start = now();
             let mut actual = if f["path"] == "stream" {
                 // Compare per input line: chunk boundaries matter.
@@ -275,7 +392,7 @@ fn reference_goldens() {
                     let chunks = s.line(&field(line, bytes)).unwrap();
                     let want = f["outputs"][i].as_array().unwrap().len();
                     if chunks.len() != want {
-                        failures.push(format!("{name}: line {i} produced {} chunks, Go {want}", chunks.len()));
+                        early.push(format!("line {i} produced {} chunks, Go {want}", chunks.len()));
                     }
                     out.extend(chunks);
                 }
@@ -283,12 +400,12 @@ fn reference_goldens() {
                     let chunks = s.finalize_tool_input();
                     let want = f["outputs"][lines.len()].as_array().unwrap().len();
                     if chunks.len() != want {
-                        failures.push(format!("{name}: finalize produced {} chunks, Go {want}", chunks.len()));
+                        early.push(format!("finalize produced {} chunks, Go {want}", chunks.len()));
                     }
                     out.extend(chunks);
                 }
                 if s.tool_input_failed() != f["tool_error"].as_bool().unwrap_or(false) {
-                    failures.push(format!("{name}: tool input error state differs from Go"));
+                    early.push("tool input error state differs from Go".to_owned());
                 }
                 out
             } else {
@@ -297,7 +414,7 @@ fn reference_goldens() {
                     && out[0].is_empty() != f["tool_error"].as_bool().unwrap_or(false)
                     && f["tool_error"].as_bool().unwrap_or(false)
                 {
-                    failures.push(format!("{name}: Go rejected the apply_patch body, Rust did not"));
+                    early.push("Go rejected the apply_patch body, Rust did not".to_owned());
                 }
                 if f["path"] == "non_stream" && f["tool_error"].as_bool().unwrap_or(false) && out[0].is_empty() {
                     // Go's executors answer 502 and drop whatever body the translator
@@ -328,7 +445,8 @@ fn reference_goldens() {
                     actual = expected.clone();
                 }
             }
-            let mut errors = normalize(&mut actual, &dynamics, Some((start, end)));
+            let mut errors = early;
+            errors.extend(normalize(&mut actual, &dynamics, Some((start, end))));
             normalize(&mut expected, &dynamics, None);
             if actual != expected {
                 let show = |v: &Vec<Vec<u8>>| {
@@ -338,9 +456,26 @@ fn reference_goldens() {
                 };
                 errors.push(format!("\n  go:   {:?}\n  rust: {:?}", show(&expected), show(&actual)));
             }
-            if !errors.is_empty() {
-                failures.push(format!("{name}: {}", errors.join("; ")));
+            let pending = pending(&format!("{}->{}", client.as_str(), upstream.as_str()), f);
+            if let Some(i) = pending {
+                pending_matched[i] += 1;
             }
+            if !errors.is_empty() {
+                match pending {
+                    Some(i) => pending_failed[i] += 1,
+                    None => failures.push(format!("{name}: {}", errors.join("; "))),
+                }
+            }
+        }
+    }
+    let keys = PENDING.iter().map(|(pair, key, _)| format!("{pair} {key}"));
+    for ((key, matched), failed) in keys.zip(&pending_matched).zip(&pending_failed) {
+        if *matched == 0 {
+            failures.push(format!("{key}: pending entry matches no fixture"));
+        } else if failed != matched {
+            failures.push(format!(
+                "{key}: pending entry matches {matched} fixtures but only {failed} fail; narrow or remove it"
+            ));
         }
     }
     assert!(

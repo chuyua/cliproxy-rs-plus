@@ -1,6 +1,7 @@
 //! Home client errors. `Display` reproduces Go's error text: several of these reach
 //! clients verbatim inside auth error messages (`home auth not found`).
 
+use cpa_core::gostr::GoStr;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,20 +75,20 @@ impl Error {
 
     /// Go `isHomeCommandUnsupported`: Home rejected a command it does not implement.
     pub fn is_command_unsupported(&self) -> bool {
-        let message = self.to_string().trim().to_lowercase();
+        let message = self.to_string().trim().go_lower();
         message.contains("unknown command") || message.contains("unsupported command")
     }
 
     /// Go `IsMembershipTakeoverUnavailableError`.
     pub fn is_membership_takeover_unavailable(&self) -> bool {
-        let message = self.to_string().trim().to_lowercase();
+        let message = self.to_string().trim().go_lower();
         message == "membership_takeover_unavailable" || message == "err membership_takeover_unavailable"
     }
 
     /// Go `IsLegacyMembershipProtocolError`: an old Home rejected the membership
     /// arguments of `SUBSCRIBE`.
     pub fn is_legacy_membership_protocol(&self) -> bool {
-        let message = self.to_string().trim().to_lowercase();
+        let message = self.to_string().trim().go_lower();
         message == "wrong number of arguments for 'subscribe' command"
             || message == "err wrong number of arguments for 'subscribe' command"
     }

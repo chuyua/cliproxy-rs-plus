@@ -90,3 +90,124 @@ fn validate_manifest_urls(manifest: &Manifest) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Go internal/pluginstore/home_sync_test.go. Rust zeroes a `Secret` when it is
+    //! dropped, so Go's explicit `Clear` checks have no counterpart here.
+
+    use super::*;
+    use crate::gojson;
+    use crate::store::{Artifact, InstallPlan, Secret};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn now() -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::Utc::now().fixed_offset()
+    }
+
+    fn response(url: &str, auth: Vec<ResolvedAuthConfig>) -> PluginSyncResponse {
+        PluginSyncResponse {
+            schema_version: PLUGIN_SYNC_SCHEMA_VERSION,
+            expires_at: GoTime(Some(now() + chrono::Duration::minutes(1))),
+            items: vec![PluginSyncItem {
+                manifest: Manifest {
+                    schema_version: 2,
+                    id: "sample".into(),
+                    version: "1.0.0".into(),
+                    install: InstallPlan {
+                        install_type: "direct".into(),
+                        artifacts: vec![Artifact {
+                            goos: "linux".into(),
+                            goarch: "amd64".into(),
+                            url: url.into(),
+                            sha256: SHA.into(),
+                            size: 0,
+                        }],
+                    },
+                    ..Default::default()
+                },
+                auth,
+            }],
+        }
+    }
+
+    fn bearer(matches: &str, apply_to: &[&str]) -> Vec<ResolvedAuthConfig> {
+        vec![ResolvedAuthConfig {
+            matches: matches.into(),
+            apply_to: apply_to.iter().map(|s| s.to_string()).collect(),
+            auth_type: "bearer".into(),
+            token: Secret(b"temporary-token".to_vec()),
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn plugin_sync_response_validates_and_clears_resolved_auth() {
+        let response = response(
+            "https://downloads.example/sample.zip",
+            bearer("https://downloads.example/", &[]),
+        );
+        response.validate(now()).unwrap();
+    }
+
+    #[test]
+    fn plugin_sync_response_json_keeps_secrets_out_of_plain_text() {
+        let response = PluginSyncResponse {
+            schema_version: PLUGIN_SYNC_SCHEMA_VERSION,
+            expires_at: GoTime(Some(now() + chrono::Duration::minutes(1))),
+            items: vec![PluginSyncItem {
+                auth: vec![ResolvedAuthConfig {
+                    token: Secret(b"temporary-token".to_vec()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let raw = gojson::to_vec(&response);
+        assert!(!String::from_utf8_lossy(&raw).contains("temporary-token"));
+        let decoded: PluginSyncResponse = gojson::from_slice(&raw).unwrap();
+        assert_eq!(decoded.items[0].auth[0].token.0, b"temporary-token");
+    }
+
+    #[test]
+    fn plugin_sync_response_rejects_expired_plan() {
+        let response = PluginSyncResponse {
+            schema_version: PLUGIN_SYNC_SCHEMA_VERSION,
+            expires_at: GoTime(Some(now() - chrono::Duration::seconds(1))),
+            items: Vec::new(),
+        };
+        assert!(response.validate(now()).is_err());
+    }
+
+    #[test]
+    fn plugin_sync_response_rejects_insecure_resolved_auth_match() {
+        let response = response(
+            "https://downloads.example/sample.zip",
+            bearer("http://downloads.example/", &[]),
+        );
+        assert!(response.validate(now()).is_err());
+    }
+
+    #[test]
+    fn plugin_sync_response_rejects_http_artifact() {
+        let response = response("http://downloads.example/sample.zip", Vec::new());
+        assert!(response.validate(now()).is_err());
+    }
+
+    #[test]
+    fn plugin_sync_response_rejects_http_artifact_with_resolved_auth() {
+        let response = response(
+            "http://downloads.example/sample.zip",
+            bearer("https://downloads.example/", &[crate::store::REQUEST_KIND_ARTIFACT]),
+        );
+        assert!(response.validate(now()).is_err());
+    }
+
+    #[test]
+    fn plugin_sync_response_rejects_artifact_url_credentials() {
+        let response = response("https://user:password@downloads.example/sample.zip", Vec::new());
+        let error = response.validate(now()).unwrap_err();
+        assert!(!error.contains("password"), "{error}");
+    }
+}

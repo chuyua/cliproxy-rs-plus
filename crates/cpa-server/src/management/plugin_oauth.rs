@@ -5,6 +5,7 @@
 //! `/v8/management/oauth/auth-url?provider=<provider>`, the callback is written where
 //! the plugin reads it, and polling the status saves the auths it returns.
 
+use cpa_core::gostr::GoStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use super::plugins::{go_query, map_json};
 
 /// Go `NormalizePluginOAuthCallbackProvider`: lowercase letters, digits and `-`.
 pub(super) fn normalize_provider(provider: &str) -> Option<String> {
-    let p = provider.trim().to_lowercase();
+    let p = provider.trim().go_lower();
     (!p.is_empty()
         && p.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))

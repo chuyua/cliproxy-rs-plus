@@ -804,6 +804,50 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     }
 }
 
+/// Go `ParsePluginExecutorResponseUsage`: a plugin executor's buffered response in its
+/// output protocol; an unknown protocol reads as OpenAI.
+pub fn parse_plugin_body(protocol: &str, payload: &[u8]) -> Detail {
+    if payload.is_empty() {
+        return Detail::default();
+    }
+    match protocol.trim().go_lower().as_str() {
+        // Go `parseClaudePayloadUsage`: `usage`, else `message.usage`, of a valid body.
+        "claude" => {
+            if !gj::valid(payload) {
+                return Detail::default();
+            }
+            let node = first(&gj::parse(payload), &["usage", "message.usage"]);
+            if node.exists() {
+                parse_claude_node(&node)
+            } else {
+                Detail::default()
+            }
+        }
+        "gemini" => parse_gemini(payload),
+        "interactions" | "interactions-response" => parse_interactions(payload),
+        "antigravity" => parse_body(Format::Antigravity, payload),
+        // Go `parseResponsesPluginExecutorUsage`: an event's `response.usage`, else a
+        // completed object's top-level usage; a tier alone hides neither.
+        "codex" | "openai-response" => {
+            let codex = parse_codex(payload);
+            if let Some(d) = codex.as_ref().filter(|d| has_tokens(d)) {
+                return d.clone();
+            }
+            let mut openai = parse_openai(payload);
+            if has_tokens(&openai) {
+                if openai.response_service_tier.is_empty()
+                    && let Some(d) = &codex
+                {
+                    openai.response_service_tier = d.response_service_tier.clone();
+                }
+                return openai;
+            }
+            codex.unwrap_or(openai)
+        }
+        _ => parse_openai(payload),
+    }
+}
+
 /// Go `StreamUsageBuffer`, fed line by line in one format the way that format's Go
 /// executor feeds it.
 #[derive(Debug, Default)]
@@ -940,6 +984,43 @@ impl StreamUsage {
                     self.observe(d);
                 }
             }
+        }
+    }
+
+    /// Go `ObservePluginExecutorStreamUsage` for one trimmed line of a plugin
+    /// executor's stream in its output protocol; an unknown protocol reads as OpenAI.
+    pub fn plugin_line(&mut self, protocol: &str, line: &[u8]) {
+        match protocol.trim().go_lower().as_str() {
+            "claude" => {
+                if let Some(d) = parse_claude_stream(line) {
+                    self.observe_merged(d);
+                }
+            }
+            "gemini" => {
+                if let Some(d) = parse_gemini_stream(line) {
+                    self.observe(d);
+                }
+            }
+            "interactions" | "interactions-response" => {
+                if let Some(d) = parse_interactions_stream(line) {
+                    self.observe_merged(d);
+                }
+            }
+            "antigravity" => {
+                if let Some(d) = parse_antigravity_stream(line) {
+                    self.observe(d);
+                }
+            }
+            // A tier without `response.usage` is not token usage: a completed object's
+            // top-level usage still counts.
+            "codex" | "openai-response" => {
+                if let Some(d) = json_payload(line).and_then(parse_codex).filter(has_tokens) {
+                    self.observe(d);
+                    return;
+                }
+                self.observe_openai(line);
+            }
+            _ => self.observe_openai(line),
         }
     }
 
@@ -1118,7 +1199,7 @@ impl ResponseModel {
 
 /// Go `normalizeModelName`: lower case without the thinking suffix.
 fn normalize_model_name(model: &str) -> String {
-    let lower = model.trim().to_lowercase();
+    let lower = model.trim().go_lower();
     cpa_common::thinking::parse_suffix(&lower).model_name.trim().to_owned()
 }
 
@@ -1257,6 +1338,8 @@ pub struct Client {
     pub endpoint: String,
     /// The matched client key (Go gin `userApiKey`).
     pub api_key: String,
+    /// The access provider that accepted it (Go gin `accessProvider`, 37fe2608).
+    pub access_provider: String,
 }
 
 /// One attempt's record before Go's queue normalization (Go `usage.Record` as the
@@ -1422,6 +1505,27 @@ fn sessions(client: &Client) -> (String, String) {
 }
 
 /// Go `usageQueuePlugin.HandleUsage`: the queued `queuedUsageDetail` JSON.
+/// Go `usage.APIKeyFromContext` for a Home 401 record from a handler whose context
+/// derives from the request's (Alpha Search, the live handlers): the key the access
+/// middleware set wins; otherwise the key this request's Home pick authenticated
+/// (`setHomeUserAPIKeyOnGinContext`).
+pub(crate) fn home_unauthorized_key(principal: &str, home_key: &str) -> String {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        home_key.trim()
+    } else {
+        principal
+    }
+    .to_owned()
+}
+
+/// Go `usage.IsNativeAccessProvider`: CPA's own client-key providers.
+pub(crate) fn is_native_access_provider(provider: &str) -> bool {
+    use cpa_common::gostr::GoStr;
+    let provider = provider.trim();
+    provider.go_eq_fold("config-inline") || provider.go_eq_fold("config-api-key")
+}
+
 pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     let or = |v: &str, d: &str| -> String {
         let v = v.trim();
@@ -1540,6 +1644,8 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     w.str("endpoint", client.endpoint.trim());
     w.str("auth_type", &auth_type);
     w.str("api_key", client.api_key.trim());
+    w.bool("is_native_key", is_native_access_provider(&client.access_provider));
+    w.opt_str("access_provider", client.access_provider.trim());
     w.str("request_id", request_id);
     w.opt_str("execution_id", &execution_id);
     w.opt_str("trace_id", request_id);
@@ -1670,7 +1776,7 @@ pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
 // ponytail: Codex attempts over the upstream WebSocket report `CodexExecutor`; Go
 // names them `CodexWebsocketsExecutor`.
 fn executor_identity(c: &cpa_core::credential::Credential) -> (String, &'static str) {
-    let provider = c.provider.trim().to_lowercase();
+    let provider = c.provider.trim().go_lower();
     let executor = match provider.as_str() {
         "claude" => "ClaudeExecutor",
         "codex" => "CodexExecutor",
@@ -1818,6 +1924,8 @@ struct Reported {
     discarded: bool,
     exchange: Exchange,
     claude_cache: Option<cpa_core::exec::ClaudeCacheTelemetry>,
+    /// The plugin executor's provider when a plugin runs the attempt.
+    plugin_provider: Option<String>,
 }
 
 impl Reported {
@@ -1840,12 +1948,13 @@ impl Observer {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn settle(&self, failed: bool, status: i64, body: &str) {
+    /// `keep_usage`: a failure that keeps the usage reported so far.
+    fn settle(&self, failed: bool, keep_usage: bool, status: i64, body: &str) {
         let mut r = self.lock();
         if r.outcome.is_some() {
             return;
         }
-        let detail = if failed {
+        let detail = if failed && !keep_usage {
             Detail::default()
         } else {
             r.usage().unwrap_or_default()
@@ -1885,6 +1994,28 @@ impl cpa_core::exec::UsageObserver for Observer {
         r.model.observe(line, &self.provider);
     }
 
+    fn plugin_executor(&self, provider: &str) {
+        self.lock().plugin_provider = Some(provider.to_owned());
+    }
+
+    fn plugin_response_body(&self, protocol: &str, body: &[u8]) {
+        let mut r = self.lock();
+        r.seen = true;
+        r.body = Some(parse_plugin_body(protocol, body));
+    }
+
+    fn plugin_response_line(&self, protocol: &str, line: &[u8]) {
+        let mut r = self.lock();
+        r.seen = true;
+        r.stream.plugin_line(protocol, line);
+        // Go `ObserveResponseModel` on each chunk (the TTFT observers) and the stream
+        // buffer's own model, for the executor's provider.
+        let Reported {
+            model, plugin_provider, ..
+        } = &mut *r;
+        model.observe(line, plugin_provider.as_deref().unwrap_or(&self.provider));
+    }
+
     fn request(&self, format: Format, payload: &[u8]) {
         self.request_for(format.as_str(), payload);
     }
@@ -1920,11 +2051,15 @@ impl cpa_core::exec::UsageObserver for Observer {
     }
 
     fn publish(&self) {
-        self.settle(false, 0, "");
+        self.settle(false, false, 0, "");
     }
 
     fn publish_failure(&self, status: u16, body: &str) {
-        self.settle(true, i64::from(status), body);
+        self.settle(true, false, i64::from(status), body);
+    }
+
+    fn publish_failure_with_usage(&self, status: u16, body: &str) {
+        self.settle(true, true, i64::from(status), body);
     }
 
     fn usage_required(&self) {
@@ -2130,6 +2265,11 @@ impl Tracker {
         // Keep the returned TTL buckets as observations, not inferred accounting.
         let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));
         let mut record = std::mem::take(&mut self.record);
+        if let Some(provider) = &reported.plugin_provider {
+            // Go `ExecutorTypeName` of the host's `*executorAdapter`.
+            record.provider.clone_from(provider);
+            record.executor_type = "executorAdapter".into();
+        }
         let mut telemetry_only = false;
         let (latency, ttft);
         if let Some(outcome) = reported.outcome {
@@ -2285,7 +2425,9 @@ impl Tracker {
             executor_type: record.executor_type.clone(),
             model: record.model.clone(),
             alias: record.alias.clone(),
-            api_key: client.api_key.clone(),
+            api_key: client.api_key.trim().to_owned(),
+            is_native_key: is_native_access_provider(&client.access_provider),
+            access_provider: client.access_provider.trim().to_owned(),
             session_id,
             parent_session_id,
             auth_id: self.auth_id.clone(),
@@ -2388,7 +2530,7 @@ pub fn access_token_sha256(c: &cpa_core::credential::Credential) -> String {
 /// `FileName`, never reaches a Home auth: Go's auth JSON omits it.
 fn auth_source_kind(c: &cpa_core::credential::Credential) -> &'static str {
     let attr = |k: &str| c.attributes.get(k).map_or("", |v| v.trim());
-    let normalize = |s: &str| match s.trim().to_lowercase().as_str() {
+    let normalize = |s: &str| match s.trim().go_lower().as_str() {
         "config" => Some("config"),
         "file" | "filesystem" => Some("file"),
         "git" => Some("git"),
@@ -2405,7 +2547,7 @@ fn auth_source_kind(c: &cpa_core::credential::Credential) -> &'static str {
     }
     let source = attr("source");
     if !source.is_empty() {
-        if source.to_lowercase().starts_with("config:") {
+        if source.go_lower().starts_with("config:") {
             return "config";
         }
         return normalize(source).unwrap_or("file");
@@ -2492,10 +2634,8 @@ pub fn publish_home_unauthorized(
         },
         ..Record::default()
     };
-    // The record carries no client key (Go leaves `Record.APIKey` empty).
-    let mut client = home_session(&facts.client, credential).into_owned();
-    client.api_key.clear();
-    queue.enqueue(queued(&record, &client));
+    // Go 37fe2608: the record carries the request's client key and access provider.
+    queue.enqueue(queued(&record, &home_session(&facts.client, credential)));
 }
 
 /// Go `time.Time.MarshalJSON` (RFC 3339 with trailing-zero-trimmed nanoseconds).
@@ -2774,14 +2914,89 @@ mod tests {
                 request_id: s("request_id"),
                 endpoint: s("endpoint"),
                 api_key: s("client_key"),
+                access_provider: String::new(),
             };
             let got = queued(&record, &client);
             // Go's exact bytes: the fixture re-indents the queued payload; compacting
             // restores it.
             let raw = gj::get(FIXTURE.as_bytes(), &format!("usage.{index}.queued"));
-            let want = gj::compact(raw.raw(), false);
-            assert_eq!(String::from_utf8_lossy(&got), String::from_utf8_lossy(&want), "{name}");
+            let want = String::from_utf8(gj::compact(raw.raw(), false)).unwrap();
+            // Go 37fe2608, after the fixture's 6fecc6e, always writes `is_native_key`
+            // after `api_key`; with no access provider it is false and
+            // `access_provider` is omitted.
+            let at = want.find(",\"request_id\":").unwrap();
+            let want = format!("{},\"is_native_key\":false{}", &want[..at], &want[at..]);
+            assert_eq!(String::from_utf8_lossy(&got), want, "{name}");
         }
+    }
+
+    /// Go `TestUsageQueuePluginPayloadDistinguishesNativeKey` and
+    /// `TestIsNativeAccessProvider` (37fe2608): `is_native_key` is always written right
+    /// after `api_key`, true only for CPA's own client-key providers (trimmed, any case);
+    /// `access_provider` follows it unless empty.
+    #[test]
+    fn queued_payload_distinguishes_native_key() {
+        for (provider, key, want) in [
+            (
+                "config-inline",
+                "sk-native-key-123",
+                r#""api_key":"sk-native-key-123","is_native_key":true,"access_provider":"config-inline","request_id""#,
+            ),
+            (
+                "  CONFIG-API-KEY ",
+                "k",
+                r#""api_key":"k","is_native_key":true,"access_provider":"CONFIG-API-KEY","request_id""#,
+            ),
+            (
+                "custom-auth-plugin",
+                "plugin-principal-456",
+                r#""api_key":"plugin-principal-456","is_native_key":false,"access_provider":"custom-auth-plugin","request_id""#,
+            ),
+            (
+                "realtime-client-secret",
+                "p",
+                r#""api_key":"p","is_native_key":false,"access_provider":"realtime-client-secret","request_id""#,
+            ),
+            ("", "", r#""api_key":"","is_native_key":false,"request_id""#),
+        ] {
+            let client = Client {
+                api_key: key.into(),
+                access_provider: provider.into(),
+                ..Default::default()
+            };
+            let got = String::from_utf8(queued(&Record::default(), &client)).unwrap();
+            assert!(got.contains(want), "{provider:?}: {got}");
+        }
+        // The usage plugin record (Go `usageAdapter.HandleUsage`) trims both and
+        // derives the flag the same way.
+        let client = Client {
+            api_key: " sk-native ".into(),
+            access_provider: " Config-Inline ".into(),
+            ..Default::default()
+        };
+        let facts = std::sync::Arc::new(Facts::new(
+            client,
+            Format::OpenAIResponse,
+            Format::OpenAIResponse,
+            "claude-sonnet-4-6",
+            b"{}",
+            false,
+            &crate::dispatch::Trace::default(),
+        ));
+        let tracker = Tracker::start(&usage_runtime(), &facts, &credential_for("claude"), "claude-sonnet-4-6");
+        let got = tracker.plugin_record(&Record::default(), Default::default(), Default::default());
+        assert_eq!(
+            (got.api_key.as_str(), got.is_native_key, got.access_provider.as_str()),
+            ("sk-native", true, "Config-Inline")
+        );
+        // pluginapi.UsageRecord's Go field order: both follow APIKey.
+        let mut wire = Vec::new();
+        cpa_plugin::gojson::GoJson::encode(&got, &mut wire);
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(
+            wire.contains(r#""APIKey":"sk-native","IsNativeKey":true,"AccessProvider":"Config-Inline","SessionID""#),
+            "{wire}"
+        );
     }
 
     /// A runtime whose usage queue keeps records.
@@ -3019,7 +3234,8 @@ mod tests {
                 is_fork: c["is_fork"].as_bool().unwrap_or(false),
                 request_id: s(&c["request_id"]),
                 endpoint: s(&c["endpoint"]),
-                api_key: "client-key-must-not-appear".into(),
+                api_key: "fake-client-key".into(),
+                access_provider: "config-inline".into(),
                 ..Default::default()
             };
             if name == "count_tokens_oauth_runtime" {
@@ -3030,13 +3246,14 @@ mod tests {
             }
             let credential = cpa_core::credential::Credential {
                 id: s(&case["id"]),
-                provider: s(&case["auth_provider"]).to_lowercase(),
+                provider: s(&case["auth_provider"]).go_lower(),
                 source: cpa_core::credential::Source::File(s(&case["id"]).into()),
                 disabled: false,
                 label: String::new(),
                 attributes,
                 metadata: case["metadata"].as_object().cloned().unwrap_or_default(),
                 revision: 0,
+                next_refresh_after: None,
             };
             let request = &case["request"];
             let with_options = request["with_options"].as_bool().unwrap_or(false);
@@ -3087,6 +3304,12 @@ mod tests {
             }
             assert_eq!(got.len(), 1, "{name}");
             let mut want = case["record"].clone();
+            // Go 37fe2608, after this fixture was recorded: the record carries the
+            // request's client key and access provider.
+            let fields = want.as_object_mut().unwrap();
+            fields.insert("api_key".into(), "fake-client-key".into());
+            fields.insert("is_native_key".into(), true.into());
+            fields.insert("access_provider".into(), "config-inline".into());
             for record in [&mut want, &mut got[0]] {
                 let record = record.as_object_mut().unwrap();
                 assert!(record.remove("timestamp").is_some(), "{name}");

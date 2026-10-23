@@ -31,6 +31,74 @@ pub(crate) fn has_item(payload: &[u8]) -> bool {
     has_input_type(payload, b"compaction")
 }
 
+/// The `fmt.Errorf` of a failed summary extraction or seal: no status and not a
+/// transport fault, so the scheduler classifies it like any statusless model failure.
+pub(crate) fn statusless(message: impl Into<String>) -> cpa_core::exec::ExecError {
+    cpa_core::exec::ExecError::local(0, cpa_core::exec::FailureScope::Model, message)
+}
+
+/// `ResponsesCompactionSourcePayload`: the body, unless only the original request
+/// carries the trigger or the body is empty.
+pub(crate) fn source_payload<'a>(body: &'a [u8], original: &'a [u8]) -> &'a [u8] {
+    if (!has_trigger(body) && has_trigger(original)) || (body.is_empty() && !original.is_empty()) {
+        original
+    } else {
+        body
+    }
+}
+
+/// `DropForeignResponsesCompactionItems`: compaction items whose `encrypted_content`
+/// is not a CPA capsule (`RecognizedAntigravityCompactionCapsule`) are removed. `None`
+/// when nothing was dropped.
+fn drop_foreign(payload: &[u8], provider: &str) -> Option<Vec<u8>> {
+    let input = gj::get(payload, "input");
+    if !input.is_array() {
+        return None;
+    }
+    let items = input.array();
+    let kept: Vec<&[u8]> = items
+        .iter()
+        .filter(|item| {
+            *item.get("type").bytes() != *b"compaction"
+                || item.get("encrypted_content").str().trim().starts_with(PREFIX)
+        })
+        .map(|item| item.raw())
+        .collect();
+    let dropped = items.len() - kept.len();
+    if dropped == 0 {
+        return None;
+    }
+    tracing::warn!("{provider} compaction: dropped {dropped} non-CPA compaction item(s)");
+    let mut out = payload.to_vec();
+    gj::set_raw(&mut out, "input", gj::join(&kept));
+    Some(out)
+}
+
+/// `ExpandResponsesCompactionCapsules`: drops foreign compaction items and expands CPA
+/// capsules in the body and the original request.
+pub(crate) fn expand_request(req: &mut cpa_core::exec::ExecRequest, provider: &str) -> Result<(), String> {
+    let one = |payload: &bytes::Bytes| -> Result<Option<bytes::Bytes>, String> {
+        let dropped = drop_foreign(payload, provider);
+        let current = dropped.as_deref().unwrap_or(payload);
+        if has_item(current) {
+            return expand(current).map(|expanded| Some(expanded.into()));
+        }
+        Ok(dropped.map(Into::into))
+    };
+    let same_original = !req.original_body.is_empty() && req.body == req.original_body;
+    if let Some(body) = one(&req.body)? {
+        req.body = body;
+    }
+    if same_original {
+        req.original_body = req.body.clone();
+    } else if !req.original_body.is_empty()
+        && let Some(original) = one(&req.original_body)?
+    {
+        req.original_body = original;
+    }
+    Ok(())
+}
+
 /// `PrepareAntigravityCompactionSummaryPayload`: the input without triggers plus the
 /// summary prompt, without tools and other fields summary generation does not take.
 pub(crate) fn summary_payload(payload: &[u8]) -> Vec<u8> {
@@ -161,7 +229,8 @@ pub(crate) fn summary_text(response: &[u8]) -> Result<String, String> {
             if content.is_array() {
                 for part in content.array() {
                     let text = part.get("text").str().into_owned();
-                    if *part.get("type").bytes() == *b"output_text" && !text.is_empty() {
+                    let kind = part.get("type").bytes();
+                    if (*kind == *b"output_text" || *kind == *b"text") && !text.is_empty() {
                         texts.push(text);
                     }
                 }

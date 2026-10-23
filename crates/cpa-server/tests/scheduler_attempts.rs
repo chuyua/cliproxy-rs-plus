@@ -380,3 +380,65 @@ async fn postcommit_stream_fault_is_terminal_and_never_replayed() {
         }
     );
 }
+
+/// Go conductor_stream.go and conductor_execution.go: a bootstrap failure that a
+/// request-scoped rule stops comes back as an error, not as a stream, so the handler's
+/// `bootstrap-retries` never re-run it; an unstopped one is re-run.
+#[tokio::test]
+async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
+    let calls = Arc::new(Mutex::new(0));
+    let failed = r#"data: {"type":"response.failed","response":{"error":{"type":"server_error","status":503,"message":"boom"}}}"#;
+    let app = axum::Router::new()
+        .fallback(move |State(calls): State<Arc<Mutex<usize>>>| async move {
+            *calls.lock().unwrap() += 1;
+            ([("content-type", "text/event-stream")], format!("{failed}\n\n")).into_response()
+        })
+        .with_state(calls.clone());
+    let (upstream_url, upstream) = serve(app).await;
+    let stop = serde_json::json!([{"status":503,"match":["boom"],"action":"stop"}]);
+    for (rules, expected_calls) in [(Some(stop), 1), (None, 2)] {
+        *calls.lock().unwrap() = 0;
+        let mut metadata = serde_json::json!({"type":"codex","disable_cooling":true});
+        if let Some(rules) = &rules {
+            metadata["request_scoped_errors"] = rules.clone();
+        }
+        let mut credential = Credential::from_file(
+            Path::new("/mock"),
+            &Path::new("/mock").join("codex.json"),
+            metadata.as_object().unwrap().clone(),
+        )
+        .unwrap();
+        for (k, v) in [
+            ("api_key", "sk-fake"),
+            ("base_url", upstream_url.as_str()),
+            ("auth_kind", "apikey"),
+        ] {
+            credential.attributes.insert(k.into(), v.into());
+        }
+        let config = "routing:\n  retry:\n    request-retry: 0\nrequests:\n  streaming:\n    bootstrap-retries: 1\n";
+        let rt = Arc::new(cpa_server::testing::runtime(
+            Config::parse(config).unwrap(),
+            vec![cpa_server::testing::local(credential)],
+            Executors {
+                claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        ));
+        let (url, proxy) = serve(router(rt)).await;
+        let response = wreq::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .body(r#"{"model":"gpt-5.5","stream":true,"input":"hi"}"#)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 503, "{text}");
+        assert_eq!(*calls.lock().unwrap(), expected_calls, "rules {rules:?}");
+        proxy.abort();
+    }
+    upstream.abort();
+}

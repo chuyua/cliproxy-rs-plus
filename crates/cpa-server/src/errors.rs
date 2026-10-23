@@ -18,8 +18,32 @@ fn text_for(status: u16, text: &str) -> String {
     }
 }
 
-/// Go `BuildErrorResponseBody`: valid JSON passes through trimmed, anything else is
-/// wrapped in an OpenAI error envelope typed by status.
+/// Go `json.Compact` of valid JSON: the white space between tokens dropped, strings
+/// untouched (no HTML escaping), so an upstream error fits on one SSE `data:` line.
+pub(crate) fn compact_json(json: &str) -> String {
+    let mut out = Vec::with_capacity(json.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in json.as_bytes() {
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            in_string = b == b'"';
+            out.push(b);
+        }
+    }
+    // Only ASCII white space was removed, outside strings.
+    String::from_utf8(out).expect("compacting valid UTF-8 JSON keeps it UTF-8")
+}
+
+/// Go `BuildErrorResponseBody`: valid JSON passes through compacted (v8.0.35
+/// cd9e5ace), anything else is wrapped in an OpenAI error envelope typed by status.
 pub fn openai_body(status: u16, text: &str) -> String {
     let status = if status == 0 { 500 } else { status };
     let text = if gojson::trim(text).is_empty() {
@@ -29,7 +53,7 @@ pub fn openai_body(status: u16, text: &str) -> String {
     };
     let trimmed = gojson::trim(text);
     if !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_ok() {
-        return trimmed.to_owned();
+        return compact_json(trimmed);
     }
     let (kind, code) = match status {
         401 => ("authentication_error", "invalid_api_key"),
@@ -162,6 +186,23 @@ mod tests {
             r#"{"error":{"message":"status 500","type":"server_error","code":"internal_server_error"}}"#
         );
         assert_eq!(openai_body(400, " {\"a\":1} "), r#"{"a":1}"#);
+        // Recorded from Go v8.0.35 BuildErrorResponseBody, including its
+        // TestBuildErrorResponseBody_CompactsPrettyPrintedJSON input.
+        for (text, want) in [
+            (
+                "{\n  \"error\": {\n    \"code\": 500,\n    \"message\": \"Internal error encountered.\",\n    \"status\": \"INTERNAL\"\n  }\n}",
+                r#"{"error":{"code":500,"message":"Internal error encountered.","status":"INTERNAL"}}"#,
+            ),
+            (" [ 1 ,\t2 ]\r\n", "[1,2]"),
+            (
+                "{\"a b\" : \"x  y\\n <&> \\u2028 \u{2028}\", \"n\" : [ ] }",
+                "{\"a b\":\"x  y\\n <&> \\u2028 \u{2028}\",\"n\":[]}",
+            ),
+            ("{\"q\":\"a\\\" b\" , \"r\" : 1}", r#"{"q":"a\" b","r":1}"#),
+            ("\"  spaced  \"", "\"  spaced  \""),
+        ] {
+            assert_eq!(openai_body(502, text), want, "{text:?}");
+        }
         assert_eq!(
             openai_body(422, "bad <x>"),
             r#"{"error":{"message":"bad \u003cx\u003e","type":"invalid_request_error"}}"#

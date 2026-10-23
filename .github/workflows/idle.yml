@@ -28,6 +28,7 @@ on:
       - bench/budgets.txt
       - .github/workflows/idle.yml
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - crates/cpa-server/src/fs_events.rs
       - crates/cpa-server/src/watching.rs
@@ -53,6 +54,7 @@ env:
 
 jobs:
   other-os:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: idle gate (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -99,6 +101,7 @@ jobs:
           bench/gate.sh idle "$os" "target/${{ matrix.target }}/release/$exe" 1
 
   go-comparison:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: idle, Go vs cliproxy-rs (Linux)
     runs-on: ubuntu-22.04
     timeout-minutes: 60

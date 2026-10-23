@@ -297,7 +297,11 @@ fn mime_from_output_format(format: &str) -> String {
 
 /// `multipartFileToDataURL`.
 fn data_url(part: &multipart::Part) -> String {
-    let mut media = part.header("Content-Type").unwrap_or_default().trim().to_owned();
+    // ponytail: a Content-Type that is not UTF-8 reaches the data URL lossily (image
+    // clients send ASCII media types); building the URL as bytes would keep it.
+    let mut media = String::from_utf8_lossy(part.header("Content-Type").unwrap_or_default())
+        .trim()
+        .to_owned();
     if media.is_empty() {
         media = detect_content_type(&part.body).to_owned();
     }
@@ -671,13 +675,15 @@ pub async fn generations(
     matched: Option<MatchedPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    limit: crate::body_limit::Limit,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     if disabled(&rt) {
         return not_found();
     }
-    let body = match body {
-        Ok(body) => body,
+    let body = match body.map(|body| crate::openai::read_body(&headers, body, limit.0)) {
+        Ok(Ok(body)) => body,
+        Ok(Err(response)) => return *response,
         Err(rejection) => return read_failed(&rejection),
     };
     if !gj::std_valid(&body) {
@@ -731,7 +737,8 @@ pub async fn edits(
     matched: Option<MatchedPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    limit: crate::body_limit::Limit,
+    read: crate::body_limit::Read,
 ) -> Response {
     if disabled(&rt) {
         return not_found();
@@ -748,9 +755,22 @@ pub async fn edits(
             cpa_common::gostr::quote(&lowered)
         ));
     }
-    let body = match body {
-        Ok(body) => body,
-        Err(rejection) => return read_failed(&rejection),
+    // Go decodes Content-Encoding for JSON edits only (`ReadRequestBody`).
+    let body = if json {
+        match read.body.map(|body| crate::openai::read_body(&headers, body, limit.0)) {
+            Ok(Ok(body)) => body,
+            Ok(Err(response)) => return *response,
+            Err(rejection) => return read_failed(&rejection),
+        }
+    } else {
+        use crate::management::multipart::{Failed, body};
+        match body(read, &content_type) {
+            Ok(body) => body,
+            Err(Failed::Read(rejection)) => return read_failed(&rejection),
+            Err(Failed::Form(status, e)) => {
+                return respond::error_detail(status, &format!("Invalid request: {e}"), "invalid_request_error");
+            }
+        }
     };
     let p = Prepared {
         rt,
@@ -768,20 +788,28 @@ pub async fn edits(
 
 /// `http.Request.ParseMultipartForm` as gin's `c.MultipartForm` calls it.
 pub(crate) fn multipart_form(content_type: &str, body: &[u8]) -> Result<Form, String> {
+    multipart::read_form(body, &multipart_boundary(content_type)?)
+}
+
+/// The boundary of a multipart form, or Go's error for a `Content-Type` that
+/// `ParseMultipartForm` refuses before it reads the body (`multipartReader`, then the
+/// empty-boundary check of the first `NextPart`). The value is kept as sent.
+pub(crate) fn multipart_boundary(content_type: &str) -> Result<String, String> {
     const NOT_MULTIPART: &str = "request Content-Type isn't multipart/form-data";
     if content_type.is_empty() {
         return Err(NOT_MULTIPART.into());
     }
-    let MediaType::Ok(media, params) = multipart::parse_media_type(content_type) else {
+    let MediaType::Ok(media, mut params) = multipart::parse_media_type(content_type) else {
         return Err(NOT_MULTIPART.into());
     };
     if media != "multipart/form-data" {
         return Err(NOT_MULTIPART.into());
     }
-    let Some(boundary) = params.get("boundary") else {
-        return Err("no multipart boundary param in Content-Type".into());
-    };
-    multipart::read_form(body, boundary)
+    match params.remove("boundary") {
+        None => Err("no multipart boundary param in Content-Type".into()),
+        Some(boundary) if boundary.is_empty() => Err("multipart: boundary is empty".into()),
+        Some(boundary) => Ok(boundary),
+    }
 }
 
 /// `imagesEditsFromMultipart`.

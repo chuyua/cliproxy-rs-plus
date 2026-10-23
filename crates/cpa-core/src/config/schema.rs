@@ -98,35 +98,6 @@ pub fn coerce_typed_scalars(value: &mut Value) {
     walk(value, &SCHEMA);
 }
 
-/// The bool a YAML 1.1 spelling decodes to, for the first such string in a typed bool
-/// field of `written` (the value written at the v8 path `parts`). Plugin entries are
-/// raw YAML in Go, so their strings are not typed-bool writes.
-pub fn written_bool_spelling(parts: &[&str], written: &Value) -> Option<bool> {
-    fn find(node: &Value, schema: &Schema) -> Option<bool> {
-        if is_raw_entries(schema) {
-            return None;
-        }
-        let schema = schema.get("optional").unwrap_or(schema);
-        if schema.as_str() == Some("bool") {
-            return node.as_str().and_then(go_bool);
-        }
-        match node {
-            Value::Mapping(map) => map.iter().find_map(|(k, v)| find(v, child(schema, k)?)),
-            Value::Sequence(items) => items.iter().find_map(|i| find(i, schema.get("list")?)),
-            _ => None,
-        }
-    }
-    let mut schema = &*SCHEMA;
-    for part in parts {
-        if is_raw_entries(schema) {
-            return None;
-        }
-        let inner = schema.get("optional").unwrap_or(schema);
-        schema = child(inner, &Value::from(*part))?;
-    }
-    find(written, schema)
-}
-
 pub(super) fn is_struct(path: &str) -> bool {
     let mut schema = &*SCHEMA;
     for part in path.split('.') {
@@ -140,7 +111,9 @@ pub(super) fn is_struct(path: &str) -> bool {
 
 fn walk(value: &Value, schema: &Schema, path: &str, strict: bool) -> anyhow::Result<()> {
     if value.is_null() {
-        if schema.get("fields").is_some() && path != "config.routing" {
+        // Routing is shared with the legacy layout, and `models` is no v8 path parent:
+        // Go decodes null into their zero structs.
+        if schema.get("fields").is_some() && path != "config.routing" && path != "config.models" {
             bail!("{path} must be a mapping");
         }
         if schema.get("list").is_some() && path.starts_with("config.api-keys.") && !path.contains('[') {
@@ -218,7 +191,13 @@ fn walk(value: &Value, schema: &Schema, path: &str, strict: bool) -> anyhow::Res
             if value.is_null() && is_raw_entries(schema) {
                 continue;
             }
-            walk(value, inner, &format!("{path}.{key}"), strict)?;
+            // Other keys of a plugin entry are the plugin's own settings.
+            walk(
+                value,
+                inner,
+                &format!("{path}.{key}"),
+                strict && !is_raw_entries(schema),
+            )?;
         } else if let Some(inner) = schema.get("fields").and_then(|f| f.get(key)) {
             walk(value, inner, &format!("{path}.{key}"), strict)?;
         } else if strict || native_group {

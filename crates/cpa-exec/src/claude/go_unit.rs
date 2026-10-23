@@ -26,6 +26,52 @@ fn fixture_v8_0_27() -> &'static Value {
     FIXTURE.get_or_init(|| serde_json::from_str(include_str!("testdata/go_unit_v8.0.27.json")).unwrap())
 }
 
+/// Go's tests at v8.0.35 whose answers changed with a v8.0.35 behaviour this executor
+/// follows; 6fecc6e's recordings of the same tests are skipped ([`SUPERSEDED`]).
+fn fixture_v8_0_35() -> &'static Value {
+    static FIXTURE: OnceLock<Value> = OnceLock::new();
+    FIXTURE.get_or_init(|| serde_json::from_str(include_str!("testdata/go_unit_v8.0.35.json")).unwrap())
+}
+
+/// 6fecc6e recordings replaced by their v8.0.35 recording: ad9e456d `disableThinking`
+/// replaces the whole `thinking` object, and the payload rules run once, last (868e137).
+const SUPERSEDED: &[&str] = &[
+    "TestClaudeExecutor_DisabledThinkingStripsDisplayBeta",
+    "TestClaudeExecutorPayloadOverrideDisabledThinking",
+    "TestClaudeExecutorPayloadOverrideReenablesThinking",
+    "TestClaudeExecutor_ChatCompletionsDefaultMaxTokensAndPayloadDefaultRule",
+    "TestClaudeExecutor_PayloadCustomReportingOutcomesPreservedOnRewrite",
+    "TestClaudeExecutor_PayloadFilterFallbacksPreservesRemovalOnFable",
+    "TestClaudeExecutor_PayloadOverrideParentThinkingPreventsDisplayUpdates",
+    "TestClaudeExecutor_PayloadOverridePreservesExplicitFallbacks",
+    "TestClaudeExecutor_PayloadOverrideProbeWithExplicitDiagnosticsPreserved",
+    "TestClaudeExecutor_PayloadOverrideRawPreservesExplicitFallbacks",
+    "TestClaudeExecutor_PayloadStringSystemWithExactReportingPromptDoesNotDuplicate",
+    "TestClaudeExecutor_PayloadOverrideCannotSmuggleLegacyMidSystemMessage",
+    "TestClaudeExecutor_PayloadOverrideDoesNotClaimMatchingCallerTurn",
+];
+
+/// 6fecc6e tests Go deleted in 868e137: they checked the repairs that ran after the
+/// payload rules. Their v8.0.35 successors are in the v8.0.35 recording under new names.
+const REMOVED_IN_868E137: &[&str] = &[
+    "TestClaudeExecutor_ExecuteTransportMatchesResponseFormat",
+    "TestClaudeExecutor_PayloadFableThinkingAdaptiveToDisabledDropsInjectedDisplay",
+    "TestClaudeExecutor_PayloadFableToSonnetWithSensitiveWordsRemovesReportingBlock",
+    "TestClaudeExecutor_PayloadOverrideFableModelReconciled",
+    "TestClaudeExecutor_PayloadOverrideFableToProbeStripsFableAdditions",
+    "TestClaudeExecutor_PayloadOverrideMaxTokensTo1ReclassifiesAsProbe",
+    "TestClaudeExecutor_PayloadOverrideNonFableToFableReconciled",
+    "TestClaudeExecutor_PayloadOverrideProbeToNormalReinitializes",
+    "TestClaudeExecutor_PayloadOverrideUnrelatedModelRuleDoesNotPreserveFableFallbacks",
+    "TestClaudeExecutor_PayloadReplacesSystemOnOriginalFableReaddsReportingBlock",
+    "TestClaudeExecutor_PayloadSonnetToFableWithSensitiveWordsObfuscatesInjectedReportingBlock",
+    "TestClaudeExecutor_PayloadSonnetToFableWithSystemTTLEditsAddsReportingBlock",
+    "TestClaudeExecutor_PayloadStringSystemFableAddsReportingBlock",
+    "TestClaudeExecutor_PayloadStringSystemMentioningReportingOutcomesStillInjectsFableReportingBlock",
+    "TestClaudeExecutor_PayloadSystemTTLOverrideStillRemovesInjectedFableReportingBlock",
+    "TestClaudeExecutor_PayloadOverrideReconcilesRelocatedSystemPrompt",
+];
+
 fn bytes(value: &Value) -> Option<Vec<u8>> {
     use base64::Engine;
     match value {
@@ -121,6 +167,18 @@ async fn replay_file(fixture: &Value, file: &str) {
     let mut failures = Vec::new();
     let mut count = 0;
     for (test, records) in tests {
+        if std::ptr::eq(fixture, self::fixture()) && SUPERSEDED.contains(&test.as_str()) {
+            assert!(
+                fixture_v8_0_35()["files"][file][test]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()),
+                "{test}: superseded but no v8.0.35 call recorded"
+            );
+            continue;
+        }
+        if std::ptr::eq(fixture, self::fixture()) && REMOVED_IN_868E137.contains(&test.as_str()) {
+            continue;
+        }
         for (i, record) in records.as_array().unwrap().iter().enumerate() {
             count += 1;
             match replay(test, record).await {
@@ -168,6 +226,7 @@ fn unverified_go_cancellation_cases() {
 fn go_assertions_held_while_recording() {
     assert_eq!(fixture()["go_failures"], serde_json::json!([]));
     assert_eq!(fixture_v8_0_27()["go_failures"], serde_json::json!([]));
+    assert_eq!(fixture_v8_0_35()["go_failures"], serde_json::json!([]));
 }
 
 macro_rules! go_file {
@@ -269,8 +328,7 @@ go_file_v8_0_27!(
 go_file_v8_0_27!(
     /// 6d57ac9: the replay runs on Go's swapped clock, so the reminder date compares
     /// as sent. TestClaudeCloakedDateReminderProbeOverrideDoesNotReinitializeSessionDate
-    /// is left out: its bodies follow v8.0.27's payload rule ordering (868e137, not
-    /// ported), and tests::declassified_probes_keep_their_own_date checks its dates.
+    /// is replayed from v8.0.35 (`v8_0_35_cloaked_date_pin`).
     v8_0_27_cloaked_date_pin,
     "claude_cloaked_date_pin_test.go"
 );
@@ -285,4 +343,41 @@ go_file_v8_0_27!(
     /// (`go_exec::RELOCATES_API_KEY_SYSTEM`); 6fecc6e's recording passes as recorded.
     v8_0_27_executor,
     "claude_executor_test.go"
+);
+
+macro_rules! go_file_v8_0_35 {
+    ($(#[$doc:meta])* $name:ident, $file:literal) => {
+        $(#[$doc])*
+        #[tokio::test]
+        async fn $name() {
+            replay_file(fixture_v8_0_35(), $file).await;
+        }
+    };
+}
+
+go_file_v8_0_35!(
+    /// ad9e456d and 868e137: Go's v8.0.35 recording of the 6fecc6e tests listed in
+    /// [`SUPERSEDED`], and the payload-barrier tests that replace those 868e137 removed.
+    v8_0_35_executor,
+    "claude_executor_test.go"
+);
+go_file_v8_0_35!(
+    /// 868e137: payload rules no longer rerun system placement.
+    v8_0_35_mid_system_model,
+    "claude_mid_system_model_test.go"
+);
+go_file_v8_0_35!(
+    /// 868e137: a probe a payload rule declassifies keeps its own date.
+    v8_0_35_cloaked_date_pin,
+    "claude_cloaked_date_pin_test.go"
+);
+go_file_v8_0_35!(
+    /// 868e137: filters are not replayed and identity is not reinjected after the rules.
+    v8_0_35_payload_barrier,
+    "payload_barrier_test.go"
+);
+go_file_v8_0_35!(
+    /// 868e137: rule conditions are evaluated once, on the final body.
+    v8_0_35_payload_review,
+    "payload_review_test.go"
 );

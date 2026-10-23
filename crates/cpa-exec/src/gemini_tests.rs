@@ -241,9 +241,17 @@ pub(crate) fn check_attempt(
 
 const FIXTURE: &str = include_str!("../tests/fixtures/gemini_go.json");
 
+/// `gemini_go.json` with the scenarios the payload barrier changed taken from their
+/// v8.0.35 recording.
 fn fixture() -> &'static Value {
     static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    PARSED.get_or_init(|| serde_json::from_str(FIXTURE).unwrap())
+    PARSED.get_or_init(|| {
+        crate::payload_barrier::with_v8_0_35(
+            FIXTURE,
+            include_str!("../tests/fixtures/gemini_go_v8.0.35.json"),
+            "scenarios",
+        )
+    })
 }
 
 /// One-shot raw HTTP/1.1 capture server answering with the scripted response.
@@ -381,6 +389,7 @@ fn request(s: &Value) -> ExecRequest {
         },
         source_format: source,
         response_format: response,
+        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,
@@ -397,6 +406,7 @@ fn request(s: &Value) -> ExecRequest {
         caller: Caller {
             principal: "fake-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -472,6 +482,19 @@ fn missing(s: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Go v8.0.35 (f62d4d28) dropped `gemini-3.7-flash`: with no registry entry
+/// `capGeminiMaxOutputTokens` leaves the request's limit alone, while the
+/// `gemini-3.8-flash` the historical golden now uses is capped at its completion limit.
+#[test]
+fn a_removed_model_has_no_output_cap() {
+    let body = br#"{"generationConfig":{"maxOutputTokens":70000}}"#.to_vec();
+    assert_eq!(payload::cap_max_output_tokens(body.clone(), "gemini-3.7-flash"), body);
+    assert_eq!(
+        payload::cap_max_output_tokens(body, "gemini-3.8-flash"),
+        br#"{"generationConfig":{"maxOutputTokens":65536}}"#
+    );
+}
+
 #[tokio::test]
 async fn go_reference_scenarios() {
     let scenarios = fixture()["scenarios"].as_array().unwrap();
@@ -486,6 +509,17 @@ async fn go_reference_scenarios() {
     let unix = regex::Regex::new(r#"\"created\":1[0-9]{9}([,}])"#).unwrap();
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
+        // Recorded with 6fecc6e's catalog, where gemini-3.7-flash had a completion limit
+        // and no output limit. Go v8.0.35 (f62d4d28) drops that model; gemini-3.8-flash
+        // has the same limits and an ID of the same length, so the recorded bytes hold
+        // with the name swapped.
+        let swapped: Value;
+        let s = if name == "gen_cap_uses_max_completion_tokens" {
+            swapped = serde_json::from_str(&s.to_string().replace("gemini-3.7-flash", "gemini-3.8-flash")).unwrap();
+            &swapped
+        } else {
+            s
+        };
         let missing = missing(s);
         if !missing.is_empty() {
             skipped.push(format!("{name} ({})", missing.join(", ")));
@@ -742,6 +776,7 @@ async fn pending_responses_frame_is_flushed_before_terminal_error() {
         translator: Box::new(Pending(None)),
         client: Format::OpenAIResponse,
         raw: false,
+        executor_chunks: false,
         claude: ClaudeInputTokens::new(
             Format::OpenAIResponse,
             Format::Gemini,
@@ -815,6 +850,7 @@ async fn apply_patch_hooks_follow_go_order() {
             translator: Box::new(hooks),
             client: Format::OpenAI,
             raw: false,
+            executor_chunks: false,
             claude: ClaudeInputTokens::new(Format::OpenAI, Format::Gemini, Format::OpenAI, Bytes::new()),
             usage: Default::default(),
             capture: Default::default(),
@@ -874,4 +910,81 @@ async fn apply_patch_hooks_follow_go_order() {
         ]
     );
     assert_eq!(*seen.lock().unwrap(), [r#"{"a":1}"#, r#"{"b":2}"#, "finalize"]);
+}
+
+/// TestGeminiExecutorAppliesPayloadRulesAfterLeadingUserNormalization (868e137): the
+/// rules see the synthetic leading user turn, not the client's first turn.
+#[tokio::test]
+async fn payload_rules_run_after_the_leading_user_turn() {
+    let reply = serde_json::json!({
+        "status": 200,
+        "headers": [["Content-Type", "application/json"]],
+        "body": r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#,
+    });
+    let mock = Mock::start(&reply).await;
+    let cfg = Config::parse(
+        r#"
+payload:
+  override:
+    - models: [{name: gemini-3.7-flash, protocol: gemini}]
+      params: {"contents.0.parts.0.text": payload override}
+"#,
+    )
+    .unwrap();
+    let s = serde_json::json!({
+        "provider": "gemini", "config_auth": -1, "op": "execute", "source": "gemini", "model": "gemini-3.7-flash",
+        "attributes": {"api_key": "test-key", "base_url": "http://UPSTREAM"},
+        "payload": r#"{"contents":[{"role":"model","parts":[{"text":"prior output"}]},{"role":"user","parts":[{"text":"continue"}]}]}"#,
+    });
+    let cred = credential(&s, &cfg, mock.addr());
+    GeminiExecutor::default()
+        .execute(&cred, request(&s), &cfg)
+        .await
+        .unwrap();
+    let wire = mock.request().unwrap();
+    let body = wire.split_once("\r\n\r\n").unwrap().1.as_bytes().to_vec();
+    assert_eq!(gj::get(&body, "contents.#").int(), 3, "{wire}");
+    assert_eq!(gj::get(&body, "contents.0.role").str(), "user", "{wire}");
+    assert_eq!(
+        gj::get(&body, "contents.0.parts.0.text").str(),
+        "payload override",
+        "{wire}"
+    );
+    assert_eq!(
+        gj::get(&body, "contents.1.parts.0.text").str(),
+        "prior output",
+        "{wire}"
+    );
+}
+
+/// A count whose original request fails to translate refuses rather than checking
+/// `default` rules against an empty baseline: Go's partial translation keeps the
+/// client's temperature, so no default would apply (DIFFERENCES-FROM-GO.md).
+#[tokio::test]
+async fn count_refuses_when_the_original_does_not_translate() {
+    let reply = serde_json::json!({
+        "status": 200,
+        "headers": [["Content-Type", "application/json"]],
+        "body": r#"{"totalTokens":3}"#,
+    });
+    let mock = Mock::start(&reply).await;
+    let cfg = Config::parse(
+        r#"
+payload:
+  default:
+    - models: [{name: gemini-3.7-flash, protocol: gemini}]
+      params: {"generationConfig.temperature": 0.9}
+"#,
+    )
+    .unwrap();
+    let s = serde_json::json!({
+        "provider": "gemini", "config_auth": -1, "op": "count", "source": "claude", "model": "gemini-3.7-flash",
+        "attributes": {"api_key": "test-key", "base_url": "http://UPSTREAM"},
+        "payload": r#"{"model":"gemini-3.7-flash","max_tokens":16,"temperature":0.2,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+        "original": r#"{"model":"gemini-3.7-flash","max_tokens":16,"temperature":0.2,"messages":[{"role":"user","content":[{"type":"container_upload","source":{"type":"file","file_id":"f1"}}]}]}"#,
+    });
+    let cred = credential(&s, &cfg, mock.addr());
+    let got = GeminiExecutor::default().execute(&cred, request(&s), &cfg).await;
+    assert!(got.is_err(), "{:?}", mock.request());
+    assert_eq!(mock.request(), None);
 }

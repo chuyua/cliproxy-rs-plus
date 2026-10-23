@@ -572,20 +572,22 @@ fn invalid_config(e: String) -> Response {
 pub(crate) async fn patch_enabled(
     State(state): State<Arc<Management>>,
     UrlPath(raw): UrlPath<String>,
-    body: Bytes,
+    crate::body_limit::FirstJson(body): crate::body_limit::FirstJson,
 ) -> Response {
     let id = match plugin_id(&raw) {
         Ok(id) => id,
         Err(r) => return *r,
     };
-    // gin ShouldBindJSON into `struct{ Enabled *bool }`.
-    let enabled = match serde_json::from_slice::<Value>(&body) {
-        Ok(Value::Object(map)) => match map.get("enabled") {
-            Some(Value::Bool(b)) => Some(*b),
-            _ => None,
-        },
-        _ => None,
-    };
+    // gin ShouldBindJSON into `struct{ Enabled *bool }`: the first JSON value, every
+    // member in order; a type mismatch fails the bind even if a later duplicate fixes it.
+    let mut enabled = None;
+    for (_, value) in super::api_call::bind_struct(&body, &["enabled"]).into_iter().flatten() {
+        match value {
+            Value::Bool(b) => enabled = Some(b),
+            Value::Null => enabled = None,
+            _ => return error(StatusCode::BAD_REQUEST, "invalid_body", "enabled is required"),
+        }
+    }
     let Some(enabled) = enabled else {
         return error(StatusCode::BAD_REQUEST, "invalid_body", "enabled is required");
     };
@@ -606,7 +608,7 @@ pub(super) fn set_key(node: &mut Mapping, key: &str, value: Yaml) {
 pub(crate) async fn put_config(
     State(state): State<Arc<Management>>,
     UrlPath(raw): UrlPath<String>,
-    body: Bytes,
+    crate::body_limit::FirstJson(body): crate::body_limit::FirstJson,
 ) -> Response {
     let id = match plugin_id(&raw) {
         Ok(id) => id,
@@ -630,7 +632,7 @@ pub(crate) async fn put_config(
 pub(crate) async fn patch_config(
     State(state): State<Arc<Management>>,
     UrlPath(raw): UrlPath<String>,
-    body: Bytes,
+    crate::body_limit::FirstJson(body): crate::body_limit::FirstJson,
 ) -> Response {
     let id = match plugin_id(&raw) {
         Ok(id) => id,
@@ -826,12 +828,16 @@ async fn serve_management(State(state): State<Arc<Management>>, req: Request) ->
         return access::not_found();
     }
     // Go reads the whole body (no cap) once a route matches, and answers 400 when that
-    // fails.
+    // fails, 413 at `server.max-request-body-bytes`.
     let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(body) => body,
-        Err(_) => {
+        Err(error) => {
             return reply(Some(cpa_plugin::management::Reply::error(
-                400,
+                if crate::body_limit::is_too_large(&error) {
+                    413
+                } else {
+                    400
+                },
                 "failed to read plugin management request body",
             )));
         }

@@ -2,9 +2,14 @@
 //! of internal/util. Strings are bytes, as in Go.
 
 use cpa_common::json::{self as gj, Kind, Res};
+pub(crate) use cpa_common::schema::{
+    SCHEMA_MAP_KEYWORDS, SCHEMA_VALUE_KEYWORDS, has_unsupported_unicode_property_escape,
+};
+use cpa_core::gostr::GoStr;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -37,7 +42,7 @@ pub fn trim_space(s: &[u8]) -> &[u8] {
 
 /// Trimmed, lowercased text for comparisons (strings.ToLower(strings.TrimSpace(x))).
 pub fn norm(r: &Res<'_>) -> String {
-    r.str().trim().to_lowercase()
+    r.str().trim().go_lower()
 }
 
 pub fn now_unix() -> i64 {
@@ -728,57 +733,6 @@ pub fn is_claude_code_attribution_text(text: &[u8]) -> bool {
     trim_left_space(text).starts_with(b"x-anthropic-billing-header:")
 }
 
-/// util.HasUnsupportedUnicodePropertyEscape: `\p{`, `\P{` or `\0` outside an escaped
-/// backslash.
-pub fn has_unsupported_unicode_property_escape(pattern: &[u8]) -> bool {
-    let mut i = 0;
-    while i < pattern.len() {
-        if pattern[i] != b'\\' {
-            i += 1;
-            continue;
-        }
-        let Some(&next) = pattern.get(i + 1) else { break };
-        if matches!(next, b'p' | b'P') && pattern.get(i + 2) == Some(&b'{') {
-            return true;
-        }
-        if next == b'0' {
-            return true;
-        }
-        i += 2;
-    }
-    false
-}
-
-/// util.SchemaMapKeywords: keywords whose values map names to subschemas.
-pub const SCHEMA_MAP_KEYWORDS: [&[u8]; 6] = [
-    b"properties",
-    b"$defs",
-    b"definitions",
-    b"patternProperties",
-    b"dependentSchemas",
-    b"dependencies",
-];
-
-/// util.SchemaValueKeywords: keywords holding one subschema or a list of them.
-pub const SCHEMA_VALUE_KEYWORDS: [&[u8]; 16] = [
-    b"items",
-    b"prefixItems",
-    b"contains",
-    b"additionalProperties",
-    b"propertyNames",
-    b"unevaluatedProperties",
-    b"unevaluatedItems",
-    b"additionalItems",
-    b"contentSchema",
-    b"anyOf",
-    b"oneOf",
-    b"allOf",
-    b"not",
-    b"if",
-    b"then",
-    b"else",
-];
-
 /// util.FixJSON: converts single-quoted strings to double-quoted ones. Go walks `[]rune`,
 /// so invalid bytes come out as U+FFFD.
 pub fn fix_json(input: &[u8]) -> Vec<u8> {
@@ -854,7 +808,7 @@ pub fn fix_json(input: &[u8]) -> Vec<u8> {
 }
 
 /// util.CanonicalToolName: trimmed, leading underscores dropped, lowercased.
-fn canonical_tool_name(name: &[u8]) -> Vec<u8> {
+pub(crate) fn canonical_tool_name(name: &[u8]) -> Vec<u8> {
     let trimmed = trim_space(name);
     let start = trimmed.iter().position(|&c| c != b'_').unwrap_or(trimmed.len());
     go_lower(&trimmed[start..])
@@ -1344,6 +1298,60 @@ mod tests {
     }
 
     #[test]
+    fn is_http_url_follows_go_url_parse() {
+        // Expectations recorded from Go's common.IsHTTPURL at v8.0.35 (go 1.26).
+        for (url, want) in [
+            ("https://[broken", false),
+            ("https://ex%zzample.com/", false),
+            ("https://ex%41mple.com/", false),
+            ("https://example.com:80a/", false),
+            ("https://[::1]:x/", false),
+            ("https://a:b:c/", false),
+            ("https://exa mple.com", false),
+            ("https://[1.2.3.4]/", false),
+            ("https://[::1%25]/", false),
+            ("https://example.com/%zz", false),
+            ("https://example.com/a#%zz", false),
+            ("https://us er@example.com/", false),
+            ("https://user@/", false),
+            ("https:///path", false),
+            ("https:example.com", false),
+            ("ftp://example.com", false),
+            ("http://user:pa%20ss@example.com/x", true),
+            ("https://[::1]:8443/a", true),
+            ("https://[::1%25en0]/", true),
+            ("https://example.com:/", true),
+            ("https://example.com/?%zz", true),
+            ("https://ex<ample.com", true),
+            ("  HTTPS://Example.com/a.png  ", true),
+            ("https://例子.测试/图.png", true),
+        ] {
+            assert_eq!(is_http_url(url.as_bytes()), want, "{url}");
+        }
+        // A Claude turn whose only part is an unparseable image URL empties and is
+        // refused, as Go's claudeImageInputPart drops it; a valid IPv6 URL is sent.
+        let codex = |url: &str| {
+            let body = format!(
+                r#"{{"model":"m","max_tokens":10,"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"url","url":"{url}"}}}}]}}]}}"#
+            );
+            let ctx = crate::RequestCtx {
+                model: "m",
+                stream: false,
+            };
+            crate::translate_request(
+                cpa_core::format::Format::Claude,
+                cpa_core::format::Format::Codex,
+                &ctx,
+                body.as_bytes(),
+            )
+        };
+        for url in ["https://[broken", "https://[::1%25]/a.png"] {
+            assert_eq!(codex(url).unwrap_err().0, "unsupported content part: image", "{url}");
+        }
+        assert!(codex("https://[::1]:8443/a.png").is_ok());
+    }
+
+    #[test]
     fn trim_space_follows_go_unicode_rules() {
         assert_eq!(trim_space(" \u{a0}x\u{2003}\n".as_bytes()), b"x");
         // Invalid bytes are not whitespace and stop trimming.
@@ -1359,4 +1367,233 @@ mod tests {
         let id = sanitize_claude_tool_id(b"");
         assert!(id.starts_with(b"toolu_"));
     }
+}
+
+/// Writes one SSE event from its fields, for [`claude_messages_json_to_sse`].
+type EmitEvent<'a> = dyn FnMut(&[(&str, &[u8])]) + 'a;
+
+/// `ClaudeMessagesJSONToSSE`: a native Messages response (`type: message` with a
+/// `content` array) as the SSE events its stream would have carried, for the SSE
+/// aggregators, plus its model. Anything else is returned unchanged with no model.
+/// Events are written as Go's `json.Marshal` of a map: sorted keys, raw values
+/// compacted and HTML-escaped.
+pub fn claude_messages_json_to_sse(raw: &[u8]) -> (Cow<'_, [u8]>, Vec<u8>) {
+    if !gj::valid(raw) {
+        return (Cow::Borrowed(raw), vec![]);
+    }
+    let root = gj::parse(raw);
+    let content = root.get("content");
+    if &*root.get("type").s != b"message" || !content.is_array() {
+        return (Cow::Borrowed(raw), vec![]);
+    }
+    let mut out = Vec::with_capacity(raw.len() * 2);
+    let mut emit = |fields: &[(&str, &[u8])]| {
+        out.extend_from_slice(b"data: {");
+        for (i, (key, value)) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            gj::marshal_str(&mut out, key.as_bytes(), true);
+            out.push(b':');
+            out.extend_from_slice(value);
+        }
+        out.extend_from_slice(b"}\n\n");
+    };
+    let string = |s: &[u8]| {
+        let mut v = vec![];
+        gj::marshal_str(&mut v, s, true);
+        v
+    };
+    let mut message = raw.to_vec();
+    gj::set_raw(&mut message, "content", b"[]");
+    gj::set_raw(&mut message, "stop_reason", b"null");
+    gj::set_raw(&mut message, "stop_sequence", b"null");
+    emit(&[
+        ("message", &gj::compact(&message, true)),
+        ("type", b"\"message_start\""),
+    ]);
+    for (index, block) in content.array().iter().enumerate() {
+        let index = index.to_string();
+        let kind = block.get("type");
+        let mut start = block.raw().to_vec();
+        let delta = match &*kind.s {
+            b"text" => {
+                gj::set_str(&mut start, "text", "");
+                Some((("text", string(&block.get("text").s)), "\"text_delta\""))
+            }
+            b"tool_use" => {
+                gj::set_raw(&mut start, "input", b"{}");
+                let input = block.get("input");
+                let input = if input.raw().is_empty() {
+                    &b"{}"[..]
+                } else {
+                    input.raw()
+                };
+                Some((("partial_json", string(input)), "\"input_json_delta\""))
+            }
+            b"thinking" => {
+                gj::set_str(&mut start, "thinking", "");
+                gj::set_str(&mut start, "signature", "");
+                Some((("thinking", string(&block.get("thinking").s)), "\"thinking_delta\""))
+            }
+            _ => None,
+        };
+        let block_delta = |out: &mut EmitEvent<'_>, (key, value): (&str, &[u8]), kind: &str| {
+            let mut delta = b"{".to_vec();
+            gj::marshal_str(&mut delta, key.as_bytes(), true);
+            delta.push(b':');
+            delta.extend_from_slice(value);
+            delta.extend_from_slice(b",\"type\":");
+            delta.extend_from_slice(kind.as_bytes());
+            delta.push(b'}');
+            out(&[
+                ("delta", &delta),
+                ("index", index.as_bytes()),
+                ("type", b"\"content_block_delta\""),
+            ]);
+        };
+        emit(&[
+            ("content_block", &gj::compact(&start, true)),
+            ("index", index.as_bytes()),
+            ("type", b"\"content_block_start\""),
+        ]);
+        if let Some(((key, value), kind)) = delta {
+            block_delta(&mut emit, (key, &value), kind);
+        }
+        if &*kind.s == b"text" {
+            for citation in block.get("citations").array() {
+                block_delta(
+                    &mut emit,
+                    ("citation", &gj::compact(citation.raw(), true)),
+                    "\"citations_delta\"",
+                );
+            }
+        }
+        let signature = block.get("signature");
+        if &*kind.s == b"thinking" && signature.exists() {
+            block_delta(&mut emit, ("signature", &string(&signature.s)), "\"signature_delta\"");
+        }
+        emit(&[("index", index.as_bytes()), ("type", b"\"content_block_stop\"")]);
+    }
+    let usage = root.get("usage");
+    let usage = if usage.raw().is_empty() {
+        b"{}".to_vec()
+    } else {
+        gj::compact(usage.raw(), true)
+    };
+    let value = |r: Res<'_>| gj::AnyValue::from_res(&r).marshal().unwrap_or_else(|| b"null".to_vec());
+    let mut delta = b"{\"stop_reason\":".to_vec();
+    delta.extend_from_slice(&value(root.get("stop_reason")));
+    delta.extend_from_slice(b",\"stop_sequence\":");
+    delta.extend_from_slice(&value(root.get("stop_sequence")));
+    delta.push(b'}');
+    emit(&[("delta", &delta), ("type", b"\"message_delta\""), ("usage", &usage)]);
+    emit(&[("type", b"\"message_stop\"")]);
+    (Cow::Owned(out), root.get("model").s.to_vec())
+}
+
+/// `UserTurnDrops`: a part a translation cannot send is dropped, but a user turn left
+/// with nothing to send is refused (`UnsupportedPartError`, a request-scoped 400)
+/// rather than forwarded empty. The first dropped type of the first emptied turn is
+/// reported.
+#[derive(Default)]
+pub struct UserTurnDrops {
+    turn: Option<String>,
+    first: Option<String>,
+}
+
+impl UserTurnDrops {
+    pub fn drop_part(&mut self, part_type: &str) {
+        if self.turn.is_none() {
+            self.turn = Some(part_type.to_owned());
+        }
+    }
+
+    /// Closes the current user turn, which contributed `sendable` parts.
+    pub fn end_turn(&mut self, sendable: usize) {
+        let turn = self.turn.take();
+        if sendable == 0 && self.first.is_none() {
+            self.first = turn;
+        }
+    }
+
+    pub fn result(&self) -> Result<(), crate::Error> {
+        match &self.first {
+            None => Ok(()),
+            Some(t) if t.is_empty() => Err(crate::Error("unsupported content part".into())),
+            Some(t) => Err(crate::Error(format!("unsupported content part: {t}"))),
+        }
+    }
+}
+
+/// `UserRun`: consecutive user content a target merges into one user turn.
+#[derive(Default)]
+pub struct UserRun {
+    drops: UserTurnDrops,
+    sendable: usize,
+}
+
+impl UserRun {
+    pub fn add(&mut self) {
+        self.sendable += 1;
+    }
+
+    pub fn drop_part(&mut self, part_type: &str) {
+        self.drops.drop_part(part_type);
+    }
+
+    pub fn end(&mut self) {
+        self.drops.end_turn(self.sendable);
+        self.sendable = 0;
+    }
+
+    pub fn result(&self) -> Result<(), crate::Error> {
+        self.drops.result()
+    }
+}
+
+/// `IsInteractionsInstructionStep`: a developer or system step (or one inside such a
+/// wrapper, `inherited`) is sent as user content but is not the user's own turn.
+pub fn is_interactions_instruction_step(step: &Res<'_>, inherited: bool) -> bool {
+    let mut name = go_lower(trim_space(&step.get("role").bytes()));
+    if name.is_empty() {
+        name = go_lower(trim_space(&step.get("type").bytes()));
+    }
+    match name.as_slice() {
+        b"developer" | b"system" => true,
+        b"user" | b"assistant" | b"model" | b"model_output" | b"thought" => false,
+        _ => inherited,
+    }
+}
+
+/// `InteractionsAttachmentType`: the type reported when an Interactions attachment
+/// cannot be sent, or empty for text and parts that name nothing.
+pub fn interactions_attachment_type(part: &Res<'_>) -> String {
+    if !part.is_object() {
+        return String::new();
+    }
+    let kind = go_lower(trim_space(&part.get("type").bytes()));
+    if !kind.is_empty() {
+        return if kind == b"text" {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&kind).into_owned()
+        };
+    }
+    if part.get("inlineData").exists() || part.get("inline_data").exists() {
+        return "inlineData".into();
+    }
+    if part.get("fileData").exists() || part.get("file_data").exists() {
+        return "fileData".into();
+    }
+    String::new()
+}
+
+/// `IsHTTPURL`: Go's `url.Parse` succeeds, the host is non-empty and the scheme is http(s).
+pub fn is_http_url(value: &[u8]) -> bool {
+    // Go keeps invalid UTF-8 bytes; url.Parse accepts any byte >= 0x80 where it accepts
+    // U+FFFD, and only the host's emptiness is read.
+    let value = String::from_utf8_lossy(trim_space(value));
+    cpa_core::config::go_url::parse(&value)
+        .is_some_and(|u| !u.host().is_empty() && matches!(u.scheme.as_str(), "http" | "https"))
 }

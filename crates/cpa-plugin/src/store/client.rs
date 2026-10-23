@@ -2,6 +2,7 @@
 //! request_identity.go): registry, release and artifact downloads with manual
 //! redirects, per-hop store authentication and the GitHub rate limiter.
 
+use cpa_core::gostr::GoStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -205,7 +206,7 @@ impl Client {
         let (headers, authenticated) = self.auth_headers(&request_url, REQUEST_KIND_METADATA)?;
         let key = format!(
             "{}/{}",
-            request_url.to_lowercase(),
+            request_url.go_lower(),
             request_identity(&self.network_scope, &headers, authenticated)
         );
         let mut client = self.clone();

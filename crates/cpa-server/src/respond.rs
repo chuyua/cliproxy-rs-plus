@@ -144,14 +144,18 @@ pub fn write_upstream_headers(dst: &mut axum::http::HeaderMap, src: &axum::http:
     }
 }
 
-/// Go `WriteErrorResponse` with passthrough on: the error's upstream headers replace
-/// the response's, reserved names excepted.
+/// Go `WriteErrorResponse` with passthrough on: the error's addon headers replace the
+/// response's, reserved names excepted. Content-Type stays the response's: Go sets
+/// `application/json` after copying the addon.
 // ponytail: Go copies these unfiltered, so an upstream Content-Length (or other
 // framing header) can declare the wrong length for CPA's error body; framing and
 // hop-by-hop headers are dropped here to keep the response valid.
 pub fn write_error_headers(dst: &mut axum::http::HeaderMap, src: &axum::http::HeaderMap) {
     for name in src.keys() {
-        if reserved_response_header(name.as_str()) || hop_by_hop(name.as_str()) {
+        if reserved_response_header(name.as_str())
+            || hop_by_hop(name.as_str())
+            || name == axum::http::header::CONTENT_TYPE
+        {
             continue;
         }
         dst.remove(name);
@@ -443,7 +447,7 @@ mod tests {
                 ("x-b", "1"),
             ]),
         );
-        assert_eq!(dst["content-type"], "text/html");
+        assert_eq!(dst["content-type"], "application/json");
         assert_eq!(dst["x-cpa-trace-id"], "t");
         assert!(dst.get("content-length").is_none());
         assert_eq!(dst["x-b"], "1");

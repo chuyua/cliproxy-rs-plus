@@ -1,5 +1,6 @@
 //! The `net/url` reads the store makes, over cpa-exec's port of Go's `url.Parse`.
 
+use cpa_core::gostr::GoStr;
 pub use cpa_exec::xai_url::GoUrl;
 
 /// `url.Parse`; `None` where Go returns an error.
@@ -94,7 +95,7 @@ pub fn has_sensitive_query_parameter(u: &GoUrl) -> bool {
     !u.raw_query.is_empty()
         && query_keys(&u.raw_query).iter().any(|key| {
             matches!(
-                key.trim().to_lowercase().as_str(),
+                key.trim().go_lower().as_str(),
                 "token" | "access_token" | "access_key" | "secret" | "secret_key" | "api_key"
             )
         })

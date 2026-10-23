@@ -20,6 +20,7 @@ use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
+use cpa_common::gostr::GoStr;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_exec::wsrelay::{self, Relay};
@@ -65,7 +66,7 @@ fn observe(rt: &Weak<Runtime>, provider: &str, cause: Option<&str>) {
     };
     match cause {
         None => {
-            if !provider.to_lowercase().starts_with("aistudio-") {
+            if !provider.go_lower().starts_with("aistudio-") {
                 return;
             }
             if rt.store().add_runtime(Credential::relay_session(provider)) {

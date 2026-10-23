@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - feature/gcl2api-antigravity-403-20261019
+      - 'sync/**'
+      - 'integration/**'
   workflow_dispatch:
 
 permissions:
@@ -57,6 +59,10 @@ jobs:
         run: cargo test --locked -p cpa-server --lib antigravity_cli_probe -- --nocapture
       - name: Antigravity verified CLI version SQLite tests
         run: cargo test --locked -p cpa-server --lib antigravity_cli_state -- --nocapture
+      - name: Antigravity management OAuth regression
+        run: cargo test --locked -p cpa-server --test management antigravity_management -- --nocapture
+      - name: Antigravity v0/v8 management aliases
+        run: cargo test --locked -p cpa-server --test legacy_go v0_aliases_match_v8_and_lists_carry_live_auth_indexes -- --nocapture
       - name: Compile release Linux executable
         run: cargo build --release --locked -p cliproxy
       - name: Smoke test and checksum

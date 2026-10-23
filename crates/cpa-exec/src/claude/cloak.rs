@@ -2,6 +2,7 @@
 //! blocks, caller prompt relocation, current-date reminder, context management,
 //! cache-control placement and TTL policy, and the fake/derived user identity.
 
+use cpa_core::gostr::GoStr;
 use sha2::{Digest, Sha256};
 
 use super::signals;
@@ -38,7 +39,7 @@ const LEGACY_SYSTEM_REMINDER_MODELS: &[&str] = &[
 
 /// Lowercased model without any `provider/` prefix.
 pub(crate) fn canonical_model(model: &str) -> String {
-    let m = model.trim().to_lowercase();
+    let m = model.trim().go_lower();
     m.rsplit('/').next().unwrap_or_default().to_owned()
 }
 
@@ -47,7 +48,7 @@ pub(crate) fn legacy_system_reminder(body: &str) -> bool {
 }
 
 pub(crate) fn is_fable51(model: &str) -> bool {
-    let m = model.trim().to_lowercase();
+    let m = model.trim().go_lower();
     ["fable-5-1", "fable-5.1", "mythos-5-1", "mythos-5.1"].iter().any(|t| {
         m.match_indices(t).take(1).any(|(i, _)| {
             let next = i + t.len();
@@ -585,22 +586,16 @@ pub(crate) fn inject_context_management(body: &str) -> Option<String> {
         .then(|| rawjson::set_raw(body, "context_management", CONTEXT_MANAGEMENT))
 }
 
-/// `reconcileClaudeCodeContextManagement` without payload-rule ownership.
-pub(crate) fn reconcile_context_management(
-    body: String,
-    eligible: bool,
-    caller_owned: bool,
-    injected: bool,
-    payload_touched: bool,
-) -> String {
+/// `reconcileClaudeCodeContextManagement`.
+pub(crate) fn reconcile_context_management(body: String, eligible: bool, caller_owned: bool, injected: bool) -> String {
     let current = rawjson::get(&body, "context_management");
     if !thinking_accepts_clear(&body) {
-        if caller_owned || !injected || payload_touched || current.json() != CONTEXT_MANAGEMENT {
+        if caller_owned || !injected || current.json() != CONTEXT_MANAGEMENT {
             return body;
         }
         return rawjson::delete(&body, "context_management");
     }
-    if !eligible || caller_owned || payload_touched || current.exists() {
+    if !eligible || caller_owned || current.exists() {
         return body;
     }
     rawjson::set_raw(&body, "context_management", CONTEXT_MANAGEMENT)

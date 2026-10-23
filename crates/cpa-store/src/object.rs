@@ -3,6 +3,7 @@
 //! mirrored into `<root>/config` and `<root>/auths`. Path-style requests signed with
 //! SigV4; the region comes from the bucket location like minio-go.
 
+use cpa_core::gostr::GoStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +41,7 @@ impl ObjectConfig {
         if raw.contains("://") {
             let parsed =
                 url::Url::parse(raw).map_err(|e| anyhow!("failed to parse object store endpoint {raw:?}: {e}"))?;
-            use_ssl = match parsed.scheme().to_lowercase().as_str() {
+            use_ssl = match parsed.scheme().go_lower().as_str() {
                 "http" => false,
                 "https" => true,
                 other => bail!("unsupported object store scheme {other:?} (only http and https are allowed)"),
@@ -225,8 +226,11 @@ pub(crate) fn seed_config(example: &Path, target: &Path) -> Result<()> {
         return write_file(target, b"");
     }
     let template = std::fs::read(example).with_context(|| format!("open {}", example.display()))?;
-    write_file(target, &template)?;
-    std::fs::File::open(target)?.sync_all()?;
+    // Go syncs the handle it wrote: Windows refuses to flush a read-only handle.
+    use std::io::Write;
+    let mut file = crate::private_fs::create_truncate(target)?;
+    file.write_all(&template)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -493,6 +497,11 @@ impl ObjectStore {
                 if !self.config_path.exists() {
                     seed_config(example, &self.config_path).context("object store: copy example config")?;
                 }
+                // Seed the bucket with the file the startup load leaves behind, so a
+                // plaintext management secret never reaches it. Fail instead of skipping:
+                // the startup load could turn a refused file into one a later start uploads.
+                cpa_core::config::prepare_for_upload(&self.config_path)
+                    .context("object store: prepare local config for seeding")?;
                 let data = std::fs::read(&self.config_path).context("object store: read local config")?;
                 if !data.is_empty() {
                     self.put(CONFIG_KEY, &data, "application/x-yaml").await?;
@@ -638,6 +647,33 @@ impl cpa_server::persist::StorePersister for ObjectPersister {
     }
 }
 
+/// On every platform: the template reaches a new folder, and no template gives an
+/// empty file.
+#[cfg(test)]
+mod seed_tests {
+    #[test]
+    fn seed_config_copies_the_template() {
+        let root = std::env::temp_dir().join(format!(
+            "cpa-store-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let example = root.join("config.example.yaml");
+        std::fs::write(&example, "port: 8317\r\n").unwrap();
+        let target = root.join("store").join("config").join("config.yaml");
+        super::seed_config(&example, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"port: 8317\r\n");
+        let empty = root.join("empty.yaml");
+        super::seed_config(std::path::Path::new(""), &empty).unwrap();
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 // Mode-bit assertions: Unix only.
 #[cfg(all(test, unix))]
 mod tests {
@@ -708,6 +744,47 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Go `TestObjectTokenStoreSeed*` (f9437700): the seed is the prepared file, and a
+    /// file that would keep a plaintext management secret is not uploaded at all.
+    #[tokio::test]
+    async fn seeding_uploads_the_prepared_config() {
+        const PLAIN: &str = "seed-plaintext-secret";
+        let s3 = FakeS3::start("us-east-1", Location::Answer, 1000).await;
+        let dir = scratch("obj-seed-prepared");
+        let example = dir.join("config.example.yaml");
+        std::fs::write(
+            &example,
+            format!("# note\nport: 8317\nremote-management:\n  secret-key: {PLAIN}\n"),
+        )
+        .unwrap();
+        let seeded = store(&s3, &dir.join("objectstore"));
+        seeded.bootstrap(&example).await.unwrap();
+        let uploaded = String::from_utf8(s3.object("tokens", "config/config.yaml").unwrap()).unwrap();
+        assert!(!uploaded.contains(PLAIN) && uploaded.contains("# note"), "{uploaded}");
+        let hash = cpa_core::config::Config::parse(&uploaded)
+            .unwrap()
+            .management
+            .secret_key;
+        assert!(bcrypt::verify(PLAIN, &hash).unwrap());
+        assert_eq!(std::fs::read_to_string(seeded.config_path()).unwrap(), uploaded);
+
+        let s3 = FakeS3::start("us-east-1", Location::Answer, 1000).await;
+        let dir = scratch("obj-seed-refused");
+        let example = dir.join("config.example.yaml");
+        // The secret aliased into a value a startup validator would quote: the error,
+        // which the binary logs, must not carry it.
+        let anchored = format!("management:\n  secret-key: &key {PLAIN}\ntrusted-proxies: [*key]\n");
+        std::fs::write(&example, &anchored).unwrap();
+        let refused = store(&s3, &dir.join("objectstore"));
+        let error = refused.bootstrap(&example).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("prepare local config for seeding") && !format!("{error:#}").contains(PLAIN),
+            "{error:#}"
+        );
+        assert!(s3.object("tokens", "config/config.yaml").is_none());
+        assert_eq!(std::fs::read_to_string(refused.config_path()).unwrap(), anchored);
     }
 
     #[tokio::test]

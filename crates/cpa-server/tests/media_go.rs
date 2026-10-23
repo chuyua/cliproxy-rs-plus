@@ -1,7 +1,9 @@
 //! `/v1/images/*`, `/v1/videos*` and `/openai/v1/videos*` against goldens recorded from
-//! the unmodified Go server (CLIProxyAPI 6fecc6e) by tests/reference/media: the same
-//! config, client requests and scripted upstream replies, compared on status, the kept
-//! response headers, the response body and every raw upstream request.
+//! the unmodified Go server (CLIProxyAPI 6fecc6e), and `/v1/audio/speech` and `/v1/tts`
+//! against goldens from v8.0.35, as are the passthrough error headers
+//! (`passthrough_errors_go.json`), by tests/reference/media: the same config, client
+//! requests and scripted upstream replies, compared on status, the kept response headers,
+//! the response body and every raw upstream request.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -42,6 +44,9 @@ struct Scenario {
     body: String,
     #[serde(default)]
     body_b64: String,
+    /// A zstd skippable frame of this many zero bytes goes before the body.
+    #[serde(default)]
+    skip_prefix: usize,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -68,6 +73,11 @@ const KEEP: [&str; 6] = [
 /// Scenarios whose Go error message is Go's own dial error text: the status, headers and
 /// the error envelope's `type` and `code` are compared, and the message must be a string.
 const STATUS_ONLY: [&str; 1] = ["video_content_connect_refused"];
+
+/// Scenarios whose Go error copied the stream's own `Content-Length: 0` from its
+/// passthrough headers, which cuts Go's error body to nothing. Rust drops framing
+/// headers from them (`respond::write_error_headers`), so length and body are skipped.
+const ADDON_FRAMING: [&str; 1] = ["compat_stream_empty"];
 
 /// The error envelope check for a [`STATUS_ONLY`] scenario, `None` when it matches Go.
 fn gateway_error_diff(go: &str, rust: &str) -> Option<String> {
@@ -232,16 +242,53 @@ fn canonical_form(s: &str) -> String {
     )
 }
 
+/// The last xAI video builtin in a Grok Shell catalog.
+const PREVIEW_ENTRY: &str = r#"{"id":"grok-imagine-video-1.5-preview","model":"grok-imagine-video-1.5-preview","name":"Grok Imagine Video 1.5 Preview","api_backend":"responses","supported_in_api":true}"#;
+
+/// One process holds one registry overlay, so the two fixtures replay in turn.
 #[tokio::test]
 async fn media_routes_match_go() {
-    let fixture: Fixture = serde_json::from_str(include_str!("fixtures/media_go.json")).expect("fixture parses");
+    let media: Fixture = serde_json::from_str(include_str!("fixtures/media_go.json")).expect("fixture parses");
+    let speech: Fixture = serde_json::from_str(include_str!("fixtures/speech_go.json")).expect("fixture parses");
+    // v8.0.35 adds the speech builtins to the xAI catalog (6a853dce): the 6fecc6e Grok
+    // Shell catalogs expect them as the speech fixture recorded them, after the video
+    // builtins.
+    let catalog = &speech
+        .scenarios
+        .iter()
+        .find(|s| s.name == "models_grok_shell")
+        .expect("speech fixture lists the catalog")
+        .response;
+    let speech_entries = &catalog[catalog.find(r#"{"id":"grok-tts""#).expect("grok-tts listed")..catalog.len() - 2];
+    let mut failures = replay("media", &media, |s| {
+        if s.name.starts_with("models_grok_shell") {
+            s.response
+                .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
+        } else {
+            s.response.clone()
+        }
+    })
+    .await;
+    failures.extend(replay("speech", &speech, |s| s.response.clone()).await);
+    let errors: Fixture =
+        serde_json::from_str(include_str!("fixtures/passthrough_errors_go.json")).expect("fixture parses");
+    failures.extend(replay("errors", &errors, |s| s.response.clone()).await);
+    assert!(
+        failures.is_empty(),
+        "{} scenario(s) differ from Go:\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
 
+/// Replays `fixture` on a fresh runtime; `expected` is the response a scenario must give.
+async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> String) -> Vec<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let upstream = Arc::new(Capture::default());
     tokio::spawn(capture(listener, upstream.clone(), addr.clone()));
 
-    let auth_dir = std::env::temp_dir().join(format!("cpa-media-{}", std::process::id()));
+    let auth_dir = std::env::temp_dir().join(format!("cpa-{tag}-{}", std::process::id()));
     let config = fixture
         .config
         .replace("UPSTREAM", &addr)
@@ -292,11 +339,18 @@ async fn media_routes_match_go() {
         }
         let mut req = client.request(method, format!("{base}{}", s.path)).headers(headers);
         if s.method == "POST" {
-            req = req.body(if s.body_b64.is_empty() {
+            let mut body = Vec::new();
+            if s.skip_prefix > 0 {
+                body.extend([0x50, 0x2a, 0x4d, 0x18]);
+                body.extend((s.skip_prefix as u32).to_le_bytes());
+                body.resize(body.len() + s.skip_prefix, 0);
+            }
+            body.extend(if s.body_b64.is_empty() {
                 s.body.clone().into_bytes()
             } else {
                 base64::engine::general_purpose::STANDARD.decode(&s.body_b64).unwrap()
             });
+            req = req.body(body);
         }
         let res = req.send().await.unwrap_or_else(|e| panic!("{}: {e}", s.name));
         let status = res.status().as_u16();
@@ -327,7 +381,8 @@ async fn media_routes_match_go() {
         if status != s.status {
             diffs.push(format!("status: go {} rust {status}", s.status));
         }
-        let compare_body = !STATUS_ONLY.contains(&s.name.as_str());
+        let framing = ADDON_FRAMING.contains(&s.name.as_str());
+        let compare_body = !STATUS_ONLY.contains(&s.name.as_str()) && !framing;
         let mut want_headers = s.response_headers.clone();
         if !compare_body {
             headers.remove("Content-Length");
@@ -336,10 +391,14 @@ async fn media_routes_match_go() {
         if headers != want_headers {
             diffs.push(format!("headers:\n  go   {:?}\n  rust {headers:?}", s.response_headers));
         }
-        if compare_body && (response != s.response || response_b64 != s.response_b64) {
-            diffs.push(format!("body:\n  go   {}\n  rust {response}", s.response));
+        let want = expected(s);
+        if compare_body && (response != want || response_b64 != s.response_b64) {
+            diffs.push(format!("body:\n  go   {want}\n  rust {response}"));
         }
-        if !compare_body && let Some(diff) = gateway_error_diff(&s.response, &response) {
+        if !compare_body
+            && !framing
+            && let Some(diff) = gateway_error_diff(&s.response, &response)
+        {
             diffs.push(diff);
         }
         if requests != s.requests {
@@ -349,13 +408,33 @@ async fn media_routes_match_go() {
             ));
         }
         if !diffs.is_empty() {
-            failures.push(format!("== {}\n{}", s.name, diffs.join("\n")));
+            failures.push(format!("== {tag}/{}\n{}", s.name, diffs.join("\n")));
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{} scenario(s) differ from Go:\n{}",
-        failures.len(),
-        failures.join("\n\n")
-    );
+    if tag == "speech" {
+        // Past the shared request limit: Go has none by default, reads an identity body
+        // whole and answers its decoded 1 MiB check.
+        let want = fixture
+            .scenarios
+            .iter()
+            .find(|s| s.name == "speech_zstd_decoded_too_large")
+            .expect("the oversize scenario");
+        let res = client
+            .post(format!("{base}/v1/tts"))
+            .header("Authorization", "Bearer client-key-1")
+            .header("Content-Type", "application/json")
+            .body(vec![b' '; cpa_server::MAX_REQUEST_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let body = res.text().await.unwrap();
+        if (status, body.as_str()) != (want.status, want.response.as_str()) {
+            failures.push(format!(
+                "== speech/identity_body_over_request_limit\n  go   {} {}\n  rust {status} {body}",
+                want.status, want.response
+            ));
+        }
+    }
+    failures
 }

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use bytes::{Bytes, BytesMut};
 use cpa_core::exec::ExecError;
+use cpa_core::gostr::GoStr;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
@@ -595,7 +596,6 @@ pub(crate) fn replace_all(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 }
 
 fn eq_fold(a: &[u8], b: &str) -> bool {
-    use cpa_common::gostr::GoStr;
     String::from_utf8_lossy(a).go_eq_fold(b)
 }
 
@@ -627,7 +627,9 @@ pub(crate) fn sanitize_tool_description(name: &[u8], description: &[u8]) -> Vec<
     if description.is_empty() {
         return Vec::new();
     }
-    let lower = String::from_utf8_lossy(cpa_common::gostr::trim_space(name)).to_lowercase();
+    let lower = String::from_utf8_lossy(cpa_common::gostr::trim_space(name))
+        .as_ref()
+        .go_lower();
     let mut desc = description.to_vec();
     if lower == "exec_command" || lower.ends_with("__exec_command") {
         desc = if contains(&desc, EXEC_OBFUSCATED) {
@@ -1124,7 +1126,7 @@ pub(crate) fn parse_dimension_groups(groups: &[Vec<u8>]) -> Option<(i64, i64, i6
             }
             _ => {}
         });
-        if String::from_utf8_lossy(title).to_lowercase() == "token usage" {
+        if String::from_utf8_lossy(title).go_eq_fold("Token Usage") {
             for (key, value) in &metrics {
                 match key.as_slice() {
                     b"input_tokens" => {
@@ -1160,7 +1162,6 @@ fn go_json_string(value: &cpa_common::json::Res<'_>) -> String {
 /// field names match case-insensitively (Go's fold), duplicates decode in order into the
 /// same struct, and any type mismatch makes the whole decode an error (`None`).
 fn decode_trailer(payload: &[u8]) -> Option<(String, String)> {
-    use cpa_common::gostr::GoStr;
     use cpa_common::json::{self as gj, Kind};
     if !gj::std_valid(payload) {
         return None;
@@ -1211,7 +1212,6 @@ fn decode_trailer(payload: &[u8]) -> Option<(String, String)> {
 /// `ParseDevinTrailerError`: the HTTP status and message of an EOS trailer error;
 /// `None` for a clean end.
 pub(crate) fn parse_trailer_error(payload: &[u8]) -> Option<(u16, String)> {
-    use cpa_common::gostr::GoStr;
     let trimmed = cpa_common::gostr::trim_space(payload);
     if trimmed.is_empty() || trimmed == b"{}" {
         return None;
@@ -1467,104 +1467,6 @@ fn usage_json(u: &Usage) -> Vec<u8> {
         o.raw("headers", &h);
     }
     o.end()
-}
-
-/// What `BuildDevinUpstreamLogBody` receives.
-pub(crate) struct RequestLog<'a> {
-    pub interactions: &'a [u8],
-    pub interactions_source: bool,
-    pub model_uid: &'a str,
-    /// The system prompt after `SanitizeDevinSystemPrompt`.
-    pub system_prompt: &'a [u8],
-    pub prompts: &'a [Prompt],
-    pub tools: &'a [Tool],
-    pub temperature: Option<f64>,
-    pub max_tokens: i64,
-    pub session_id: &'a str,
-    pub cascade_id: &'a str,
-}
-
-/// `BuildDevinUpstreamLogBody`: the request Go logs instead of the protobuf it sends.
-pub(crate) fn request_log_body(r: &RequestLog<'_>) -> Vec<u8> {
-    let prompts = r.prompts.iter().map(|p| {
-        let role: &[u8] = match p.source {
-            2 => b"assistant",
-            4 => b"tool",
-            _ => b"user",
-        };
-        let mut o = GoObject::new();
-        o.string_omit("id", p.message_id.as_bytes());
-        o.int("source", p.source);
-        o.string_omit("role", role);
-        o.string_omit("content", &p.content);
-        o.string_omit("thinking", &p.thinking);
-        o.string_omit("signature", &signature_for_log(&p.signature));
-        o.string_omit("signature_type", &p.signature_type);
-        if !p.tool_calls.is_empty() {
-            o.raw("tool_calls", &tool_calls_json(&p.tool_calls));
-        }
-        o.string_omit("tool_call_id", &p.tool_call_id);
-        if !p.images.is_empty() {
-            o.raw(
-                "images",
-                &go_array(p.images.iter().map(|img| {
-                    let mut i = GoObject::new();
-                    i.string("mime_type", &img.mime);
-                    i.int("data_len", img.base64.len());
-                    i.end()
-                })),
-            );
-        }
-        o.end()
-    });
-    let tools = r
-        .tools
-        .iter()
-        .filter(|t| !t.name.is_empty() && !is_codex_app_automation_update(b"", &t.name))
-        .map(|t| {
-            let mut o = GoObject::new();
-            o.string("name", &t.name);
-            o.string_omit("description", &tool_description(&t.name, &t.description));
-            if !t.parameters.is_empty() && cpa_common::json::std_valid(&t.parameters) {
-                // json.RawMessage: compacted with HTML escapes.
-                o.raw("parameters", &cpa_common::json::compact(&t.parameters, true));
-            }
-            o.end()
-        });
-    let prompts: Vec<Vec<u8>> = prompts.collect();
-    let tools: Vec<Vec<u8>> = tools.collect();
-    let mut o = GoObject::new();
-    o.string("model", r.model_uid.as_bytes());
-    o.string_omit("session_id", r.session_id.as_bytes());
-    o.string_omit("cascade_id", r.cascade_id.as_bytes());
-    o.string_omit("system_prompt", r.system_prompt);
-    let request = match r.temperature.map(cpa_common::json::json_float) {
-        // MarshalIndent fails on NaN or an infinity: Go logs only the model.
-        Some(None) => format!(r#"{{"model": {}}}"#, cpa_common::gostr::quote(r.model_uid)).into_bytes(),
-        temperature => {
-            if let Some(Some(t)) = temperature {
-                o.raw("temperature", t.as_bytes());
-            }
-            if r.max_tokens != 0 {
-                o.int("max_tokens", r.max_tokens);
-            }
-            if !prompts.is_empty() {
-                o.raw("prompts", &go_array(prompts));
-            }
-            if !tools.is_empty() {
-                o.raw("tools", &go_array(tools));
-            }
-            go_indent(&o.end()).unwrap_or_default()
-        }
-    };
-    if r.interactions_source || r.interactions.is_empty() {
-        return request;
-    }
-    let mut out = b"=== INTERMEDIATE INTERACTIONS ===\n".to_vec();
-    out.extend_from_slice(&go_indent(r.interactions).unwrap_or_else(|| r.interactions.to_vec()));
-    out.extend_from_slice(b"\n\n=== DEVIN UPSTREAM REQUEST ===\n");
-    out.extend_from_slice(&request);
-    out
 }
 
 /// `DevinUpstreamResponseLog`: the decoded frames Go logs for a response.

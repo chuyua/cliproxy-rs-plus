@@ -3,7 +3,7 @@
 //! A quota plugin answers for its `quota.identifier`, its plugin ID, its auth provider's
 //! identifier, and then any provider its `quota.describe` lists (cached per snapshot).
 
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use crate::abi::method;
 use crate::api::{
@@ -141,36 +141,44 @@ impl Host {
         out
     }
 
-    /// Go `QuotaSupportedProvidersSet`.
-    pub async fn quota_supported_providers(&self) -> BTreeSet<String> {
+    /// Go `QuotaProviderPluginIDs`: each provider key to the plugin
+    /// [`Self::quota_provider_record`] would select for it, with its two-pass
+    /// precedence. A plugin fused while describing loses its keys to the next candidate.
+    pub async fn quota_provider_plugin_ids(&self) -> HashMap<String, String> {
         let snapshot = self.snapshot();
-        let mut out = BTreeSet::new();
+        // Candidates in selection order per provider; describing may fuse a plugin.
+        let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
+        let mut add = |provider: String, id: &str| {
+            if !provider.is_empty() {
+                candidates.entry(provider).or_default().push(id.to_owned());
+            }
+        };
+        let mut records = Vec::new();
+        // First pass: the quota identifier, the plugin ID, the auth identifier.
         for record in self.quota_records_in(&snapshot) {
             if self.is_fused(&record.id) {
                 continue;
             }
-            let id = Self::quota_identifier(&record);
-            if !id.is_empty() {
-                out.insert(id);
-            }
-            let plugin = normalize_provider(&record.id);
-            if !plugin.is_empty() {
-                out.insert(plugin);
-            }
+            add(Self::quota_identifier(&record), &record.id);
+            add(normalize_provider(&record.id), &record.id);
             if record.plugin.caps.auth_provider {
-                let auth = normalize_provider(&record.plugin.auth_identifier);
-                if !auth.is_empty() {
-                    out.insert(auth);
-                }
+                add(normalize_provider(&record.plugin.auth_identifier), &record.id);
             }
-            for p in self.supported_providers(&snapshot, &record).await {
-                let p = normalize_provider(&p);
-                if !p.is_empty() {
-                    out.insert(p);
-                }
+            records.push(record);
+        }
+        // Second pass: the providers each plugin describes.
+        for record in &records {
+            if self.is_fused(&record.id) {
+                continue;
+            }
+            for p in self.supported_providers(&snapshot, record).await {
+                add(normalize_provider(&p), &record.id);
             }
         }
-        out
+        candidates
+            .into_iter()
+            .filter_map(|(provider, ids)| Some((provider, ids.into_iter().find(|id| !self.is_fused(id))?)))
+            .collect()
     }
 
     /// Go `quotaProviderRecord`.

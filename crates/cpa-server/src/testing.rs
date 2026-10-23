@@ -11,7 +11,9 @@
 //! A non-loopback proxy (including `direct`) does not count: it could reach a
 //! provider. Stored credentials never change, so management listings, reconciliation and
 //! features that pick their own proxy (management `api-call`, `latest-version`) behave
-//! as configured.
+//! as configured. Such a runtime also starts no remote model catalog refresh
+//! (models.json, the Codex client list, Devin, the Antigravity version); the embedded
+//! catalogs stay in use.
 // ponytail: the realtime routes dial through the Codex executor's live endpoints
 // directly, outside these executor calls; their tests build those endpoints on mocks.
 
@@ -85,6 +87,13 @@ fn is_loopback(raw: &str) -> bool {
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Registers, after the client keys, the frontend auth provider of a plugin that is not
+/// loaded: it reads each request body and never accepts.
+pub fn unloaded_frontend_auth(rt: &Runtime) {
+    rt.plugin_runtime()
+        .register_access(true, vec![("plugin-auth".into(), "p".into())], None);
 }
 
 #[cfg(test)]

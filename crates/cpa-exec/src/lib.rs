@@ -44,6 +44,9 @@ pub mod codex_quota;
 mod codex_replay;
 mod codex_request;
 mod codex_response;
+pub mod codex_siwc;
+pub mod codex_siwc_bind;
+mod codex_sse;
 #[cfg(test)]
 mod codex_testkit;
 mod codex_tls;
@@ -52,6 +55,7 @@ mod codex_ws;
 pub mod devin;
 pub mod devin_auth;
 pub mod devin_models;
+mod devin_payload;
 mod devin_request;
 mod devin_wire;
 pub mod gemini;
@@ -76,6 +80,8 @@ pub mod openai_compat_multipart;
 mod openai_compat_payload;
 #[cfg(test)]
 mod openai_compat_usage;
+mod payload_barrier;
+mod payload_media;
 pub mod proxy;
 mod quota;
 mod rawjson;
@@ -90,6 +96,7 @@ mod upstream;
 pub mod vertex;
 pub mod vertex_auth;
 mod wire;
+mod ws_observation;
 pub mod wsrelay;
 pub mod xai;
 pub mod xai_auth;
@@ -103,9 +110,13 @@ use cpa_core::config::Config;
 use cpa_core::credential::{Credential, MetadataPatch};
 use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope};
 
+/// Go `Auth.ExpirationTime`, `authLastRefreshTimestamp` and `authPreferredInterval`, for
+/// the server's plugin refresh schedule (Go `shouldRefresh` for providers without a lead).
+pub use kimi_http::{expiration, last_refresh, preferred_interval};
 /// Go `helps.EnsureResponsesUsageDetails`, for paths outside the executors (plugin
 /// executors' Responses payloads and stream chunks).
 pub use openai_compat_payload::ensure_responses_usage_details;
+pub use xai_ws::websockets_enabled;
 
 /// What a credential needs before or around use. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +226,20 @@ impl Executors {
         }
     }
 
+    /// The OpenAI speech routes (`/v1/audio/speech`, `/v1/tts`): Go's `openai-speech`
+    /// source, which only the xAI executor serves.
+    pub async fn speech(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        match credential.provider.as_str() {
+            xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
+            other => Err(no_executor(other)),
+        }
+    }
+
     /// One turn of a downstream Responses WebSocket session. Codex and xAI credentials
     /// with `websockets` keep a pooled upstream socket per session; every other credential
     /// runs an ordinary execution and cannot continue upstream state, so a continuation
@@ -263,6 +288,18 @@ impl Executors {
         self.openai.xai.close_session(id);
     }
 
+    /// Go `CloseCodexWebsocketSessionsForAuthID` and `CloseXAIWebsocketSessionsForAuthID`
+    /// for the credential store: given a removed credential's id, ends only the upstream
+    /// WebSocket sessions that credential serves.
+    pub fn credential_session_closer(&self) -> impl Fn(&str) + Send + Sync + 'static {
+        let codex = self.codex.ws.clone();
+        let xai = self.openai.xai.ws.clone();
+        move |id| {
+            codex.close_credential(id);
+            xai.close_credential(id);
+        }
+    }
+
     /// Whether an executor serves this provider. Credentials of other providers never
     /// enter selection (Go skips auths whose executor is not registered).
     pub fn supports(&self, provider: &str) -> bool {
@@ -285,6 +322,11 @@ impl Executors {
     pub fn has_refresh_credential(&self, credential: &Credential) -> bool {
         let filled = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
         if filled(credential.str("refresh_token")) || filled(credential.str("refreshToken")) {
+            return true;
+        }
+        // Go `CodexSIWCNeedsRefresh`'s hasRefresh: a `siwc` refresh token and client ID.
+        // ponytail: Go asks it of every provider; Codex only until the Claude replay.
+        if credential.provider == "codex" && codex_siwc::refresh_due(credential, chrono::Utc::now()).is_some() {
             return true;
         }
         credential.provider.trim().eq_ignore_ascii_case("meta")
@@ -364,6 +406,26 @@ impl Executors {
     /// providers that probe capabilities after registration start here. Must not block.
     pub fn models_registered(&self, credentials: &[std::sync::Arc<Credential>], cfg: &Config) {
         self.google.antigravity.models_registered(credentials, cfg);
+    }
+
+    /// [`Self::prepare`] for a credential whose access token an upstream rejected, or a
+    /// management refresh: Codex refreshes even when not due (Go marks the token rejected
+    /// or forces the refresh). Other providers prepare as usual; most of them (Claude
+    /// once its identity is known, Kimi, Meta, Devin) refresh whenever asked.
+    pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        match credential.provider.as_str() {
+            "codex" => self.codex.refresh_now(credential, cfg).await,
+            _ => self.prepare(credential, cfg).await,
+        }
+    }
+
+    /// [`Self::prepare_forced`] for a management refresh (Go `IsForceRefreshContext`):
+    /// Codex refreshes every token partition that can refresh.
+    pub async fn prepare_management(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        match credential.provider.as_str() {
+            "codex" => self.codex.refresh_all(credential, cfg).await,
+            _ => self.prepare_forced(credential, cfg).await,
+        }
     }
 
     /// Prepares `credential` and returns the metadata change to commit.
@@ -588,6 +650,17 @@ mod readiness_tests {
         assert!(has(serde_json::json!({"type": "claude", "refresh_token": "fake"})));
         assert!(has(serde_json::json!({"type": "kimi", "refreshToken": "fake"})));
         assert!(!has(serde_json::json!({"type": "claude", "refresh_token": "  "})));
+        // A Sign in with ChatGPT partition needs its refresh token and client ID.
+        assert!(has(
+            serde_json::json!({"type": "codex", "siwc": {"refresh_token": "fake", "client_id": "c"}})
+        ));
+        assert!(!has(
+            serde_json::json!({"type": "codex", "siwc": {"refresh_token": "fake"}})
+        ));
+        assert!(
+            !has(serde_json::json!({"type": "claude", "siwc": {"refresh_token": "fake", "client_id": "c"}})),
+            "SIWC is Codex's"
+        );
         assert!(has(serde_json::json!({"type": "meta", "dca_token": "fake"})));
         assert!(
             !has(serde_json::json!({"type": "claude", "dca_token": "fake"})),

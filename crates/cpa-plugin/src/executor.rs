@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use cpa_core::format::Format;
+use cpa_core::gostr::GoStr;
 use futures_util::stream::BoxStream;
 
 use crate::abi::method;
@@ -18,7 +19,7 @@ use crate::streams::{Chunk, Reader};
 /// Go `normalizeExecutorFormatName`: aliases map to translator formats; anything else
 /// is kept as written (trimmed); empty and `none` mean no format.
 pub fn normalize_format(raw: &str) -> String {
-    match raw.trim().to_lowercase().as_str() {
+    match raw.trim().go_lower().as_str() {
         "" | "none" => String::new(),
         "chat-completions" | "chat_completions" | "openai-chat-completions" | "openai_chat_completions" => {
             "openai".into()

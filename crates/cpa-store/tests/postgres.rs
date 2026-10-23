@@ -547,3 +547,50 @@ async fn cooldown_instances_merge_like_go() {
     .await
     .unwrap();
 }
+
+/// Go `TestPostgresStoreSeed*` (f9437700): the seeded row is the prepared file, and a
+/// file that would keep a plaintext management secret seeds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_upserts_the_prepared_config() {
+    const PLAIN: &str = "seed-plaintext-secret";
+    let Some(cluster) = Cluster::start() else { return };
+    let sql = cluster.client().await;
+    let row = |schema: &'static str| {
+        let sql = &sql;
+        async move {
+            sql.query_opt(
+                &format!("SELECT content FROM {schema}.config_store WHERE id = 'config'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get::<_, String>(0))
+        }
+    };
+    let dir = scratch("seed-prepared");
+    let example = dir.join("config.example.yaml");
+    std::fs::write(
+        &example,
+        format!("port: 8317\nremote-management:\n  secret-key: {PLAIN}\n"),
+    )
+    .unwrap();
+    let seeded = store(&cluster, "seeded", &dir.join("pgstore")).await;
+    seeded.bootstrap(&example).await.unwrap();
+    let content = row("seeded").await.unwrap();
+    assert!(!content.contains(PLAIN), "{content}");
+    let hash = cpa_core::config::Config::parse(&content).unwrap().management.secret_key;
+    assert!(bcrypt::verify(PLAIN, &hash).unwrap());
+
+    let dir = scratch("seed-refused");
+    let example = dir.join("config.example.yaml");
+    let anchored = format!("defaults: &management\n  secret-key: {PLAIN}\nmanagement: *management\n");
+    std::fs::write(&example, &anchored).unwrap();
+    let refused = store(&cluster, "refused", &dir.join("pgstore")).await;
+    let error = refused.bootstrap(&example).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("prepare local config for seeding"),
+        "{error:#}"
+    );
+    assert_eq!(row("refused").await, None);
+    assert_eq!(std::fs::read_to_string(refused.config_path()).unwrap(), anchored);
+}

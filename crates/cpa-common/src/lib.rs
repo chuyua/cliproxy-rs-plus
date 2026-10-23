@@ -34,13 +34,13 @@ pub mod codex_catalog;
 pub mod codex_client;
 pub mod gemini_schema;
 pub mod gostr;
-mod gostr_tables;
 pub mod headers;
 pub mod idle;
 pub mod json;
 #[cfg(test)]
 mod json_go_vectors;
 pub mod payload;
+pub mod schema;
 pub mod session;
 pub mod signature;
 pub mod thinking;

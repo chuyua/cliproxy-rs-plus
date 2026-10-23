@@ -100,7 +100,13 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
           rustup default "$RUST_TOOLCHAIN"
       - name: Build
-        run: cargo build --release --locked -p cliproxy --target ${{ matrix.target }}
+        run: |
+          cargo tree --locked -p cliproxy --target ${{ matrix.target }} --edges normal --prefix none > release-dependencies.txt
+          if grep -qE '^(pprof|backtrace) v' release-dependencies.txt; then
+            echo '::error::Published release binaries must exclude CPU profiling and symbol resolution'
+            exit 1
+          fi
+          cargo build --release --locked -p cliproxy --target ${{ matrix.target }}
       # Pull requests gate Linux; macOS and Windows are gated here, before anything is
       # published, and weekly by idle.yml. CPU time, wakeups, threads and memory over a
       # minute without requests, against bench/budgets.txt.

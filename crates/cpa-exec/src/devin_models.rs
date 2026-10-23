@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use cpa_common::gostr::GoStr;
 use cpa_common::thinking::parse_suffix;
 use cpa_core::registry::devin;
 
@@ -48,13 +49,13 @@ const KNOWN_SUFFIXES: [&str; 32] = [
 
 /// `HasDevinEffortSuffix`.
 fn has_effort_suffix(model: &str) -> bool {
-    let lower = model.trim().to_lowercase();
+    let lower = model.trim().go_lower();
     KNOWN_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
 /// `NormalizeThinkingLevel`: canonical effort from a level name or a token budget.
 pub(crate) fn normalize_level(level: &str, budget: i64) -> String {
-    let normalized = level.trim().to_lowercase();
+    let normalized = level.trim().go_lower();
     match normalized.as_str() {
         "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "fast" => return normalized,
         "none" | "off" | "disabled" => return "none".into(),
@@ -72,7 +73,7 @@ pub(crate) fn normalize_level(level: &str, budget: i64) -> String {
 
 /// `devinLevelIndex`.
 fn level_index(level: &str) -> Option<usize> {
-    let lower = level.trim().to_lowercase();
+    let lower = level.trim().go_lower();
     ["minimal", "low", "medium", "high", "xhigh", "max"]
         .iter()
         .position(|l| *l == lower)
@@ -84,8 +85,8 @@ fn clamp_effort(requested: &str, allowed: &[String], default: &str) -> String {
     if requested.is_empty() {
         return default.to_owned();
     }
-    let req = requested.trim().to_lowercase();
-    if let Some(a) = allowed.iter().find(|a| a.trim().to_lowercase() == req) {
+    let req = requested.trim().go_lower();
+    if let Some(a) = allowed.iter().find(|a| a.trim().go_lower() == req) {
         return a.clone();
     }
     if req == "none" {
@@ -135,11 +136,16 @@ fn default_effort(base: &str, levels: &[String]) -> String {
 
 /// `ResolveDevinChatModelUID`.
 pub(crate) fn resolve_chat_model_uid(raw_model: &str, thinking_level: &str, budget: i64) -> String {
+    resolve_in(devin::global(), raw_model, thinking_level, budget)
+}
+
+/// [`resolve_chat_model_uid`] against `catalog`.
+pub(crate) fn resolve_in(catalog: &devin::Store, raw_model: &str, thinking_level: &str, budget: i64) -> String {
     let model = raw_model.trim();
     if model.is_empty() {
         return "swe-2-high".into();
     }
-    let clean = if model.to_lowercase().starts_with("devin/") {
+    let clean = if model.go_lower().starts_with("devin/") {
         &model[6..]
     } else {
         model
@@ -157,7 +163,7 @@ pub(crate) fn resolve_chat_model_uid(raw_model: &str, thinking_level: &str, budg
         level = clean[colon + 1..].trim().to_owned();
     }
     let effort = normalize_level(&level, budget);
-    let lower = base.to_lowercase();
+    let lower = base.go_lower();
     let mut canonical = lower.replace('.', "-");
     match canonical.as_str() {
         "claude-haiku-4-5" => return "MODEL_PRIVATE_11".into(),
@@ -180,11 +186,11 @@ pub(crate) fn resolve_chat_model_uid(raw_model: &str, thinking_level: &str, budg
     match canonical.replace('-', "_").as_str() {
         "model_gpt_5_2" => {
             let e = clamp_effort(&effort, &levels(&["none", "low", "medium", "high", "xhigh"]), "low");
-            return format!("MODEL_GPT_5_2_{}", e.to_uppercase());
+            return format!("MODEL_GPT_5_2_{}", e.go_upper());
         }
         "model_google_gemini_3_0_flash" => {
             let e = clamp_effort(&effort, &levels(&["minimal", "low", "medium", "high"]), "high");
-            return format!("MODEL_GOOGLE_GEMINI_3_0_FLASH_{}", e.to_uppercase());
+            return format!("MODEL_GOOGLE_GEMINI_3_0_FLASH_{}", e.go_upper());
         }
         "model_claude_4_5_opus" => {
             return if thinking_on {
@@ -196,7 +202,9 @@ pub(crate) fn resolve_chat_model_uid(raw_model: &str, thinking_level: &str, budg
         }
         _ => {}
     }
-    let info = devin::lookup(&canonical).or_else(|| (canonical != lower).then(|| devin::lookup(&lower)).flatten());
+    let info = catalog
+        .lookup(&canonical)
+        .or_else(|| (canonical != lower).then(|| catalog.lookup(&lower)).flatten());
     let allowed: Vec<String> = info.and_then(|m| m.thinking).map(|t| t.levels).unwrap_or_default();
     match canonical.as_str() {
         "swe-1-7" => {

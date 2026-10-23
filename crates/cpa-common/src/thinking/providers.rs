@@ -8,12 +8,34 @@ use super::{
 use super::{is_empty_object, with_bool, with_int, with_str, without};
 use crate::gostr::GoStr;
 use crate::json;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub(crate) type ApplyFn = fn(&[u8], &Config, Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
 
-/// `GetProviderApplier` for the built-in providers.
-pub(crate) fn applier(provider: &str) -> Option<ApplyFn> {
-    Some(match provider.trim().go_lower().as_str() {
+/// Go `ProviderApplier` for a plugin-owned provider (pluginhost `thinkingAdapter`).
+pub trait PluginApplier: Send + Sync {
+    fn apply(&self, body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
+}
+
+/// A provider's applier: built in, or registered by a plugin.
+pub(crate) enum Applier {
+    Native(ApplyFn),
+    Plugin(Arc<dyn PluginApplier>),
+}
+
+impl Applier {
+    pub(crate) fn apply(&self, body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
+        match self {
+            Applier::Native(f) => f(body, config, info),
+            Applier::Plugin(p) => p.apply(body, config, info),
+        }
+    }
+}
+
+fn native(provider: &str) -> Option<ApplyFn> {
+    Some(match provider {
         "gemini" => gemini,
         "antigravity" => antigravity,
         "interactions" => interactions,
@@ -25,6 +47,77 @@ pub(crate) fn applier(provider: &str) -> Option<ApplyFn> {
     })
 }
 
+struct PluginProvider {
+    owner: String,
+    priority: i64,
+    applier: Arc<dyn PluginApplier>,
+}
+
+/// Go `pluginProviderAppliers`; `PLUGINS_SET` lets lookups skip the lock while empty.
+static PLUGINS: RwLock<BTreeMap<String, PluginProvider>> = RwLock::new(BTreeMap::new());
+static PLUGINS_SET: AtomicBool = AtomicBool::new(false);
+
+fn plugins() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, PluginProvider>> {
+    PLUGINS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Go `RegisterPluginProvider`: `false` for an empty owner or name, a built-in
+/// provider, or a provider already held at a higher priority (or the same priority by
+/// a lower owner ID).
+pub fn register_plugin_provider(owner: &str, name: &str, priority: i64, applier: Arc<dyn PluginApplier>) -> bool {
+    let (owner, name) = (owner.trim(), name.trim().go_lower());
+    if owner.is_empty() || name.is_empty() || native(&name).is_some() {
+        return false;
+    }
+    let mut map = plugins();
+    if let Some(current) = map.get(&name)
+        && (current.priority > priority || (current.priority == priority && current.owner.as_str() <= owner))
+    {
+        return false;
+    }
+    map.insert(
+        name,
+        PluginProvider {
+            owner: owner.to_owned(),
+            priority,
+            applier,
+        },
+    );
+    PLUGINS_SET.store(true, Ordering::Release);
+    true
+}
+
+/// Go `UnregisterPluginProviders`: drops every provider `owner` holds.
+pub fn unregister_plugin_providers(owner: &str) {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return;
+    }
+    let mut map = plugins();
+    map.retain(|_, p| p.owner != owner);
+    PLUGINS_SET.store(!map.is_empty(), Ordering::Release);
+}
+
+/// Go `ClearPluginProviders`.
+pub fn clear_plugin_providers() {
+    let mut map = plugins();
+    map.clear();
+    PLUGINS_SET.store(false, Ordering::Release);
+}
+
+/// Go `GetProviderApplier`: the built-in applier, else a plugin's.
+pub(crate) fn applier(provider: &str) -> Option<Applier> {
+    let provider = provider.trim().go_lower();
+    if let Some(f) = native(&provider) {
+        return Some(Applier::Native(f));
+    }
+    if !PLUGINS_SET.load(Ordering::Acquire) {
+        return None;
+    }
+    let map = PLUGINS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.get(&provider).map(|p| Applier::Plugin(p.applier.clone()))
+}
+
 /// Public entry for callers that need one applier directly (Go `GetProviderApplier`).
 pub fn apply_provider(
     provider: &str,
@@ -32,7 +125,7 @@ pub fn apply_provider(
     config: &Config,
     info: Option<&ModelCaps>,
 ) -> Option<Result<Vec<u8>, Error>> {
-    applier(provider).map(|f| f(body, config, info))
+    applier(provider).map(|f| f.apply(body, config, info))
 }
 
 fn object_or_empty(body: &[u8]) -> Vec<u8> {
@@ -289,12 +382,13 @@ fn normalize_interactions_level(level: &str, info: Option<&ModelCaps>) -> String
 
 // ---- Claude ----
 
-fn claude_disable(body: &[u8], drop_display: bool) -> Vec<u8> {
-    let mut result = with_str(body, "thinking.type", "disabled");
-    result = without(&result, "thinking.budget_tokens");
-    if drop_display {
-        result = without(&result, "thinking.display");
-    }
+/// Go `disableThinking`: `thinking` becomes `{"type": <disable_type>}`, since neither
+/// off type accepts other thinking fields (budget_tokens, display, block_binding), and
+/// the effort is left to the model default.
+fn claude_disable(body: &[u8], disable_type: &str) -> Vec<u8> {
+    let mut result = body.to_vec();
+    json::set_raw(&mut result, "thinking", b"{}");
+    result = with_str(&result, "thinking.type", disable_type);
     result = without(&result, "output_config.effort");
     delete_if_empty_object(result, "output_config")
 }
@@ -335,27 +429,42 @@ fn claude_rejects_disabled(model: &str) -> bool {
     .any(|prefix| model.starts_with(prefix))
 }
 
-/// Thinking off for `model` (the registry ID, or the body's `model` for an alias):
-/// `disabled`, or the lowest effort on a model that refuses `disabled`
-/// (docs/DIFFERENCES-FROM-GO.md).
-// ponytail: a fixed model list; move it into the model registry as a capability if
-// Anthropic keeps adding always-on models.
-fn claude_off(body: &[u8], model: &str, drop_display: bool) -> Vec<u8> {
+/// Thinking off without registry capabilities (Go `applyCompatibleClaude`): `disabled`,
+/// or the lowest effort on a model that refuses `disabled` (`model` is the registry ID,
+/// or the body's `model` for an alias; docs/DIFFERENCES-FROM-GO.md).
+// ponytail: a fixed model list for models the registry cannot describe; drop it if Go
+// starts deciding by name too.
+fn claude_off_unregistered(body: &[u8], model: &str) -> Vec<u8> {
     if claude_rejects_disabled(model) || claude_rejects_disabled(&json::get(body, "model").str()) {
         return claude_adaptive(body, Some("low"));
     }
-    claude_disable(body, drop_display)
+    claude_disable(body, "disabled")
+}
+
+/// Go `disableThinking` with registry capabilities: the model's `DisableType` (Go
+/// ad9e456d; `between_tools` on claude-sonnet-5-5), else `disabled`.
+fn claude_off(body: &[u8], disable_type: &str) -> Vec<u8> {
+    claude_disable(
+        body,
+        if disable_type.is_empty() {
+            "disabled"
+        } else {
+            disable_type
+        },
+    )
 }
 
 fn claude(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
     let model = info.map_or("", |i| i.id.as_str());
     if is_user_defined_model(info) {
         let body = object_or_empty(body);
+        // Go `applyCompatibleClaude` disables with `disabled`, whatever the model.
         return Ok(match config.mode {
-            Mode::None => claude_off(&body, model, true),
+            Mode::None => claude_off_unregistered(&body, model),
             Mode::Auto => claude_enabled(&body, None),
             Mode::Level if config.level.is_empty() => body,
             Mode::Level => claude_adaptive(&body, Some(&config.level)),
+            Mode::Budget if config.budget == 0 => claude_off_unregistered(&body, model),
             Mode::Budget => claude_enabled(&body, Some(config.budget)),
         });
     }
@@ -366,7 +475,7 @@ fn claude(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<
     let body = object_or_empty(body);
     let adaptive = !support.levels.is_empty();
     let budget = match config.mode {
-        Mode::None => return Ok(claude_off(&body, model, true)),
+        Mode::None => return Ok(claude_off(&body, &support.disable_type)),
         Mode::Level if adaptive && !config.level.is_empty() => return Ok(claude_adaptive(&body, Some(&config.level))),
         Mode::Level => match super::convert_level_to_budget(&config.level) {
             Some(budget) => budget,
@@ -377,7 +486,7 @@ fn claude(body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<
         Mode::Auto => return Ok(claude_enabled(&body, None)),
     };
     if budget == 0 {
-        return Ok(claude_off(&body, model, false));
+        return Ok(claude_off(&body, &support.disable_type));
     }
     let result = claude_enabled(&body, Some(budget));
     Ok(normalize_claude_budget(result, budget, info))

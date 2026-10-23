@@ -2,6 +2,7 @@
 //! The list is per request: model capability, body features and caller requests
 //! decide which managed betas appear, in Claude Code 2.1.280's wire order.
 
+use cpa_core::gostr::GoStr;
 use std::collections::HashSet;
 
 use super::cloak::{canonical_model, is_fable51, is_opus55, legacy_system_reminder};
@@ -154,10 +155,10 @@ pub(crate) fn supports_effort(body: &str) -> bool {
     if signals::probe_or_helper(body) {
         return false;
     }
-    if model(body).trim().to_lowercase().contains("haiku") {
+    if model(body).trim().go_lower().contains("haiku") {
         return false;
     }
-    rawjson::string(body, "thinking.type").trim().to_lowercase() != "disabled"
+    rawjson::string(body, "thinking.type").trim().go_lower() != "disabled"
 }
 
 fn display_updates(body: &str) -> bool {
@@ -172,18 +173,14 @@ fn tool_types(body: &str) -> Vec<String> {
     rawjson::get(body, "tools")
         .array()
         .iter()
-        .map(|t| t.get("type").str().trim().to_lowercase())
+        .map(|t| t.get("type").str().trim().go_lower())
         .collect()
 }
 fn advanced_tool_use(body: &str) -> bool {
     let tools = rawjson::get(body, "tools");
     tools.kind() == gjson::Kind::Array
         && tools.array().iter().any(|t| {
-            t.get("type")
-                .str()
-                .trim()
-                .to_lowercase()
-                .starts_with("tool_search_tool_")
+            t.get("type").str().trim().go_lower().starts_with("tool_search_tool_")
                 || t.get("defer_loading").bool()
                 || t.get("input_examples").exists()
                 || t.get("allowed_callers").exists()

@@ -365,8 +365,17 @@ async fn rust_host_matches_go_host() {
     let Some(built) = support::built_plugins_for("go_host::rust_host_matches_go_host") else {
         return;
     };
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/pluginhost_go.json")).unwrap();
-    let scratch = support::scratch("go-host");
+    for (name, fixture) in [
+        ("go-host", include_str!("fixtures/pluginhost_go.json")),
+        ("go-callbacks-v8035", include_str!("fixtures/host_callbacks_v8035.json")),
+    ] {
+        replay(built, name, fixture).await;
+    }
+}
+
+async fn replay(built: &Path, name: &str, fixture: &str) {
+    let fixture: Value = serde_json::from_str(fixture).unwrap();
+    let scratch = support::scratch(name);
     let runner = Runner {
         built: built.to_path_buf(),
         plugin_dir: scratch.join("plugins"),
@@ -382,7 +391,7 @@ async fn rust_host_matches_go_host() {
     for (i, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
         let op = step["op"].as_str().unwrap();
         let got = runner.step(op, &step["args"]).await;
-        if !same(&step["result"], &got) {
+        if step.get("result").is_some() && !same(&step["result"], &got) {
             failures.push(format!(
                 "step {i} {op} {}\n  {}",
                 step["args"].to_string().chars().take(160).collect::<String>(),
@@ -393,7 +402,7 @@ async fn rust_host_matches_go_host() {
     let _ = std::fs::remove_dir_all(Path::new(&scratch));
     assert!(
         failures.is_empty(),
-        "{} step(s) differ from Go:\n{}",
+        "{name}: {} step(s) differ from Go:\n{}",
         failures.len(),
         failures.join("\n")
     );

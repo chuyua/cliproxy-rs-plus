@@ -1,7 +1,7 @@
-# Formatting, lints, the full test suite and the harness build on every pull request and
-# push to master, plus clippy on Windows and the Linux size and idle gates. release.yml
-# calls this workflow too, so a tagged release runs the same checks before it builds
-# anything.
+# Formatting, lints, the full test suite and the harness build on promotion pull requests and
+# push to master, plus clippy and the file writer tests on Windows and the Linux size and
+# idle gates. release.yml calls this workflow too, so a tagged release runs the same checks
+# before it builds anything.
 # One run per change: pushes to master, and pull requests through `pull_request` only. A
 # branch push used to start a second run of every job for the same commit. Runs are
 # grouped per pull request (or per ref outside one), and a newer push cancels the older
@@ -12,6 +12,7 @@ on:
   push:
     branches: [master]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   workflow_call:
 
@@ -31,6 +32,7 @@ env:
 
 jobs:
   linux:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: tests (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -125,6 +127,7 @@ jobs:
   # the harness, and the Codex Live media relay tests, which build cpa-server with its
   # optional media-relay feature. In parallel with the tests above.
   lint:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: fmt, clippy, harness and media relay tests (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -152,11 +155,18 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Profiler excluded from default normal dependencies
+        run: |
+          cargo tree --locked -p cliproxy --edges normal --prefix none > default-dependencies.txt
+          if grep -qE '^(pprof|backtrace) v' default-dependencies.txt; then
+            echo '::error::CPU profiler and symbol resolver must remain opt-in'
+            exit 1
+          fi
       - name: Harness
         env:
           CARGO_NET_OFFLINE: "true"
         run: cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
-      - name: Media relay tests, with external network denied
+      - name: Media relay and CPU profiler tests, with external network denied
         # The same loopback-only namespace as the tests above. All of cpa-server's unit
         # tests run with the feature on, the 25 behind it included.
         run: |
@@ -165,10 +175,11 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             CPA_TEST_NO_SKIP=1 CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always CARGO_INCREMENTAL=0 \
             "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG" \
-            unshare --net -- sh -c 'ip link set lo up && exec setpriv --reuid="$1" --regid="$2" --init-groups -- cargo nextest run -p cpa-server --features media-relay --lib --locked --profile ci' \
+            unshare --net -- sh -c 'ip link set lo up && exec setpriv --reuid="$1" --regid="$2" --init-groups -- cargo nextest run -p cpa-server --features media-relay,pprof --lib --locked --profile ci' \
             sh "$(id -u)" "$(id -g)"
 
   perf:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: ${{ matrix.gates }} (Linux)
     # The release builds use Ubuntu 22.04 too, so the sizes compare with theirs, and its
     # unprivileged user namespaces give bench/idle.sh a loopback-only network. The two
@@ -193,7 +204,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' && matrix.auth-files == 1 }}
       - name: Build
-        run: cargo build --release --locked -p cliproxy
+        run: |
+          cargo tree --locked -p cliproxy --edges normal --prefix none > size-dependencies.txt
+          if grep -qE '^(pprof|backtrace) v' size-dependencies.txt; then
+            echo '::error::Size-gate binaries must exclude CPU profiling and symbol resolution'
+            exit 1
+          fi
+          cargo build --release --locked -p cliproxy
       # Bytes and counts against bench/budgets.txt, never elapsed time.
       - name: Size
         if: matrix.auth-files == 1
@@ -206,11 +223,25 @@ jobs:
         env:
           AUTH_FILES: ${{ matrix.auth-files }}
         run: bench/gate.sh idle linux target/release/cliproxy "$AUTH_FILES"
+      # A failed budget stays failed. Two more fresh processes help distinguish
+      # a stable RSS regression from a noisy hosted runner without weakening
+      # the one-shot fail-closed threshold.
+      - name: Diagnose failed one-account RSS without waiving the gate
+        if: ${{ failure() && matrix.auth-files == 1 }}
+        run: |
+          if [ -x target/release/cliproxy ]; then
+            for i in 1 2; do
+              echo "::group::Additional isolated idle sample $i"
+              bench/idle.sh target/release/cliproxy 1 30
+              echo "::endgroup::"
+            done
+          fi
 
   # Clippy over every target (tests, examples, benches) with warnings as errors, so code
   # that only builds on Windows, test-only code included, is held to the Linux rules.
   # Checking only, no codegen or link, so it stays a few minutes on a warm cache.
   windows:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: clippy (Windows)
     runs-on: windows-2025
     timeout-minutes: 60
@@ -233,3 +264,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+      # The credential and config file writers on Windows, against loopback mocks only.
+      - name: File writer tests
+        run: >-
+          cargo test --locked --target x86_64-pc-windows-msvc -p cpa-exec -p cpa-store --lib --
+          browser_login_writes_go_file a_busy_port_is_go_port_in_use existing_file_keeps_user_fields codex_siwc_bind::
+          seed_config_copies_the_template

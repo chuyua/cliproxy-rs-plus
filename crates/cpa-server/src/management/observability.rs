@@ -1,6 +1,7 @@
 //! `GET /server/latest-version`, `GET /observability/usage/api-keys` and
 //! `GET /observability/usage/queue` (Go config_basic.go, api_key_usage.go, usage.go).
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -121,7 +122,7 @@ pub(crate) async fn api_key_usage(State(state): State<Arc<Management>>) -> Respo
             .map(|n| n.trim())
             .filter(|n| !n.is_empty())
             .unwrap_or(c.provider.trim())
-            .to_lowercase();
+            .go_lower();
         let provider = if provider.is_empty() {
             "unknown".to_owned()
         } else {

@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock, Weak};
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::HeaderMap;
+use cpa_common::gostr::GoStr;
 use cpa_core::config::Config;
 use cpa_core::exec::Caller;
 use tokio::sync::watch;
@@ -16,12 +17,19 @@ use crate::Runtime;
 
 pub(crate) mod execution;
 pub(crate) mod interceptors;
+pub(crate) mod model_callbacks;
+pub(crate) mod refresh;
 
 /// The host plus the config it should converge on.
 pub struct PluginRuntime {
     host: cpa_plugin::Host,
-    latest: watch::Sender<Option<Arc<Config>>>,
+    /// The latest published config and its publish sequence number.
+    latest: watch::Sender<Option<(u64, Arc<Config>)>>,
+    /// The sequence number of the last config the worker applied.
+    applied: watch::Sender<u64>,
     access: RwLock<Arc<AccessRegistry>>,
+    /// Go's executor table entries owned by plugins: provider to the registered executor.
+    executors: RwLock<HashMap<String, cpa_plugin::executor::Adapter>>,
 }
 
 impl Default for PluginRuntime {
@@ -37,7 +45,9 @@ impl PluginRuntime {
         Self {
             host,
             latest: watch::Sender::new(None),
+            applied: watch::Sender::new(0),
             access: RwLock::default(),
+            executors: RwLock::default(),
         }
     }
 
@@ -45,18 +55,61 @@ impl PluginRuntime {
         &self.host
     }
 
+    /// The registered plugin executor serving `credential`, if any. Go binds a
+    /// credential's executor as the credential arrives (`registerExecutorForAuth`): a
+    /// credential [`binds_native`] replaces a plugin executor registered for its
+    /// provider at once, while the table here changes only on a plugin sync. So the
+    /// table is consulted only for credentials that would leave a plugin executor bound.
+    pub(crate) fn executor(
+        &self,
+        credential: &cpa_core::credential::Credential,
+        cfg: &Config,
+    ) -> Option<cpa_plugin::executor::Adapter> {
+        let adapter = {
+            let executors = self.executors.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            executors.get(&credential.provider.trim().go_lower()).cloned()?
+        };
+        let compat_names = cpa_core::config::credentials::openai_compat_names(cfg);
+        (!binds_native(credential, &compat_names)).then_some(adapter)
+    }
+
+    /// Whether a plugin executor is registered for `provider`.
+    pub(crate) fn has_executor(&self, provider: &str) -> bool {
+        let executors = self.executors.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        executors.contains_key(&provider.trim().go_lower())
+    }
+
     /// Records a published config; the worker started by [`start`] applies it.
     pub(crate) fn config_published(&self, cfg: Arc<Config>) {
-        self.latest.send_replace(Some(cfg));
+        self.latest.send_modify(|latest| {
+            let seq = latest.as_ref().map_or(1, |(seq, _)| seq + 1);
+            *latest = Some((seq, cfg));
+        });
     }
+
+    fn published_seq(&self) -> u64 {
+        self.latest.borrow().as_ref().map_or(0, |(seq, _)| *seq)
+    }
+}
+
+/// Waits until the plugin worker started by [`start`] has applied every config published
+/// so far (Go applies plugin config synchronously while it applies a config).
+pub async fn applied(rt: &Runtime) {
+    let seq = rt.plugin_runtime().published_seq();
+    let _ = rt
+        .plugin_runtime()
+        .applied
+        .subscribe()
+        .wait_for(|applied| *applied >= seq)
+        .await;
 }
 
 /// Go's startup and reload sequence (`syncPluginRuntimeConfigForConfig` and
 /// `RefreshPluginManagementRoutes`): apply the config, register the client-key and
 /// plugin frontend auth providers, then rebuild the plugin management routes around the
-/// built-in ones.
-/// ponytail: usage, model and executor registration join the sync with the dispatch
-/// wiring.
+/// built-in ones, then register plugin models and executors (`syncPluginModelRuntime`).
+/// Go runs that last step only once its listener is up; here it completes before
+/// serving.
 pub async fn sync(rt: &Runtime, cfg: Arc<Config>) {
     let host = rt.plugins();
     host.apply_config(cfg.clone()).await;
@@ -66,6 +119,421 @@ pub async fn sync(rt: &Runtime, cfg: Arc<Config>) {
     rt.plugin_runtime()
         .register_access(!cfg.api_keys.is_empty(), providers, exclusive);
     host.register_management_routes(&reserved_management_routes()).await;
+    // Go `sdktranslator.SetPluginHooks(s.pluginHost)`: the hooks are skipped while no
+    // plugin offers one.
+    cpa_translate::hooks::set_plugin_hooks(Some(host.translator_hooks()));
+    // Go `registerPluginAuthParser`: auth files go to plugin auth providers first; the
+    // next auth-folder reload picks up what a newly loaded plugin parses.
+    cpa_core::config::credentials::set_plugin_auth_parser(Some(host.auth_parser()));
+    sync_models(rt).await;
+}
+
+/// Go loads plugins while it builds the service, so its first auth-folder load already
+/// asks plugin auth providers (sdk/cliproxy/builder.go `ApplyConfig`, then
+/// `coreManager.Load` in `Service.Run`). Credentials load before plugins start here, so
+/// the binary calls this once they have: while a plugin offers an auth provider, the
+/// auth folder and config credentials load again, before serving. Not in Home mode,
+/// whose credentials come from Home. Published as the watcher publishes a scan: a file
+/// changed after the scan read it (a token refresh committed meanwhile) keeps its
+/// current credential, and so does a file the scan read half-written. Plugins parse on
+/// a blocking thread, holding no lock: a parse can make host callbacks that need the
+/// async runtime, even with one worker thread. This load registers the credentials as
+/// Go's first one does, so it replaces the startup load's refresh schedules
+/// ([`crate::runtime::CredentialStore::end_bootstrap`]).
+pub async fn reload_plugin_auth_files(rt: &Arc<Runtime>) {
+    use cpa_core::config::credentials;
+    /// Ends the startup window however the load ends, a failed one included, so the
+    /// refresh loop never waits on provisional schedules. Owned by the load itself: a
+    /// dropped caller leaves the window open until the parse it started is published.
+    struct EndBootstrap(Arc<Runtime>);
+    impl Drop for EndBootstrap {
+        fn drop(&mut self) {
+            self.0.store().end_bootstrap();
+        }
+    }
+    let end = EndBootstrap(rt.clone());
+    if !credentials::plugin_auth_parser_active() {
+        return;
+    }
+    let rt = rt.clone();
+    let reload = tokio::task::spawn_blocking(move || {
+        let _end = end;
+        let cfg = rt.config();
+        credentials::preparse_auth_dir(&cfg);
+        let scan = credentials::scan_auth_dir(&cfg);
+        let mut all = scan.credentials;
+        for existing in rt.store().snapshot() {
+            if let cpa_core::credential::Source::File(path) = &existing.source
+                && scan.incomplete.contains(path)
+                && !all.iter().any(|c| c.id == existing.id)
+            {
+                all.push(cpa_core::credential::Credential::clone(&existing));
+            }
+        }
+        all.extend(credentials::from_config(&cfg));
+        rt.store().reconcile_scanned_with(all, &scan.read, |current, all| {
+            keep_deferred(current, all, &scan.deferred)
+        });
+    });
+    if let Err(e) = reload.await {
+        tracing::error!(error = %e, "reloading auth files for plugin auth providers failed");
+    }
+}
+
+/// Keeps the store's `current` credentials of the files a scan deferred (no plugin auth
+/// provider has answered for their current bytes yet) and publishes nothing new for
+/// them, as Go's watcher asks the plugin first; the watcher's next reload parses them.
+/// Run under the store's reconciliation gate
+/// ([`crate::runtime::CredentialStore::reconcile_scanned_with`]), so a refresh committed
+/// after the scan is what is kept.
+pub(crate) fn keep_deferred(
+    current: &[Arc<cpa_core::credential::Credential>],
+    all: &mut Vec<cpa_core::credential::Credential>,
+    deferred: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    use cpa_core::credential::{Credential, Source};
+    if deferred.is_empty() {
+        return;
+    }
+    // Saves and uploads record absolute paths; a relative auth-dir scans relative ones.
+    let absolute = |p: &std::path::Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
+    let deferred: std::collections::HashSet<_> = deferred.iter().map(|p| absolute(p)).collect();
+    for existing in current {
+        if let Source::File(p) = &existing.source
+            && deferred.contains(&absolute(p))
+            && !all.iter().any(|c| c.id == existing.id)
+        {
+            all.push(Credential::clone(existing));
+        }
+    }
+}
+
+/// Go `syncPluginModelRuntime`: collects plugin catalogs, lets plugin executors claim
+/// the providers and models no built-in executor serves, then publishes the catalogs
+/// for credential-bound registration and the claimed executor models.
+async fn sync_models(rt: &Runtime) {
+    let host = rt.plugins();
+    host.register_models().await;
+    let native = native_executor_providers(rt).await;
+    // Ownership is decided against the registry, whose credentials carry the published
+    // plugin catalog. Republishing changes that registry (a removed built-in catalog
+    // frees its models), so repeat until the catalog is stable; Go decides once against
+    // the previous catalog and catches up on the next sync.
+    for _ in 0..3 {
+        let registry = rt.registry();
+        let Some(changes) = host
+            .register_executors(&|p| native.contains(p), &|m| registry.model_providers(m))
+            .await
+        else {
+            // The plugin set changed meanwhile; its own sync follows.
+            return;
+        };
+        *rt.plugin_runtime()
+            .executors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = changes
+            .register
+            .into_iter()
+            .map(|adapter| (adapter.provider.clone(), adapter))
+            .collect();
+        let specs = |models: &[cpa_plugin::api::ModelInfo]| models.iter().map(model_spec).collect::<Vec<_>>();
+        let changed = cpa_core::registry::dynamic::set_plugin_catalog(cpa_core::registry::dynamic::PluginCatalog {
+            providers: host
+                .provider_models()
+                .iter()
+                .map(|(provider, models)| (provider.clone(), specs(models)))
+                .collect(),
+            clients: changes
+                .clients
+                .register
+                .iter()
+                .map(|(client, provider, models)| (client.clone(), provider.clone(), specs(models)))
+                .collect(),
+        });
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// Go `registerExecutorForAuth`'s built-in providers.
+const BUILTIN: [&str; 14] = [
+    "codex",
+    "claude",
+    "gemini",
+    "gemini-interactions",
+    "vertex",
+    "aistudio",
+    "antigravity",
+    "kimi",
+    "kimi-ai",
+    "kimi.ai",
+    "kimi.com",
+    "xai",
+    "devin",
+    "meta",
+];
+
+/// Whether Go binds `c` to a built-in executor even over a registered plugin executor
+/// (`registerExecutorForAuth`): an OpenAI-compatible credential
+/// (`openAICompatInfoFromAuth`; `registerOpenAICompatProviderExecutor` keeps only a bare
+/// compat executor), a built-in provider, or any other provider with a native
+/// compatibility config (`hasNativeOpenAICompatExecutorConfig`: a `base_url` attribute
+/// or an enabled `openai-compatibility` entry named after it; `OwnsExecutor` is true
+/// for this host's plugin adapter, so `shouldKeepExistingOpenAICompatExecutor` returns
+/// false and Go replaces it even with `respectNonOwned`). Otherwise a plugin executor
+/// candidate keeps the provider.
+fn binds_native(c: &cpa_core::credential::Credential, compat_names: &[String]) -> bool {
+    let attr = |k: &str| c.attributes.get(k).map(|v| v.trim()).unwrap_or_default();
+    let provider = c.provider.trim().go_lower();
+    if !attr("compat_name").is_empty() || provider == "openai-compatibility" || BUILTIN.contains(&provider.as_str()) {
+        return true;
+    }
+    let key = if provider.is_empty() {
+        "openai-compatibility"
+    } else {
+        provider.as_str()
+    };
+    !attr("base_url").is_empty()
+        || [key, &attr("provider_key").go_lower(), &provider]
+            .iter()
+            .any(|candidate| !candidate.is_empty() && compat_names.iter().any(|n| n == candidate))
+}
+
+/// Go `providerHasNativeExecutor`: providers a built-in executor is actually bound to.
+/// Go binds one per enabled credential (`registerExecutorForAuth`), plus a fixed
+/// baseline in Home mode. An OpenAI-compatible credential or a built-in provider always
+/// binds; any other provider binds the OpenAI-compatible executor unless a plugin
+/// executor is a candidate for it and no native compatibility config names it.
+/// ponytail: Go keeps a binding after its last credential goes away; here bindings are
+/// recomputed from the current credentials.
+async fn native_executor_providers(rt: &Runtime) -> HashSet<String> {
+    let cfg = rt.config();
+    let compat_names = cpa_core::config::credentials::openai_compat_names(&cfg);
+    let host = rt.plugins();
+    let mut native = HashSet::new();
+    for c in rt.store().snapshot().iter().filter(|c| !c.disabled) {
+        let provider = c.provider.trim().go_lower();
+        let key = if !c.attributes.get("compat_name").is_none_or(|v| v.trim().is_empty())
+            || provider == "openai-compatibility"
+        {
+            cpa_core::registry::dynamic::provider_key(c)
+        } else if provider.is_empty() {
+            "openai-compatibility".to_owned()
+        } else {
+            provider
+        };
+        if !binds_native(c, &compat_names) && host.has_executor_candidate_provider(&key).await {
+            continue;
+        }
+        native.insert(key);
+    }
+    if rt.remote_dispatch().is_some() {
+        // Go `baselineExecutorAuths`: the built-in providers but `kimi.com`, plus the
+        // OpenAI-compatible executor.
+        native.extend(
+            BUILTIN
+                .iter()
+                .filter(|p| **p != "kimi.com")
+                .chain(&["openai-compatibility"])
+                .map(|p| (*p).to_owned()),
+        );
+    }
+    native
+}
+
+/// The request facts a plugin scheduler receives (Go `SchedulerPickRequest.Stream` and
+/// `Options`: the client headers and the execution metadata, JSON values only).
+#[derive(Debug, Default)]
+pub struct SchedulerContext {
+    pub stream: bool,
+    pub options: cpa_plugin::api::SchedulerOptions,
+}
+
+/// Go `pickNextLegacy`'s scheduler options for a single-provider selection (Codex
+/// realtime and Alpha Search): the selection headers, the route's own metadata
+/// (`metadata`, such as a realtime call's pinned credential and execution session), the
+/// provider as the session affinity provider and `affinity_model` (Go
+/// `selectionArgForSelector`: the route model under session affinity, else empty).
+/// These routes do not run `session.Enrich`. `None` without an active plugin scheduler.
+pub(crate) fn provider_scheduler_context(
+    rt: &Runtime,
+    provider: &str,
+    headers: &HeaderMap,
+    affinity_model: &str,
+    metadata: &[(&str, &str)],
+) -> Option<Arc<SchedulerContext>> {
+    if !rt.plugins().has_scheduler() {
+        return None;
+    }
+    let string = |s: &str| serde_json::Value::String(s.to_owned());
+    let mut out: cpa_plugin::gojson::Metadata = metadata.iter().map(|(k, v)| ((*k).to_owned(), string(v))).collect();
+    out.insert("session_affinity_provider".into(), string(provider));
+    out.insert("session_affinity_model".into(), string(affinity_model));
+    Some(Arc::new(SchedulerContext {
+        stream: false,
+        options: cpa_plugin::api::SchedulerOptions {
+            headers: go_request_header(headers),
+            metadata: out,
+        },
+    }))
+}
+
+/// The plugin scheduler's request for a selection, or `None` when no plugin scheduler
+/// takes part (none active, or Home mode). Errors are the availability errors Go
+/// reports before asking the scheduler.
+pub(crate) fn scheduler_request(
+    rt: &Runtime,
+    selection: &crate::runtime::Selection,
+    policy: &crate::scheduler::Policy,
+    admit: &crate::runtime::Admit<'_>,
+) -> Result<Option<cpa_plugin::api::SchedulerPickRequest>, crate::runtime::AcquireError> {
+    let host = rt.plugins();
+    if rt.remote_dispatch().is_some() || !host.has_scheduler() {
+        return Ok(None);
+    }
+    let across = host.scheduler_wants_across_priorities();
+    let candidates = rt.store().scheduler_candidates(selection, policy, admit, across)?;
+    let mut providers: Vec<String> = Vec::new();
+    for p in selection.provider_keys() {
+        let p = p.trim().go_lower();
+        if !p.is_empty() && p != "mixed" && !providers.contains(&p) {
+            providers.push(p);
+        }
+    }
+    let context = selection.scheduler.as_deref();
+    Ok(Some(cpa_plugin::api::SchedulerPickRequest {
+        // Handlers select across providers (Go `pickNextMixed`, "mixed"), which leaves
+        // Provider empty; Codex realtime and Alpha Search select one provider (Go
+        // `pickNextLegacy`), which names it.
+        provider: if selection.providers.is_empty() {
+            selection.provider.trim().go_lower()
+        } else {
+            String::new()
+        },
+        providers,
+        model: selection.model.clone(),
+        stream: context.is_some_and(|c| c.stream),
+        options: context.map(|c| c.options.clone()).unwrap_or_default(),
+        candidates: candidates
+            .iter()
+            .map(|c| cpa_plugin::api::SchedulerAuthCandidate {
+                id: c.id.clone(),
+                provider: c.provider.trim().go_lower(),
+                priority: crate::scheduler::priority(c),
+                // ponytail: candidates are ready, which Go reports as `active` unless an
+                // earlier failure left the credential in `error`; that status is not
+                // tracked apart from cooldowns here.
+                status: "active".into(),
+                attributes: c
+                    .attributes
+                    .iter()
+                    .filter(|(k, _)| !scheduler_attribute_sensitive(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }))
+}
+
+/// Go `pickViaPluginScheduler` before native selection (`pickNextMixedLegacy`): the
+/// highest-priority active plugin scheduler chooses among the ready candidates, rejects
+/// the selection, or delegates to a built-in strategy; without an answer the configured
+/// selector chooses. Go's Home mode selects remotely and consults no plugin scheduler.
+pub(crate) async fn scheduler_pick(
+    rt: &Runtime,
+    request: Option<cpa_plugin::api::SchedulerPickRequest>,
+) -> Result<crate::runtime::Pick, crate::runtime::AcquireError> {
+    use crate::runtime::{AcquireError, Pick};
+    let Some(request) = request else {
+        return Ok(Pick::Configured);
+    };
+    let resp = match rt.plugins().pick_auth(request).await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => return Ok(Pick::Configured),
+        // Go returns the plugin's error; its status, if any, decides the response.
+        Err(e) => {
+            return Err(AcquireError::Scheduler(cpa_core::exec::ExecError::local(
+                e.status(),
+                cpa_core::exec::FailureScope::Model,
+                e.to_string(),
+            )));
+        }
+    };
+    if resp.reject {
+        return Err(AcquireError::Rejected {
+            code: resp.reject_code,
+            message: resp.reject_reason,
+        });
+    }
+    if !resp.auth_id.is_empty() {
+        return Ok(Pick::Auth(resp.auth_id));
+    }
+    Ok(match resp.delegate_builtin.as_str() {
+        cpa_plugin::api::SCHEDULER_BUILTIN_ROUND_ROBIN => Pick::Builtin(crate::scheduler::Strategy::RoundRobin),
+        cpa_plugin::api::SCHEDULER_BUILTIN_FILL_FIRST => Pick::Builtin(crate::scheduler::Strategy::FillFirst),
+        _ => Pick::Configured,
+    })
+}
+
+/// Go `schedulerAttributeSensitive`: credential attributes a scheduler never sees.
+fn scheduler_attribute_sensitive(key: &str) -> bool {
+    let key = key.trim().go_lower();
+    let normalized: String = key
+        .chars()
+        .map(|c| if matches!(c, '-' | '.' | ' ') { '_' } else { c })
+        .collect();
+    let compact: String = key.chars().filter(|c| !matches!(c, '_' | '-' | '.' | ' ')).collect();
+    [
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "cookie",
+        "credential",
+        "password",
+        "storage",
+        "authorization",
+        "auth_header",
+        "proxy_url",
+    ]
+    .iter()
+    .any(|fragment| key.contains(fragment) || normalized.contains(fragment) || compact.contains(fragment))
+}
+
+/// Go `pluginModelInfoToRegistryModelInfo`.
+fn model_spec(m: &cpa_plugin::api::ModelInfo) -> cpa_core::registry::dynamic::Spec {
+    cpa_core::registry::dynamic::Spec {
+        id: m.id.trim().to_owned(),
+        object: m.object.clone(),
+        created: m.created,
+        owned_by: m.owned_by.clone(),
+        kind: m.model_type.clone(),
+        display_name: m.display_name.clone(),
+        name: m.name.clone(),
+        version: m.version.clone(),
+        description: m.description.clone(),
+        input_token_limit: m.input_token_limit,
+        output_token_limit: m.output_token_limit,
+        supported_generation_methods: m.supported_generation_methods.clone(),
+        context_length: m.context_length,
+        max_completion_tokens: m.max_completion_tokens,
+        supported_parameters: m.supported_parameters.clone(),
+        supported_input_modalities: m.supported_input_modalities.clone(),
+        supported_output_modalities: m.supported_output_modalities.clone(),
+        thinking: m.thinking.as_ref().map(|t| cpa_core::registry::ThinkingSupport {
+            min: t.min,
+            max: t.max,
+            zero_allowed: t.zero_allowed,
+            dynamic_allowed: t.dynamic_allowed,
+            disable_type: t.disable_type.clone(),
+            levels: t.levels.clone(),
+        }),
+        user_defined: m.user_defined,
+        ..Default::default()
+    }
 }
 
 // ---- Frontend auth (Go `sdk/access`) -------------------------------------------------
@@ -123,7 +591,12 @@ impl PluginRuntime {
     /// Go `configaccess.Register` then `RegisterFrontendAuthProviders`: register or
     /// unregister the client-key provider, register each plugin provider, set the
     /// exclusive key, and drop plugin keys no longer offered.
-    fn register_access(&self, client_keys: bool, providers: Vec<(String, String)>, exclusive: Option<String>) {
+    pub(crate) fn register_access(
+        &self,
+        client_keys: bool,
+        providers: Vec<(String, String)>,
+        exclusive: Option<String>,
+    ) {
         let mut slot = self.access.write().unwrap_or_else(|e| e.into_inner());
         let mut next = AccessRegistry {
             order: slot.order.clone(),
@@ -154,10 +627,10 @@ impl PluginRuntime {
 pub(crate) enum Access {
     /// No provider registered: Go's manager returns no result and sets nothing.
     Open,
-    /// Go `sdkaccess.Result`: the caller and the provider identifier that accepted it.
+    /// Go `sdkaccess.Result`: the caller, with the provider identifier that accepted it.
     /// ponytail: a plugin's result metadata is not kept (`Caller` has no field for it;
     /// only Go's Home mode reads it).
-    Granted { caller: Caller, provider: String },
+    Granted(Caller),
 }
 
 /// Go `sdkaccess.AuthError` as the middlewares answer it.
@@ -192,10 +665,10 @@ pub(crate) async fn authenticate(rt: &Runtime, req: Request) -> (Request, Result
                     parts.uri.query().unwrap_or_default(),
                 ) {
                     Ok(caller) => {
-                        outcome = Some(Ok(Access::Granted {
-                            caller,
+                        outcome = Some(Ok(Access::Granted(Caller {
                             provider: CONFIG_PROVIDER.to_owned(),
-                        }));
+                            ..caller
+                        })));
                         break;
                     }
                     Err(message) => invalid |= message != MISSING_API_KEY,
@@ -212,6 +685,14 @@ pub(crate) async fn authenticate(rt: &Runtime, req: Request) -> (Request, Result
                             outcome = Some(Err(Denied {
                                 status: 413,
                                 message: "request body too large",
+                            }));
+                            break;
+                        }
+                        // Go `NewRequestEntityTooLargeError` (dd7b4334).
+                        Err(error) if crate::body_limit::is_too_large(&error) => {
+                            outcome = Some(Err(Denied {
+                                status: 413,
+                                message: crate::body_limit::MESSAGE,
                             }));
                             break;
                         }
@@ -235,13 +716,11 @@ pub(crate) async fn authenticate(rt: &Runtime, req: Request) -> (Request, Result
                     body: cpa_plugin::gojson::NonNilBytes(bytes),
                 };
                 if let Some(accepted) = rt.plugins().frontend_authenticate(id, &request).await {
-                    outcome = Some(Ok(Access::Granted {
-                        caller: Caller {
-                            principal: accepted.principal,
-                            source: "",
-                        },
+                    outcome = Some(Ok(Access::Granted(Caller {
+                        principal: accepted.principal,
+                        source: "",
                         provider: accepted.provider,
-                    }));
+                    })));
                     break;
                 }
             }
@@ -307,19 +786,24 @@ pub(crate) fn go_values(raw_query: &str) -> cpa_plugin::gojson::Header {
 /// Syncs the current config now, then follows every later publish. Call once at
 /// startup, before serving (Go applies plugins before the server starts).
 pub async fn start(rt: &Arc<Runtime>) {
+    model_callbacks::attach(rt);
     let mut rx = rt.plugin_runtime().latest.subscribe();
     rx.mark_unchanged();
+    // At least this publish is in the current config.
+    let seq = rt.plugin_runtime().published_seq();
     sync(rt, rt.config()).await;
+    rt.plugin_runtime().applied.send_replace(seq);
     let weak: Weak<Runtime> = Arc::downgrade(rt);
     tokio::spawn(async move {
         while rx.changed().await.is_ok() {
-            let Some(cfg) = rx.borrow_and_update().clone() else {
+            let Some((seq, cfg)) = rx.borrow_and_update().clone() else {
                 continue;
             };
             let Some(rt) = weak.upgrade() else {
                 return;
             };
             sync(&rt, cfg).await;
+            rt.plugin_runtime().applied.send_replace(seq);
         }
     });
 }
@@ -542,5 +1026,47 @@ mod tests {
         let (_, result) = authenticate(&rt, request(Some("client-key"), Body::from("{}"))).await;
         assert_eq!(outcome(&result), (200, ""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go `TestPluginRegisteredSonnet55TurnsThinkingOffWithBetweenTools`: a plugin model's
+    /// `DisableType` reaches the Claude applier through the registry conversion. An older
+    /// plugin's payload without it turns thinking off with `disabled`, even on a model the
+    /// proxy knows refuses it: plugin capabilities are authoritative, as in Go.
+    #[test]
+    fn plugin_registered_sonnet_5_5_turns_thinking_off_with_between_tools() {
+        let thinking_off = |model: &str, thinking: &[u8]| {
+            let info = model_spec(&cpa_plugin::api::ModelInfo {
+                id: model.into(),
+                model_type: "claude".into(),
+                thinking: Some(cpa_plugin::gojson::from_slice(thinking).unwrap()),
+                ..Default::default()
+            })
+            .to_info();
+            let body = format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"thinking":{{"type":"disabled"}}}}"#
+            );
+            let caps = cpa_common::thinking::ModelCaps::from(&info);
+            let out = cpa_common::thinking::apply_thinking_with_model_info(
+                body.as_bytes(),
+                &[],
+                model,
+                "claude",
+                "claude",
+                "claude",
+                Some(&caps),
+            )
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap()["thinking"].clone()
+        };
+        let current = br#"{"ZeroAllowed":true,"Levels":["low","medium","high"],"DisableType":"between_tools"}"#;
+        assert_eq!(
+            thinking_off("claude-sonnet-5-5", current),
+            serde_json::json!({"type": "between_tools"})
+        );
+        let older = br#"{"ZeroAllowed":true,"Levels":["low","medium","high"]}"#;
+        assert_eq!(
+            thinking_off("claude-opus-5-5", older),
+            serde_json::json!({"type": "disabled"})
+        );
     }
 }

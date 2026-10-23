@@ -28,6 +28,7 @@ use futures_util::StreamExt;
 
 use crate::gemini_payload as payload;
 use crate::gemini_stream::{self as sse, ClaudeInputTokens};
+use crate::payload_barrier::Barrier;
 use crate::proxy::{self, GoClients, GoHeaders, Hooks, Proxy, Upstream};
 
 /// Providers this executor serves (`NewGeminiExecutor`, `NewGeminiInteractionsExecutor`).
@@ -80,6 +81,7 @@ pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
         headers: Box::default(),
         retry_after: None,
         direct: false,
+        addon: None,
     }
 }
 
@@ -149,7 +151,7 @@ pub(crate) fn translate(
     let ctx = RequestCtx { model, stream };
     let client = crate::codex_client::Client::new(&req.headers, cfg, "", compat);
     deep_stack(body, || {
-        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client)
+        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client).map(|t| t.body)
     })
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
@@ -206,12 +208,13 @@ fn translate_pair(
     model: &str,
     compat: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), ExecError> {
-    let working = translate(req, cfg, target, model, &req.body, req.stream, compat)?;
+    // Go translates the original first; equal payloads once.
     let source = original_request(req);
-    if *source == req.body {
-        return Ok((working.clone(), working));
-    }
     let original = translate(req, cfg, target, model, source, req.stream, compat)?;
+    if *source == req.body {
+        return Ok((original.clone(), original));
+    }
+    let working = translate(req, cfg, target, model, &req.body, req.stream, compat)?;
     Ok((original, working))
 }
 
@@ -239,35 +242,21 @@ pub(crate) fn apply_thinking(
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))
 }
 
-/// `helps.ApplyPayloadConfigWithRequest`: config payload rules on the final body, with
-/// the translated original request as the baseline for `default` rules.
-pub(crate) fn apply_payload_rules(
-    rules: &cpa_common::payload::Rules,
-    model: &str,
-    protocol: &str,
-    body: Vec<u8>,
-    original_translated: &[u8],
+/// The token-count baseline for `default` rules: the client's original request
+/// translated without stream, else the translated body before thinking. Go counts with
+/// a failed translation's partial body; this refuses with its error instead.
+pub(crate) fn count_original(
     req: &ExecRequest,
-) -> Vec<u8> {
-    let requested = match req.requested_model.trim() {
-        "" => req.model.trim(),
-        requested => requested,
-    };
-    cpa_common::payload::apply(
-        rules,
-        &cpa_common::payload::Request {
-            target_executor: "",
-            model,
-            requested_model: requested,
-            protocol,
-            from_protocol: req.source_format.as_str(),
-            root: "",
-            original: original_translated,
-            request_path: &req.request_path,
-            headers: Some(&req.headers),
-        },
-        body,
-    )
+    cfg: &Config,
+    target: Format,
+    model: &str,
+    compat: bool,
+    translated: &[u8],
+) -> Result<Vec<u8>, ExecError> {
+    if req.original_body.is_empty() {
+        return Ok(translated.to_vec());
+    }
+    translate(req, cfg, target, model, &req.original_body, false, compat)
 }
 
 /// Content-Type, the API key and the credential's custom headers (`applyGeminiHeaders`).
@@ -450,17 +439,16 @@ pub(crate) fn translate_non_stream(
     data: &[u8],
 ) -> Result<Bytes, ExecError> {
     let response = req.response_format;
+    let ctx = ResponseCtx {
+        model: &req.model,
+        original_request: original_request(req),
+        translated_request: translated,
+    };
     let mut out = match cpa_translate::pair(response, upstream) {
-        Some(pair) => (pair.non_stream)(
-            &ResponseCtx {
-                model: &req.model,
-                original_request: original_request(req),
-                translated_request: translated,
-            },
-            data,
-        )
-        .map_err(|_| bad_gateway())?,
-        None => data.to_vec(),
+        Some(pair) => (pair.non_stream)(&ctx, data).map_err(|_| bad_gateway())?,
+        // Go's TranslateNonStream still runs the plugin response hooks.
+        None => cpa_translate::hooks::unregistered_non_stream(upstream.as_str(), response.as_str(), &ctx, data)
+            .unwrap_or_else(|| data.to_vec()),
     };
     if out.is_empty() {
         return Err(bad_gateway());
@@ -515,8 +503,6 @@ impl GeminiExecutor {
         let (original_translated, body) = translate_pair(req, cfg, to, &base_model, compat)?;
         let mut body = apply_thinking(req, body, from, to, &credential.provider, resolved.as_ref())?;
         body = payload::fix_image_aspect_ratio(&base_model, body);
-        let rules = cpa_common::payload::Rules::from_config(cfg);
-        body = apply_payload_rules(&rules, &base_model, to.as_str(), body, &original_translated, req);
         body = payload::set_str_if_different(body, "model", &base_model);
         body = payload::cap_max_output_tokens(body, &base_model);
         body = cpa_common::signature::sanitize_gemini_request_thought_signatures(&body, "contents");
@@ -535,6 +521,15 @@ impl GeminiExecutor {
         }
         body = payload::delete(body, "session_id");
         req.usage.request(to, &body);
+        // The payload rules are the last change to the body (868e137).
+        body = Barrier {
+            executor: "",
+            model: &base_model,
+            protocol: to.as_str(),
+            root: "",
+            original: &original_translated,
+        }
+        .apply(cfg, req, body);
         let headers = request_headers(credential, req);
         let capture = req.capture();
         let client = self.client(credential, cfg);
@@ -597,12 +592,18 @@ impl GeminiExecutor {
         }
         // applyGeminiInteractionsThinking: the Gemini applier family for the target.
         body = apply_thinking(req, body, from, to, "gemini", resolved.as_ref())?;
-        let rules = cpa_common::payload::Rules::from_config(cfg);
-        body = apply_payload_rules(&rules, &target, "interactions", body, &original_translated, req);
         body = payload::sanitize_interactions_input_ids(body);
         if req.stream {
             body = payload::set_bool_if_different(body, "stream", true);
         }
+        body = Barrier {
+            executor: "",
+            model: &target,
+            protocol: "interactions",
+            root: "",
+            original: &original_translated,
+        }
+        .apply(cfg, req, body);
         let url = format!("{}/{API_VERSION}/interactions", base_url(credential));
         let mut headers = request_headers(credential, req);
         // applyGeminiInteractionsRequestHeaders, then applyGeminiInteractionsRevisionHeader.
@@ -670,6 +671,7 @@ impl GeminiExecutor {
         let resolved = resolved(req);
         let compat = resolved.as_ref().is_some_and(|r| r.is_compat);
         let body = translate(req, cfg, to, &base_model, &req.body, false, compat)?;
+        let original = count_original(req, cfg, to, &base_model, compat, &body)?;
         let mut body = apply_thinking(req, body, from, to, &credential.provider, resolved.as_ref())?;
         body = payload::fix_image_aspect_ratio(&base_model, body);
         for path in ["tools", "generationConfig", "safetySettings"] {
@@ -678,6 +680,14 @@ impl GeminiExecutor {
         body = payload::set_str_if_different(body, "model", &base_model);
         body = cpa_common::signature::sanitize_gemini_request_thought_signatures(&body, "contents");
         body = payload::ensure_leading_user_content(body, "contents");
+        body = Barrier {
+            executor: "gemini",
+            model: &base_model,
+            protocol: to.as_str(),
+            root: "",
+            original: &original,
+        }
+        .apply(cfg, req, body);
         let url = format!("{}/{API_VERSION}/models/{base_model}:countTokens", base_url(credential));
         let headers = request_headers(credential, req);
         let capture = req.capture();
@@ -726,20 +736,27 @@ impl Emit {
 /// Only Gemini upstreams reach it (a Codex client); every client format that takes the
 /// native Interactions path has a registered Interactions pair. Executors that pass
 /// scanned lines as [`line_event`]s get the line back without the terminator.
-#[derive(Default)]
-struct Unregistered(cpa_translate::stream::StreamOptions);
+/// With plugin response hooks active, each payload goes through them (`hooks`).
+struct Unregistered {
+    options: cpa_translate::stream::StreamOptions,
+    hooks: Option<Box<dyn cpa_translate::stream::GoStream>>,
+}
 
 impl StreamTranslator for Unregistered {
     fn event(&mut self, event: &[u8]) -> Result<Vec<Bytes>, cpa_translate::Error> {
-        let line = if self.0.whole_events {
+        let line = if self.options.whole_events {
             event
         } else {
             event.strip_suffix(LINE_END).unwrap_or(event)
         };
-        Ok(vec![match self.0.chunk {
-            Some(hook) => Bytes::from(hook(line)),
-            None => Bytes::copy_from_slice(line),
-        }])
+        let emit = |chunk: &[u8]| match self.options.chunk {
+            Some(hook) => Bytes::from(hook(chunk)),
+            None => Bytes::copy_from_slice(chunk),
+        };
+        match &mut self.hooks {
+            Some(hooks) => Ok(hooks.line(line)?.iter().map(|c| emit(c)).collect()),
+            None => Ok(vec![emit(line)]),
+        }
     }
 
     fn finish(&mut self) -> Result<Vec<Bytes>, cpa_translate::Error> {
@@ -753,6 +770,7 @@ pub(crate) struct Output {
     client: Format,
     /// A Gemini client asked for `alt`: chunks are written bare.
     raw: bool,
+    executor_chunks: bool,
     claude: ClaudeInputTokens,
     /// The attempt's usage reporter; stream loops feed it what Go's reporter sees.
     pub(crate) usage: UsageSink,
@@ -783,12 +801,20 @@ impl Output {
             original_request: original_request(req),
             translated_request: translated,
         };
-        let translator = cpa_translate::stream_with(client, upstream, &ctx, options)
-            .unwrap_or_else(|| Box::new(Unregistered(options)));
+        let mut translator = cpa_translate::stream_with(client, upstream, &ctx, options).unwrap_or_else(|| {
+            Box::new(Unregistered {
+                options,
+                hooks: cpa_translate::hooks::wrap_stream(upstream.as_str(), client.as_str(), &ctx, None),
+            })
+        });
+        if req.stream_payloads {
+            translator.executor_chunks();
+        }
         Self {
             translator,
             client,
             raw: alt(req).is_some(),
+            executor_chunks: req.stream_payloads,
             claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
             usage: req.usage.clone(),
             capture: req.capture().clone(),
@@ -883,7 +909,7 @@ impl Output {
     /// Gemini clients: translators frame chunks as SSE `data:` events; with `alt` the Go
     /// handler writes the chunk itself.
     fn frame(&self, out: &mut Vec<Bytes>) {
-        if self.client == Format::Gemini {
+        if self.client == Format::Gemini && !self.executor_chunks {
             for chunk in out.iter_mut() {
                 let bare = chunk
                     .strip_prefix(b"data: ")

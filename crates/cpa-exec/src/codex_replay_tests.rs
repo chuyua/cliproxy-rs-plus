@@ -30,6 +30,7 @@ fn request(scenario: &Value, turn: &Value) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::Claude,
         response_format: Format::Claude,
+        stream_payloads: false,
         requested_model: scenario["model"].as_str().unwrap().into(),
         model: scenario["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -44,6 +45,7 @@ fn request(scenario: &Value, turn: &Value) -> ExecRequest {
         caller: Caller {
             principal: "client-key-FAKE".into(),
             source: "authorization",
+            provider: String::new(),
         },
         resolved_model: None,
         usage: Default::default(),

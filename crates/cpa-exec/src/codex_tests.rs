@@ -5,6 +5,7 @@
 use super::*;
 use crate::codex_testkit::{Captured, GO, Mock, Reply, Tap, Wiretap};
 use cpa_core::exec::Caller;
+use cpa_core::gostr::GoStr;
 use serde_json::Value;
 use std::path::Path;
 
@@ -23,6 +24,7 @@ fn credential(case: &Value, base_url: &str) -> Credential {
         attributes: Default::default(),
         metadata: Default::default(),
         revision: 0,
+        next_refresh_after: None,
     });
     credential.provider = "codex".into();
     credential.attributes.insert("base_url".into(), base_url.into());
@@ -57,6 +59,7 @@ fn request(case: &Value) -> ExecRequest {
         operation: Operation::Generate,
         source_format: source,
         response_format: response,
+        stream_payloads: false,
         requested_model: case["model"].as_str().unwrap().into(),
         model: case["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -73,6 +76,7 @@ fn request(case: &Value) -> ExecRequest {
         caller: Caller {
             principal: "client-key-FAKE".into(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -419,7 +423,7 @@ async fn prepare_refreshes_when_due_and_keeps_a_valid_token_on_failure() {
     assert_eq!(patch.set["access_token"], "at-new");
     assert_eq!(patch.set["refresh_token"], "rt-new");
     assert!(!executor.needs_prepare(
-        &cred("rt-4", &(Utc::now() + chrono::TimeDelta::days(3)).to_rfc3339()),
+        &cred("rt-4", &(Utc::now() + chrono::TimeDelta::days(5)).to_rfc3339()),
         &cfg
     ));
 }
@@ -507,6 +511,7 @@ fn plain_request(stream: bool, alt: Option<&str>) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::Codex,
         response_format: Format::Codex,
+        stream_payloads: false,
         requested_model: "gpt-5.4".into(),
         model: "gpt-5.4".into(),
         original_body: body.clone(),
@@ -523,6 +528,7 @@ fn plain_request(stream: bool, alt: Option<&str>) -> ExecRequest {
         caller: Caller {
             principal: String::new(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -665,8 +671,8 @@ impl cpa_core::exec::UsageObserver for Recorded {
     }
 }
 
-/// Usage records see the upstream side, as Go's reporter does: the translated request
-/// (`SetTranslatedReasoningEffort`, before the prompt-cache key is added) and every
+/// Usage records see the upstream side, as Go's reporter does: the finalized request
+/// (`SetTranslatedReasoningEffort` on the upstream body, c7b4d573) and every
 /// upstream event in Codex format, or the compaction body in OpenAI Responses format,
 /// whatever the client speaks. Expected payloads come from the Go fixture.
 #[tokio::test]
@@ -700,11 +706,10 @@ async fn usage_records_see_upstream_payloads() {
         }
         let reports = recorded.0.lock().unwrap().clone();
         let upstream_format = if compact { Format::OpenAIResponse } else { Format::Codex };
-        let mut sent = case["upstream"]["body"].as_str().unwrap().as_bytes().to_vec();
-        cpa_common::json::delete(&mut sent, "prompt_cache_key");
+        let sent = case["upstream"]["body"].as_str().unwrap().to_owned();
         assert_eq!(
             reports[0],
-            ("request", upstream_format, String::from_utf8(sent).unwrap()),
+            ("request", upstream_format, sent),
             "{name}: translated request"
         );
         let upstream = case["upstream_body"].as_str().unwrap();
@@ -718,6 +723,174 @@ async fn usage_records_see_upstream_payloads() {
                 .collect()
         };
         assert_eq!(reports[1..], expected[..], "{name}: upstream payloads");
+    }
+}
+
+/// Go `Test*RecordsFinalizedPayloadOverrideReasoningEffort` (c7b4d573): a payload
+/// override of `reasoning.effort` reaches both the upstream body and the usage record,
+/// on the stream, non-stream and compact paths. The record reads the finalized body, the
+/// bytes sent upstream, so an input ID that sanitation prefixes is recorded prefixed.
+#[tokio::test]
+async fn usage_records_the_payload_override_reasoning_effort() {
+    let executor = executor();
+    for (name, protocol) in [
+        ("apikey_claude_not_compat", "codex"),
+        ("oauth_nonstream_no_instructions_free_plan", "codex"),
+        ("oauth_compact", "openai-response"),
+    ] {
+        let case = GO["executor"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        let mock = Mock::start().await;
+        let compact = case["alt"] == "responses/compact";
+        mock.script(
+            if compact { "/responses/compact" } else { "/responses" },
+            vec![reply(case)],
+        );
+        let credential = credential(case, &mock.url);
+        let cfg = Config::parse(&format!(
+            "payload:\n  override:\n    - models:\n        - name: gpt-5.4\n          protocol: {protocol}\n      params:\n        reasoning.effort: high\n"
+        ))
+        .unwrap();
+        let recorded = Arc::new(Recorded::default());
+        let mut req = request(case);
+        let body = String::from_utf8(req.body.to_vec()).unwrap().replace(
+            r#"{"type":"message","role":"user""#,
+            r#"{"type":"message","id":"abc","role":"user""#,
+        );
+        req.body = Bytes::from(body);
+        req.usage = cpa_core::exec::UsageSink::new(recorded.clone());
+        match executor.execute(&credential, req, &cfg).await.unwrap().body {
+            ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
+            ResponseBody::Buffered(_) => {}
+        }
+        let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
+        assert_eq!(gjson::get(&sent, "reasoning.effort").str(), "high", "{name}: upstream");
+        let reports = recorded.0.lock().unwrap().clone();
+        assert_eq!(reports[0].0, "request", "{name}");
+        assert_eq!(reports[0].2, sent, "{name}: the usage record reads the sent body");
+    }
+}
+
+/// Go `TestCodexImageResolvedModelOnWire` ("custom upstream", "routing and thinking
+/// suffix" and the two "final payload" rows, 51bde0ff and 868e137) through the executor:
+/// a configured, prefixed upstream name reaches the direct Images endpoint as resolved,
+/// for a JSON generation and a multipart edit, and the payload rules run once, last.
+#[tokio::test]
+async fn direct_images_send_the_configured_upstream_model() {
+    let executor = executor();
+    let form = "--XB\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nREQ\r\n--XB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ndiagnostic\r\n--XB--\r\n";
+    let models = "[{name: openai/gpt-image-2-cpr, protocol: openai, match: [{model: openai/gpt-image-2-cpr}]}]";
+    let override_rules = format!(
+        "payload:\n  override:\n    - models: {models}\n      params: {{model: policy/image-model}}\n    - models: [{{name: \"*\"}}]\n      params: {{\"audit.-1\": once}}\n"
+    );
+    let filter_rules = format!("payload:\n  filter:\n    - models: {models}\n      params: [model]\n");
+    for (requested, resolved, configured, want, rules) in [
+        (
+            "gpt-image-2",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "",
+        ),
+        (
+            "tenant/gpt-image-2(high)",
+            "OpenAI/GPT-Image-2(high)",
+            "OpenAI/GPT-Image-2",
+            "OpenAI/GPT-Image-2",
+            "",
+        ),
+        (
+            "gpt-image-2",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "policy/image-model",
+            override_rules.as_str(),
+        ),
+        (
+            "gpt-image-2",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "",
+            filter_rules.as_str(),
+        ),
+    ] {
+        for (request_path, upstream_path, content_type, body) in [
+            (
+                "/v1/images/generations",
+                "/images/generations",
+                "application/json",
+                format!(r#"{{"model":"{requested}","prompt":"diagnostic"}}"#),
+            ),
+            (
+                "/v1/images/edits",
+                "/images/edits",
+                "multipart/form-data; boundary=XB",
+                form.replace("REQ", requested),
+            ),
+        ] {
+            let mock = Mock::start().await;
+            mock.script(
+                upstream_path,
+                vec![crate::codex_testkit::json(
+                    200,
+                    r#"{"created":1713833628,"data":[{"b64_json":"AA=="}]}"#,
+                )],
+            );
+            let cfg = Config::parse(&format!(
+                "codex-api-key:\n  - api-key: codex-token\n    base-url: {}\n    prefix: tenant\n    models:\n      - name: {configured}\n        alias: gpt-image-2\n{rules}",
+                mock.url
+            ))
+            .unwrap();
+            let credential = cpa_core::config::credentials::from_config(&cfg)
+                .into_iter()
+                .find(|c| c.provider == "codex")
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
+            let body = Bytes::from(body);
+            let req = ExecRequest {
+                operation: Operation::Generate,
+                source_format: Format::OpenAI,
+                response_format: Format::OpenAI,
+                stream_payloads: false,
+                requested_model: requested.into(),
+                model: resolved.into(),
+                original_body: body.clone(),
+                body,
+                stream: false,
+                alt: None,
+                session: None,
+                headers,
+                execution_session: None,
+                derived_session: None,
+                resolved_model: None,
+                usage: Default::default(),
+                request_path: request_path.into(),
+                caller: Caller {
+                    principal: "client-key-FAKE".into(),
+                    source: "authorization",
+                    provider: String::new(),
+                },
+            };
+            executor.images(&credential, req, request_path, &cfg).await.unwrap();
+            let captured = mock.take();
+            assert_eq!(captured.len(), 1, "{resolved} {request_path}");
+            assert_eq!(captured[0].path, upstream_path);
+            let sent: Value = serde_json::from_slice(&captured[0].body).unwrap();
+            assert_eq!(
+                sent["model"].as_str().unwrap_or_default(),
+                want,
+                "{resolved} {request_path}"
+            );
+            assert_eq!(sent["prompt"], "diagnostic", "{request_path}");
+            if rules.contains("audit") {
+                assert_eq!(sent["audit"], serde_json::json!(["once"]), "{request_path}");
+            }
+        }
     }
 }
 
@@ -754,6 +927,7 @@ async fn images_match_go_on_every_fixture_case() {
             operation: Operation::Generate,
             source_format: Format::OpenAI,
             response_format: Format::OpenAI,
+            stream_payloads: false,
             requested_model: model.into(),
             model: model.into(),
             original_body: body.clone(),
@@ -770,6 +944,7 @@ async fn images_match_go_on_every_fixture_case() {
             caller: Caller {
                 principal: "client-key-FAKE".into(),
                 source: "authorization",
+                provider: String::new(),
             },
         };
         let result = executor.images(&credential, req, request_path, &cfg).await;
@@ -933,7 +1108,7 @@ async fn capture_records_each_attempt_as_go_does() {
         );
         assert_eq!(body.as_bytes(), sent.body.as_ref(), "{name}: request body");
         assert_eq!(*account, go_account(&credential), "{name}: account");
-        let mut recorded: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect();
+        let mut recorded: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.go_lower(), v.clone())).collect();
         recorded.sort();
         let mut wire: Vec<(String, String)> = sent
             .headers
@@ -1190,4 +1365,645 @@ async fn direct_images_return_the_read_error_of_a_broken_error_body() {
             "stream={stream}: {taps:?}"
         );
     }
+}
+
+/// A streamed (or buffered, `stream: false`) Responses request whose upstream sends `sse`:
+/// the client frames and the in-stream error, or the attempt's error.
+async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<String>, Option<ExecError>), ExecError> {
+    let mock = Mock::start().await;
+    mock.script(
+        "/responses",
+        vec![Reply {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: sse.into(),
+        }],
+    );
+    let synthetic = serde_json::json!({
+        "source": "openai-response",
+        "model": "gpt-5.4",
+        "payload": r#"{"model":"gpt-5.4","input":"hello"}"#,
+        "stream": stream,
+        "attributes": {"api_key": "test"},
+    });
+    let cfg = Config::parse(&format!("codex:\n  stream-bootstrap-buffering: {buffering}\n")).unwrap();
+    let response = executor()
+        .execute(&credential(&synthetic, &mock.url), request(&synthetic), &cfg)
+        .await?;
+    let (mut frames, mut failure) = (Vec::new(), None);
+    match response.body {
+        ResponseBody::Stream(mut body) => {
+            while let Some(item) = body.next().await {
+                match item {
+                    Ok(frame) => frames.push(String::from_utf8(frame.to_vec()).unwrap()),
+                    Err(error) => failure = Some(error),
+                }
+            }
+        }
+        ResponseBody::Buffered(body) => frames.push(String::from_utf8(body.to_vec()).unwrap()),
+    }
+    Ok((frames, failure))
+}
+
+const SPLIT_CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_split\",\"model\":\"gpt-5.4\"}}\n\n";
+/// Go's `codexOverloadEvent`: an overload that fails the attempt over during bootstrap.
+const SPLIT_OVERLOAD: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\",\"param\":null},\"sequence_number\":2}\n\n";
+
+/// Go's `codex_executor_sse_events_test.go` (7795de19) for events whose data spans several
+/// `data:` lines: a split event reads as its one-line form, stream and non-stream, with
+/// and without bootstrap buffering, and an invalid split stays invalid.
+#[tokio::test]
+async fn split_sse_events_read_as_one_event() {
+    let completed = r#"{"type":"response.completed","response":{"id":"resp_split","object":"response","model":"gpt-5.4","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}"#;
+    let cut = completed.find(r#""output":"#).unwrap();
+    let delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n";
+    let one_line = format!("{SPLIT_CREATED}{delta}event: response.completed\ndata: {completed}\n\n");
+    let split = format!(
+        "{SPLIT_CREATED}{delta}event: response.completed\ndata: {}\ndata: {}\n\n",
+        &completed[..cut],
+        &completed[cut..]
+    );
+    for buffering in [false, true] {
+        // TestCodexExecuteStreamTreatsAnEventSplitAcrossDataLinesAsOneEvent
+        let want = through_sse(&one_line, true, buffering).await.unwrap();
+        let got = through_sse(&split, true, buffering).await.unwrap();
+        assert!(want.1.is_none() && want.0.last().unwrap().contains("response.completed"));
+        assert_eq!(got.0, want.0, "buffering={buffering}");
+        assert!(got.1.is_none());
+        // TestCodexExecuteStreamMinimalReproFromIssue6575 and
+        // TestCodexExecuteStreamAssemblesSplitEventsWithAndWithoutBootstrapBuffering
+        for sse in [
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"status\":\"in_progress\",\"output\":[]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\ndata: \"output\":[]}}\n\n".to_owned(),
+            format!("{SPLIT_CREATED}data: {{\"type\":\"response.in_progress\",\"response\":{{\"id\":\"resp_split\",\"output\":[\ndata: {{\"x\":1}},\ndata: {{\"x\":1}}]}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_split\",\"status\":\"completed\",\ndata: \"output\":[]}}}}\n\n"),
+        ] {
+            let (frames, failure) = through_sse(&sse, true, buffering).await.unwrap();
+            assert!(failure.is_none(), "{failure:?}");
+            assert!(!frames.iter().any(|f| f.contains("data: {\"x\":1},")), "{frames:?}");
+            let last = frames.last().unwrap().trim_end();
+            assert!(last.contains("\"response.completed\""), "{last}");
+            let data = last.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            assert!(serde_json::from_str::<Value>(data).is_ok(), "{last}");
+        }
+    }
+
+    // TestCodexExecuteNonStreamReadsAnEventSplitAcrossDataLines, CRLF included.
+    let sse = format!(
+        "event: response.completed\r\ndata: {}\r\ndata: {}\r\n\r\n",
+        &completed[..cut],
+        &completed[cut..]
+    );
+    let (frames, failure) = through_sse(&sse, false, false).await.unwrap();
+    assert!(failure.is_none());
+    let body: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(body["id"], "resp_split", "{body}");
+    assert_eq!(body["output"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// Go's bootstrap budget tests for split events (7795de19): a split handshake that passes
+/// the 48-line or 1 MiB budget while it is being collected releases the stream, so the
+/// overload after it arrives in-stream instead of failing over, and the lines before the
+/// failure in its event are delivered.
+#[tokio::test]
+async fn split_sse_events_spend_the_bootstrap_budget() {
+    let open = "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_split\",\"items\":[\n";
+    // TestCodexExecuteStreamSplitHandshakeExceedingLineBudgetReleasesBootstrapWithoutFailover
+    let over_lines = format!(
+        "{SPLIT_CREATED}{open}{}data: ]}}}}\n\n{SPLIT_OVERLOAD}",
+        "data: \n".repeat(50)
+    );
+    // TestCodexExecuteStreamEventExceedsBudgetWhileAssemblingReleasesStream: the event
+    // reaches 48 lines while collected, and the overload follows without a blank line.
+    let no_blank = format!(
+        "{SPLIT_CREATED}{open}{}data: {{\"key_at_boundary\":123}},\ndata: {{\"key_after_boundary\":456}}\ndata: ]}}}}\n{SPLIT_OVERLOAD}",
+        "data: \n".repeat(43)
+    );
+    // TestCodexExecuteStreamMixedFramingCommentInsideSplitEventCountsBudget
+    let comments = format!(
+        "data: {{\"type\":\"response.in_progress\",\"items\":[\n{}: keepalive-1\n: keepalive-2\n{SPLIT_OVERLOAD}data: ]}}}}\n\n",
+        "data: \n".repeat(46)
+    );
+    // TestCodexExecuteStreamEventExceedsByteBudgetWhileAssemblingReleasesStream
+    let large = format!("data: \"{}\",\n", "x".repeat(250 * 1024));
+    let over_bytes = format!(
+        "data: {{\"type\":\"response.in_progress\",\"items\":[\n{}data: \"last\"]}}\n\n{SPLIT_OVERLOAD}",
+        large.repeat(5)
+    );
+    // An overload that precedes a long split payload in its event decides first.
+    let overload_first = format!(
+        "{SPLIT_CREATED}{}\n{open}{}data: ]}}}}\n\n",
+        SPLIT_OVERLOAD.trim_end(),
+        "data: \n".repeat(60)
+    );
+    let error = through_sse(&overload_first, true, true).await.expect_err("fails over");
+    assert_eq!(error.status, 503, "{error:?}");
+    // Control: a split handshake within the budget still lets the overload fail over.
+    let within = format!(
+        "{SPLIT_CREATED}{open}{}data: ]}}}}\n{SPLIT_OVERLOAD}",
+        "data: \n".repeat(10)
+    );
+    let error = through_sse(&within, true, true).await.expect_err("fails over");
+    assert_eq!(error.status, 503, "{error:?}");
+    // Each delivered line spends the budget before the next is read, and a handshake may
+    // fill it exactly (outcomes recorded from Go v8.0.35): 47 comments and the overload's
+    // `event:` line are 48 held lines; one comment of raw plus translated bytes equal to
+    // 1 MiB is held, so the overload after it fails over.
+    let overload_data = SPLIT_OVERLOAD.strip_prefix("event: error\n").unwrap();
+    let comment = |len: usize| format!(": {}\n", "p".repeat(len - 2));
+    // A completed 40-line split event, its blank line and `n` comments.
+    let split_40 = |n: usize| {
+        format!(
+            "data: {{\"type\":\"response.in_progress\",\"items\":[\n{}data: ]}}\n\n{}{SPLIT_OVERLOAD}",
+            "data: \n".repeat(38),
+            ": k\n".repeat(n)
+        )
+    };
+    for (name, sse) in [
+        ("47 comments", format!("{}{SPLIT_OVERLOAD}", ": k\n".repeat(47))),
+        ("40 split lines and 6 comments", split_40(6)),
+        ("1 MiB exactly", format!("{}{overload_data}", comment(512 * 1024))),
+    ] {
+        let error = through_sse(&sse, true, true)
+            .await
+            .expect_err(&format!("{name}: fails over"));
+        assert_eq!(error.status, 503, "{name}: {error:?}");
+    }
+    // Go sends a delta as read, which starts the stream before the overload after it in
+    // the same event is seen.
+    let delta_first =
+        format!("{SPLIT_CREATED}data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}}\n{SPLIT_OVERLOAD}");
+    // A split handshake that completes over the byte budget (600 KB read plus 600 KB
+    // translated) releases the stream before the overload after it is read.
+    let completed_over_bytes = format!(
+        "data: {{\"type\":\"response.in_progress\",\"response\":{{\"model\":\"gpt-5.4\"}},\"pad\":\"{}\",\ndata: \"n\":0}}\n{SPLIT_OVERLOAD}",
+        "x".repeat(600_000)
+    );
+    let comments_48 = format!("{}{SPLIT_OVERLOAD}", ": k\n".repeat(48));
+    let comments_49 = format!("{}{SPLIT_OVERLOAD}", ": k\n".repeat(49));
+    let over_one_mib = format!("{}{overload_data}", comment(512 * 1024 + 1));
+    let split_40_and_7 = split_40(7);
+    for (name, sse) in [
+        ("completed over the byte budget", &completed_over_bytes),
+        ("48 comments", &comments_48),
+        ("49 comments", &comments_49),
+        ("1 MiB and one byte", &over_one_mib),
+        ("40 split lines and 7 comments", &split_40_and_7),
+        ("delta first", &delta_first),
+        ("line budget", &over_lines),
+        ("no blank line", &no_blank),
+        ("comments", &comments),
+        ("byte budget", &over_bytes),
+    ] {
+        let (frames, failure) = through_sse(sse, true, true)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the attempt failed over: {e:?}"));
+        assert!(failure.is_some(), "{name}: the failure arrives in-stream");
+        if name == "delta first" {
+            assert!(frames.iter().any(|f| f.contains("\"delta\":\"hi\"")), "{frames:?}");
+        }
+        if name == "no blank line" {
+            let progress = frames.iter().find(|f| f.contains("response.in_progress")).unwrap();
+            let data = progress.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            let value: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(
+                value["response"]["items"],
+                serde_json::json!([{"key_at_boundary": 123}, {"key_after_boundary": 456}])
+            );
+        }
+    }
+}
+
+/// Go `TestCodexExecutorReplayedWebSearchCallHistoryEnsuresWebSearchTool_Issue6770`
+/// (e7d4c731) through the executor: the bodies sent on the stream, non-stream and compact
+/// paths, and the shaped WebSocket body, match Go's byte for byte, which pins where the
+/// web search tool lands beside the image tool and the `instructions` default.
+#[tokio::test]
+async fn replayed_web_search_history_matches_go() {
+    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_web_search_history_go.json")).unwrap();
+    let executor = executor();
+    for case in go["executor"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let call = case["call"].as_str().unwrap();
+        let mut attributes = serde_json::json!({"api_key": "test"});
+        if let Some(plan) = case["plan"].as_str() {
+            attributes["plan_type"] = plan.into();
+        }
+        let mut headers = serde_json::json!({});
+        if case["lite_header"] == true {
+            headers["x-openai-internal-codex-responses-lite"] = "true".into();
+        }
+        let synthetic = serde_json::json!({
+            "source": "openai-response",
+            "model": "gpt-6.1-sol",
+            "payload": case["payload"],
+            "stream": call != "non_stream" && call != "compact",
+            "alt": if call == "compact" { Value::from("responses/compact") } else { Value::Null },
+            "headers": headers,
+            "attributes": attributes,
+        });
+        let cfg = Config::parse(if case["no_image"] == true {
+            "disable-image-generation: true\n"
+        } else {
+            "{}"
+        })
+        .unwrap();
+        let sent = if call == "websocket" {
+            let credential = credential(&synthetic, "http://127.0.0.1:1");
+            request::shape(
+                &request(&synthetic),
+                &View::new(&credential),
+                &Settings::from(&cfg),
+                Call::Websocket,
+            )
+            .unwrap()
+            .body
+        } else {
+            let mock = Mock::start().await;
+            let (path, content_type, body) = if call == "compact" {
+                (
+                    "/responses/compact",
+                    "application/json",
+                    r#"{"id":"resp_compact_1","object":"response.compaction","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
+                )
+            } else {
+                (
+                    "/responses",
+                    "text/event-stream",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n",
+                )
+            };
+            mock.script(
+                path,
+                vec![Reply {
+                    status: 200,
+                    headers: vec![("content-type".into(), content_type.into())],
+                    body: body.into(),
+                }],
+            );
+            let credential = credential(&synthetic, &mock.url);
+            if let ResponseBody::Stream(mut stream) = executor
+                .execute(&credential, request(&synthetic), &cfg)
+                .await
+                .unwrap()
+                .body
+            {
+                while stream.next().await.is_some() {}
+            }
+            String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
+        };
+        assert_eq!(sent, case["sent"].as_str().unwrap(), "{name}");
+    }
+}
+
+/// Sign in with ChatGPT (7b0319fb): Go v8.0.35's upstream body and headers for a
+/// `use_siwc` credential on every call, and its missing-token error; see
+/// tests/reference/codex_siwc.
+#[tokio::test]
+async fn siwc_requests_match_go() {
+    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_go.json")).unwrap();
+    let executor = executor();
+    for case in go["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let call = case["call"].as_str().unwrap();
+        let mut metadata = case["metadata"].clone();
+        metadata["type"] = "codex".into();
+        let synthetic = serde_json::json!({
+            "source": "openai-response",
+            "model": case["model"],
+            "payload": case["payload"],
+            "stream": call == "stream" || call == "websocket",
+            "alt": if call == "compact" { Value::from("responses/compact") } else { Value::Null },
+            "headers": case["headers"],
+            "attributes": case["attributes"],
+            "metadata": metadata,
+        });
+        let cfg = Config::parse(case["config"].as_str().unwrap_or("{}")).unwrap();
+        let mock = Mock::start().await;
+        let credential = credential(&synthetic, &mock.url);
+        // The recorder ran on linux/amd64; the User-Agent names the host's Go platform.
+        let mut sent_headers = case["sent_headers"].clone();
+        if let Some(ua) = sent_headers.get_mut("user-agent") {
+            let host = format!("({}; {})", crate::kimi_http::go_os(), crate::kimi_http::go_arch());
+            ua[0] = ua[0].as_str().unwrap().replace("(linux; amd64)", &host).into();
+        }
+        let go_upstream = serde_json::json!({
+            "path": case["path"],
+            "body": case["body"],
+            "headers": sent_headers,
+        });
+        if call == "websocket" {
+            let req = request(&synthetic);
+            let view = View::new(&credential);
+            let settings = Settings::scoped(&cfg, &view);
+            let shaped = request::shape(&req, &view, &settings, Call::Websocket).unwrap();
+            let (body, cache) = request::prompt_cache(&req, shaped.body, Some("exec-session"), true);
+            let body = crate::codex_ws::turn_body(&view, &req, &settings, &shaped.finalize, body);
+            assert_eq!(body, case["body"].as_str().unwrap(), "{name}: body");
+            let headers = request::ws_headers(
+                &view,
+                &settings,
+                &req.headers,
+                &body,
+                &request::base_model(&req.model),
+                cache.as_deref(),
+                false,
+            );
+            let mut actual: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                .collect();
+            actual.sort();
+            let mut expected: Vec<(String, String)> = go_upstream["headers"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v[0].as_str().unwrap().to_owned()))
+                .collect();
+            expected.sort();
+            assert_eq!(actual, expected, "{name}: headers");
+            continue;
+        }
+        if call == "image" {
+            let sse = concat!(
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+            );
+            mock.script(
+                "/responses",
+                vec![Reply {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    body: sse.into(),
+                }],
+            );
+            let path = "/v1/images/generations";
+            let mut req = request(&synthetic);
+            (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
+            executor.images(&credential, req, path, &cfg).await.unwrap();
+            assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            continue;
+        }
+        let (path, content_type, reply) = if call == "compact" {
+            (
+                "/responses/compact",
+                "application/json",
+                r#"{"id":"resp_compact_1","object":"response.compaction","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
+            )
+        } else {
+            (
+                "/responses",
+                "text/event-stream",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n",
+            )
+        };
+        mock.script(
+            path,
+            vec![Reply {
+                status: 200,
+                headers: vec![("content-type".into(), content_type.into())],
+                body: reply.into(),
+            }],
+        );
+        match executor.execute(&credential, request(&synthetic), &cfg).await {
+            Ok(res) => {
+                if let ResponseBody::Stream(mut stream) = res.body {
+                    while stream.next().await.is_some() {}
+                }
+                assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            }
+            Err(error) => {
+                assert_eq!(error.status as i64, case["status"].as_i64().unwrap(), "{name}: status");
+                assert_eq!(
+                    String::from_utf8_lossy(&error.body),
+                    case["error"].as_str().unwrap(),
+                    "{name}: error"
+                );
+                assert!(mock.take().is_empty(), "{name}: nothing may reach upstream");
+            }
+        }
+    }
+    // Without a `base_url` (the cases above dial a mock): Go's `defaultOpenAISIWCBaseURL`.
+    let production = Credential::from_file(
+        Path::new("/fake"),
+        Path::new("/fake/c.json"),
+        serde_json::json!({"type": "codex", "use_siwc": true, "access_token": "outer-at",
+                           "siwc": {"access_token": "siwc-at"}})
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+    .unwrap();
+    let view = View::new(&production);
+    assert_eq!((view.base_url, view.token), ("https://api.openai.com/v1", "siwc-at"));
+}
+
+/// Sign in with ChatGPT refresh (Go `refreshLocked`): the `siwc` partition refreshes on
+/// its own 5-minute lead, a rejected token refreshes the partition requests use, a
+/// management refresh both, and one partition failing keeps the other's result.
+#[tokio::test]
+async fn siwc_partition_refreshes_like_go() {
+    use crate::codex_testkit::json;
+    const OUTER: &str = "/oauth/token";
+    const SIWC: &str = "/api/accounts/oauth/token";
+    let mock = Mock::start().await;
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &format!("{}{OUTER}", mock.url), "", "")
+        .with_siwc_token_url(&format!("{}{SIWC}", mock.url))
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    let executor = CodexExecutor::with_client(wreq::Client::new(), oauth);
+    let cfg = Config::default();
+    let at = |minutes: i64| (Utc::now() + chrono::TimeDelta::minutes(minutes)).to_rfc3339();
+    // Unique refresh tokens per case: results are single-flighted and retained.
+    let cred = |id: &str, use_siwc: bool, siwc_expires: &str| {
+        Credential::from_file(
+            Path::new("/fake"),
+            Path::new("/fake/c.json"),
+            serde_json::json!({
+                "type": "codex", "use_siwc": use_siwc,
+                "access_token": "outer-at", "refresh_token": format!("outer-{id}"), "expired": at(5 * 24 * 60),
+                "siwc": {"access_token": "siwc-at", "refresh_token": format!("siwc-{id}"), "client_id": "client-1",
+                         "device_id": "dev-1", "expired": siwc_expires, "custom": "kept"},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap()
+    };
+    let outer_ok = || {
+        json(
+            200,
+            r#"{"access_token":"outer-new","refresh_token":"outer-rt-new","id_token":"","expires_in":3600}"#,
+        )
+    };
+    let siwc_ok = || {
+        json(
+            200,
+            r#"{"access_token":"siwc-new","refresh_token":"siwc-rt-new","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#,
+        )
+    };
+    let paths = |sent: Vec<Captured>| sent.into_iter().map(|c| c.path).collect::<Vec<_>>();
+
+    // The 5-minute lead: due at four minutes left, not at six.
+    assert!(!executor.needs_prepare(&cred("a", true, &at(6)), &cfg));
+    let due = cred("b", true, &at(4));
+    assert!(executor.needs_prepare(&due, &cfg));
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.prepare(&due, &cfg).await.unwrap();
+    let sent = mock.take();
+    assert_eq!(paths(sent.clone()), [SIWC], "only the due partition refreshes");
+    assert_eq!(
+        String::from_utf8_lossy(&sent[0].body),
+        "client_id=client-1&grant_type=refresh_token&refresh_token=siwc-b&resource=https%3A%2F%2Fapi.openai.com%2Fv1"
+    );
+    assert_eq!(patch.set.keys().collect::<Vec<_>>(), ["siwc"]);
+    let siwc = &patch.set["siwc"];
+    assert_eq!(
+        (&siwc["access_token"], &siwc["refresh_token"], &siwc["client_id"]),
+        (&"siwc-new".into(), &"siwc-rt-new".into(), &"client-1".into())
+    );
+    assert_eq!((&siwc["device_id"], &siwc["custom"]), (&"dev-1".into(), &"kept".into()));
+
+    // A rejected token: the partition requests use, whichever is due otherwise.
+    mock.script(SIWC, vec![siwc_ok()]);
+    executor.refresh_now(&cred("c", true, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [SIWC]);
+    mock.script(OUTER, vec![outer_ok()]);
+    let patch = executor.refresh_now(&cred("d", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [OUTER]);
+    assert!(!patch.set.contains_key("siwc"));
+
+    // A management refresh: both, outer first.
+    mock.script(OUTER, vec![outer_ok()]);
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("e", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [OUTER, SIWC]);
+    assert_eq!(
+        (&patch.set["access_token"], &patch.set["siwc"]["access_token"]),
+        (&"outer-new".into(), &"siwc-new".into())
+    );
+
+    // One partition failing keeps the other's refresh; both failing returns the outer error.
+    mock.script(OUTER, vec![json(500, "{}"); 3]);
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("f", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(patch.set.keys().collect::<Vec<_>>(), ["siwc"]);
+    mock.take();
+    mock.script(OUTER, vec![outer_ok()]);
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    let patch = executor.refresh_all(&cred("k", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(patch.set["access_token"], "outer-new");
+    assert!(!patch.set.contains_key("siwc"));
+    assert_eq!(mock.take().len(), 4);
+    // A retry right after: the outer success is retained, the SIWC failure is not (Go's
+    // singleflight forgets it), so only the SIWC endpoint is called again.
+    mock.script(SIWC, vec![siwc_ok()]);
+    let patch = executor.refresh_all(&cred("k", false, &at(60)), &cfg).await.unwrap();
+    assert_eq!(paths(mock.take()), [SIWC]);
+    assert_eq!(patch.set["siwc"]["access_token"], "siwc-new");
+    mock.script(OUTER, vec![json(500, "{}"); 3]);
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    let error = executor
+        .refresh_all(&cred("g", false, &at(60)), &cfg)
+        .await
+        .unwrap_err();
+    assert!(
+        String::from_utf8_lossy(&error.body).starts_with("token refresh failed after 3 attempts"),
+        "{error:?}"
+    );
+    assert_eq!(mock.take().len(), 6);
+
+    // refresh_token_reused stops the retries, and only the OAuth code is kept.
+    mock.script(
+        SIWC,
+        vec![json(400, r#"{"error":"refresh_token_reused","echo":"secret"}"#)],
+    );
+    let error = executor.refresh_now(&cred("h", true, &at(60)), &cfg).await.unwrap_err();
+    assert_eq!(mock.take().len(), 1);
+    assert_eq!((error.status, error.scope), (401, FailureScope::Credential));
+    assert_eq!(
+        String::from_utf8_lossy(&error.body),
+        "OpenAI OAuth token request failed (400): refresh_token_reused"
+    );
+
+    // A failed scheduled refresh keeps a still-valid SIWC token in use.
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    assert!(
+        executor
+            .prepare(&cred("i", true, &at(4)), &cfg)
+            .await
+            .unwrap()
+            .set
+            .is_empty()
+    );
+    mock.take();
+    mock.script(SIWC, vec![json(500, "{}"); 3]);
+    assert!(executor.prepare(&cred("j", true, &at(-1)), &cfg).await.is_err());
+}
+
+/// TestPayloadBarrierCodexImageFilter, HTTP half (868e137): a filter removes what the
+/// executor adds late (the image tool, the empty instructions, the prompt cache key).
+#[tokio::test]
+async fn payload_filters_remove_late_codex_additions() {
+    let executor = executor();
+    let cfg = Config::parse(
+        "payload:\n  filter:\n    - models: [{name: gpt-5.6-sol}]\n      params: ['tools.#(type==\"image_generation\")#', instructions, prompt_cache_key]\n",
+    )
+    .unwrap();
+    for stream in [false, true] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna"] {
+            let mock = Mock::start().await;
+            mock.script(
+                "/responses",
+                vec![Reply {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    body: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_barrier\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n".into(),
+                }],
+            );
+            let mut credential = oauth_credential(&mock.url);
+            credential.attributes.insert("api_key".into(), "test".into());
+            credential.attributes.insert("plan_type".into(), "pro".into());
+            let mut req = plain_request(stream, None);
+            req.source_format = Format::OpenAIResponse;
+            req.response_format = Format::OpenAIResponse;
+            req.model = model.into();
+            req.requested_model = model.into();
+            req.body = Bytes::from_static(br#"{"input":"hello","prompt_cache_key":"injected-cache"}"#);
+            req.original_body = req.body.clone();
+            match executor.execute(&credential, req, &cfg).await.unwrap().body {
+                ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
+                ResponseBody::Buffered(_) => {}
+            }
+            let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
+            let image = gjson::get(&sent, r#"tools.#(type=="image_generation")"#).exists();
+            assert_eq!(image, model == "gpt-5.6-luna", "{model} stream={stream}: {sent}");
+            if model == "gpt-5.6-sol" {
+                assert!(!gjson::get(&sent, "instructions").exists(), "{sent}");
+                assert!(!gjson::get(&sent, "prompt_cache_key").exists(), "{sent}");
+            }
+        }
+    }
+}
+
+/// Go 868e137 gives CountTokens the payload barrier: the rules run on the shaped body
+/// before the tokenizer, so a configured `input` changes the count.
+#[test]
+fn count_tokens_sees_the_payload_rules() {
+    let count = |config: &str| {
+        let mut req = plain_request(false, None);
+        req.operation = Operation::CountTokens;
+        req.body = Bytes::from_static(br#"{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#);
+        req.original_body = req.body.clone();
+        let out = super::count_tokens(&req, &Config::parse(config).unwrap()).unwrap();
+        let ResponseBody::Buffered(bytes) = out.body else {
+            panic!("count answers are buffered")
+        };
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        gjson::get(&text, "response.usage.input_tokens").i64()
+    };
+    let plain = count("");
+    let configured = count(
+        "payload:\n  override:\n    - models: [{name: gpt-5.4}]\n      params: {input.0.content.0.text: one two three four five six seven eight nine ten}\n",
+    );
+    assert!(plain > 0);
+    assert!(configured > plain + 5, "{plain} -> {configured}");
 }

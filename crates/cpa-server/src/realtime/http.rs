@@ -22,7 +22,9 @@ use crate::runtime::Runtime;
 
 pub(super) enum ReadError {
     TooLarge,
-    Read(String),
+    /// The read failed; the status is 413 at `server.max-request-body-bytes`
+    /// (Go `HTTPStatusFromErrorOr(err, 400)`), else 400.
+    Read(String, u16),
 }
 
 /// [`live::read_limited`] on the pick's attempt context: Home draining the pick ends
@@ -43,7 +45,10 @@ pub(super) async fn read_limited(body: Body, limit: usize) -> Result<Vec<u8>, Re
     let mut stream = body.into_data_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ReadError::Read(e.to_string()))?;
+        let chunk = chunk.map_err(|e| {
+            let status = if crate::body_limit::is_too_large(&e) { 413 } else { 400 };
+            ReadError::Read(e.to_string(), status)
+        })?;
         if out.len() + chunk.len() > limit {
             return Err(ReadError::TooLarge);
         }
@@ -244,7 +249,7 @@ pub(super) async fn call(
     let body = match read_limited(body, live::MAX_BODY).await {
         Ok(body) => body,
         Err(ReadError::TooLarge) => return fail(413, "Codex live request body too large"),
-        Err(ReadError::Read(e)) => return fail(400, &format!("failed to read Codex live request: {e}")),
+        Err(ReadError::Read(e, status)) => return fail(status, &format!("failed to read Codex live request: {e}")),
     };
     let secret_session = principal
         .secret
@@ -265,10 +270,11 @@ pub(super) async fn call(
         Err(message) => return fail(503, &message),
     };
     let selection_headers = principal.selection_headers(&headers);
-    let lease = match select_oauth(&rt, &cfg, None, &selection_headers, &body, None, &call.model, "http").await {
-        Ok(lease) => lease,
-        Err(rejection) => return rejection.render(realtime),
-    };
+    let (lease, home_key) =
+        match select_oauth(&rt, &cfg, None, &selection_headers, &body, None, &call.model, "http").await {
+            Ok(picked) => picked,
+            Err(rejection) => return rejection.render(realtime),
+        };
     let home = lease.is_remote();
     let model = call.model.clone();
     let credential = lease.credential.clone();
@@ -357,6 +363,8 @@ pub(super) async fn call(
     if home && status == 401 {
         super::report_unauthorized(
             &rt,
+            &principal,
+            &home_key,
             &credential,
             &model,
             &data,
@@ -574,10 +582,11 @@ pub(super) async fn hangup(
     let selection_headers = principal.selection_headers(&headers);
     // Go: the call's active Home pick, else a pick pinned to the call's credential that
     // ends with this request.
-    let (credential, lease) = match stored.home.as_ref().and_then(|hold| hold.active()) {
-        Some(credential) => (credential, None),
+    // A reused pick carries no client key from Home: only this request's own pick does.
+    let (credential, lease, home_key) = match stored.home.as_ref().and_then(|hold| hold.active()) {
+        Some(credential) => (credential, None, String::new()),
         None => {
-            let lease = match select_oauth(
+            let (lease, home_key) = match select_oauth(
                 &rt,
                 &cfg,
                 Some(&stored.auth_id),
@@ -589,10 +598,10 @@ pub(super) async fn hangup(
             )
             .await
             {
-                Ok(lease) => lease,
+                Ok(picked) => picked,
                 Err(rejection) => return rejection.render(true),
             };
-            (lease.credential.clone(), Some(lease))
+            (lease.credential.clone(), Some(lease), home_key)
         }
     };
     let home = lease.as_ref().map_or(stored.home.is_some(), |lease| lease.is_remote());
@@ -616,9 +625,9 @@ pub(super) async fn hangup(
                 "invalid_request",
             ));
         }
-        Err(ReadError::Read(e)) => {
+        Err(ReadError::Read(e, status)) => {
             return traced(realtime_error(
-                400,
+                status,
                 &format!("failed to read Codex live request: {e}"),
                 "invalid_request_error",
                 "invalid_request",
@@ -683,6 +692,8 @@ pub(super) async fn hangup(
     if home && status == 401 {
         super::report_unauthorized(
             &rt,
+            &principal,
+            &home_key,
             &credential,
             &stored.model,
             &data,

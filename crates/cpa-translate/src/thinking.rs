@@ -1,5 +1,6 @@
 //! Translator entry points into internal/thinking, served by `cpa_common::thinking`.
 
+use cpa_common::gostr::GoStr;
 use cpa_common::thinking as ct;
 use cpa_core::registry::ModelInfo;
 
@@ -8,7 +9,7 @@ pub use ct::{convert_budget_to_level, convert_level_to_budget, has_level, map_to
 /// registry.LookupModelInfo: the server's dynamic registry (preferring `provider`'s
 /// registration), then every static catalog in Go's search order, by trimmed ID.
 pub fn lookup_model_info(model: &str, provider: &str) -> Option<ModelInfo> {
-    let provider = provider.trim().to_lowercase();
+    let provider = provider.trim().go_lower();
     cpa_core::registry::lookup_model(model, (!provider.is_empty()).then_some(provider.as_str()))
 }
 

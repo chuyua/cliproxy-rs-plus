@@ -1,6 +1,7 @@
 //! Go's OAuth tab (internal/tui/oauth_tab.go): starts a provider login through the v0
 //! `*-auth-url` routes, then polls `get-auth-status`; web flows take a pasted callback
 //! URL, device flows show the user code.
+use cpa_core::gostr::GoStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -266,11 +267,6 @@ impl OAuthTab {
                     self.refresh();
                 }
             }
-            "enter" if self.unsupported(self.cursor) => {
-                let message = format!("✗ {}: {}", PROVIDERS[self.cursor].0, t("oauth_unsupported"));
-                self.message = Some((message, s::error()));
-                self.refresh();
-            }
             "enter" => {
                 self.generation += 1;
                 self.state = State::Pending;
@@ -293,12 +289,6 @@ impl OAuthTab {
             self.input.insert(text);
             self.refresh();
         }
-    }
-
-    /// Antigravity sign-in is not ported, so a cliproxy-rs server always answers 404 to
-    /// it; Go servers still offer it.
-    fn unsupported(&self, index: usize) -> bool {
-        PROVIDERS[index].4 == "antigravity" && self.client.as_ref().is_some_and(|c| c.is_cliproxy_rs())
     }
 
     /// Go `startOAuth`: the auth URL with `is_webui=true`, then a best-effort browser.
@@ -324,7 +314,7 @@ impl OAuthTab {
                 return fail(format!("no auth URL returned for {name}"));
             }
             let user_code = s::get_string(&data, "user_code");
-            let flow = s::get_string(&data, "flow").trim().to_lowercase();
+            let flow = s::get_string(&data, "flow").trim().go_lower();
             let _ = super::sys::open_browser(&url);
             Msg::OAuthStart(Start {
                 device: device_provider || flow == "device" || !user_code.is_empty(),
@@ -449,18 +439,15 @@ impl OAuthTab {
         doc.blank();
         for (i, (name, _, emoji, _, _)) in PROVIDERS.iter().enumerate() {
             let selected = i == self.cursor;
-            let unsupported = self.unsupported(i);
-            let label = if unsupported {
-                format!(" {emoji} {name} ({}) ", t("oauth_unsupported"))
+            let style = if selected {
+                s::bold(s::WHITE).bg(s::PRIMARY)
             } else {
-                format!(" {emoji} {name} ")
+                s::fg(s::TEXT)
             };
-            let style = match (selected, unsupported) {
-                (true, _) => s::bold(s::WHITE).bg(s::PRIMARY),
-                (false, true) => s::fg(s::MUTED),
-                (false, false) => s::fg(s::TEXT),
-            };
-            doc.line(vec![plain(if selected { "▸ " } else { "  " }), span(label, style)]);
+            doc.line(vec![
+                plain(if selected { "▸ " } else { "  " }),
+                span(format!(" {emoji} {name} "), style),
+            ]);
         }
         doc.blank();
         doc.text(t("oauth_help"), s::help());

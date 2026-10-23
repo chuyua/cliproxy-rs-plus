@@ -222,9 +222,10 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
     let selection_headers = principal.selection_headers(&headers);
     // Go: the call's Home pick (a drained one ends the call), else a pick pinned to the
     // call's credential that lasts as long as this relay.
-    let (credential, lease) = match &call.home {
+    // A reused pick carries no client key from Home: only this request's own pick does.
+    let (credential, lease, home_key) = match &call.home {
         Some(hold) => match hold.active() {
-            Some(credential) => (credential, None),
+            Some(credential) => (credential, None, String::new()),
             None => {
                 let mut guard = guard;
                 guard.consume = true;
@@ -232,7 +233,7 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
             }
         },
         None => {
-            let lease = match select_oauth(
+            let (lease, home_key) = match select_oauth(
                 &rt,
                 &cfg,
                 Some(&call.auth_id),
@@ -244,10 +245,10 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
             )
             .await
             {
-                Ok(lease) => lease,
+                Ok(picked) => picked,
                 Err(rejection) => return rejection.render(realtime),
             };
-            (lease.credential.clone(), Some(lease))
+            (lease.credential.clone(), Some(lease), home_key)
         }
     };
     let home = call.home.is_some() || lease.as_ref().is_some_and(|lease| lease.is_remote());
@@ -278,6 +279,8 @@ async fn sideband(inbound: Inbound, realtime: bool, style: Sideband, call_id: St
             if home {
                 report_dial_unauthorized(
                     &rt,
+                    &principal,
+                    &home_key,
                     &credential,
                     &call.model,
                     &error,
@@ -326,6 +329,7 @@ async fn until_drained_dial(
         biased;
         _ = drained => Err(DialError {
             response: None,
+            status: None,
             message: "context canceled".into(),
         }),
         dialed = dial => dialed,
@@ -352,20 +356,22 @@ async fn until_drained(
 /// else the dial error's text.
 fn report_dial_unauthorized(
     rt: &Runtime,
+    principal: &Principal,
+    home_key: &str,
     credential: &cpa_core::credential::Credential,
     model: &str,
     error: &DialError,
     session: (String, String),
 ) {
-    let Some(handshake) = error.response.as_ref().filter(|h| h.status == 401) else {
+    // An upstream 401, or Go's local 401 before dialling (`HTTPStatusFromErrorOr`).
+    if error.response.as_ref().map_or(error.status, |h| Some(h.status)) != Some(401) {
         return;
+    }
+    let body = match error.response.as_ref().filter(|h| !h.body.is_empty()) {
+        Some(handshake) => &handshake.body[..],
+        None => error.message.as_bytes(),
     };
-    let body = if handshake.body.is_empty() {
-        error.message.as_bytes()
-    } else {
-        &handshake.body
-    };
-    super::report_unauthorized(rt, credential, model, body, session);
+    super::report_unauthorized(rt, principal, home_key, credential, model, body, session);
 }
 
 /// `HandleDirectWebsocket`.
@@ -402,7 +408,7 @@ async fn direct(inbound: Inbound, model: String) -> Response {
     }
     let cfg = rt.config();
     let selection_headers = principal.selection_headers(&headers);
-    let lease = match select_oauth(
+    let (lease, home_key) = match select_oauth(
         &rt,
         &cfg,
         None,
@@ -414,7 +420,7 @@ async fn direct(inbound: Inbound, model: String) -> Response {
     )
     .await
     {
-        Ok(lease) => lease,
+        Ok(picked) => picked,
         Err(rejection) => return rejection.render(true),
     };
     let credential = lease.credential.clone();
@@ -439,6 +445,8 @@ async fn direct(inbound: Inbound, model: String) -> Response {
             if lease.is_remote() {
                 report_dial_unauthorized(
                     &rt,
+                    &principal,
+                    &home_key,
                     &credential,
                     &selection_model,
                     &error,
@@ -517,7 +525,8 @@ async fn direct(inbound: Inbound, model: String) -> Response {
 fn dial_failed(error: DialError, other: impl FnOnce(u16) -> Response) -> Response {
     let Some(handshake) = error.response else {
         tracing::debug!(error = %error.message, "codex live upstream dial failed");
-        return other(502);
+        // Go `HTTPStatusFromErrorOr(errDial, 502)`: a local refusal keeps its status.
+        return other(error.status.unwrap_or(502));
     };
     let mut response = if handshake.status == 401 {
         let mut headers = HeaderMap::new();

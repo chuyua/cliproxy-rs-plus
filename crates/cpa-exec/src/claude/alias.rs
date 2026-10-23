@@ -7,6 +7,7 @@
 //! JSON and per SSE event. Server tools and names already shaped like MCP tools are
 //! never renamed.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -36,7 +37,7 @@ pub(crate) fn is_mcp_name(name: &str) -> bool {
 }
 
 pub(crate) fn is_server_tool_type(kind: &str) -> bool {
-    let kind = kind.trim().to_lowercase();
+    let kind = kind.trim().go_lower();
     [
         "advisor_",
         "agent_toolset_",
@@ -526,6 +527,11 @@ impl<'a> Resolver<'a> {
             _ => {}
         }
         if !self.passthroughs.is_empty() {
+            // v8.0.35 02fc76b1: the model kept the caller's full tool name, `mcp__`
+            // included, under the virtual server (`mcp__<virtual>__mcp__<server>__<tool>`).
+            if !suffix.is_empty() && self.passthroughs.contains(&suffix) {
+                return Ok(Some(suffix));
+            }
             let reprefixed = format!("mcp__{suffix}");
             if self.exact.get(&reprefixed).is_some_and(|o| *o == reprefixed) {
                 return Ok(Some(reprefixed));
@@ -670,5 +676,55 @@ mod tests {
             Some("fixture_lookup")
         );
         assert_eq!(resolver.resolve("mcp__other__x_fixture_lookup").unwrap(), None);
+    }
+
+    /// v8.0.35 claude_executor_request_remap_test.go (02fc76b1): a caller-owned MCP tool
+    /// wrapped in the virtual server, by tool name or by its full name, restores in
+    /// buffered and streamed responses; a tool name two declared tools share stays an
+    /// error.
+    #[test]
+    fn caller_mcp_tool_wrapped_in_the_virtual_server_restores_like_go() {
+        let server_of = |reverse: &Reverse| {
+            let alias = reverse
+                .iter()
+                .find(|(_, o)| *o == "Bash")
+                .map(|(a, _)| a.clone())
+                .unwrap();
+            alias_server(&alias)
+        };
+        let recall = "mcp__docs-search__search-pages";
+        let body = format!(
+            r#"{{"tools":[{{"name":"Bash"}},{{"name":"{recall}"}},{{"name":"mcp__docs-search__search-issues"}}]}}"#
+        );
+        let (_, reverse) = remap(&body, "wrapped-passthrough-caller");
+        let server = server_of(&reverse);
+        for wrapped in [
+            format!("mcp__{server}__search-pages"),
+            format!("mcp__{server}__{recall}"),
+        ] {
+            let response =
+                format!(r#"{{"content":[{{"type":"tool_use","id":"toolu_1","name":"{wrapped}","input":{{}}}}]}}"#);
+            let restored = restore_response(&response, &reverse).unwrap();
+            assert_eq!(rawjson::string(&restored, "content.0.name"), recall, "{wrapped}");
+            let event = format!(
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"toolu_1","name":"{wrapped}","input":{{}}}}}}"#
+            );
+            let restored = restore_event_payload(&event, &reverse).unwrap().unwrap();
+            assert_eq!(rawjson::string(&restored, "content_block.name"), recall, "{wrapped}");
+        }
+        let body = r#"{"tools":[{"name":"Bash"},{"name":"mcp__a__query"},{"name":"mcp__b__query"}]}"#;
+        let (_, reverse) = remap(body, "wrapped-ambiguous-caller");
+        let server = server_of(&reverse);
+        let response = format!(
+            r#"{{"content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__{server}__query","input":{{}}}}]}}"#
+        );
+        let error = restore_response(&response, &reverse).unwrap_err();
+        assert!(error.contains("matches multiple declared tools"), "{error}");
+        // A full caller name that names no declared tool stays unrestored.
+        let resolver = Resolver::new(&reverse);
+        assert_eq!(
+            resolver.resolve(&format!("mcp__{server}__mcp__c__query")).unwrap(),
+            None
+        );
     }
 }

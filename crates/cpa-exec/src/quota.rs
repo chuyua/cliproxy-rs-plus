@@ -1,5 +1,6 @@
 //! Anthropic shared-window vs model/entitlement rejection (helps/claude_ratelimit.go).
 
+use cpa_core::gostr::GoStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cpa_core::exec::{ExecError, FailureScope};
@@ -72,7 +73,7 @@ pub(crate) fn shared_rejection(headers: &HeaderMap) -> bool {
 /// rejection cools only the model, like any other 429.
 pub(crate) fn classify(mut error: ExecError, model_level_cooling: bool) -> ExecError {
     if (400..600).contains(&error.status) {
-        error.retry_after = rate_limit_reset(&error.headers);
+        error.retry_after = rate_limit_reset_for_error(&error.headers, &error.body);
     }
     if error.status == 429 {
         let value: serde_json::Value = serde_json::from_slice(&error.body).unwrap_or_default();
@@ -81,7 +82,7 @@ pub(crate) fn classify(mut error: ExecError, model_level_cooling: bool) -> ExecE
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| String::from_utf8_lossy(&error.body).into_owned())
-            .to_lowercase();
+            .go_lower();
         error.scope = if !model_level_cooling && shared_rejection(&error.headers) {
             FailureScope::Credential
         } else if message.contains("fast request rejected")
@@ -96,9 +97,104 @@ pub(crate) fn classify(mut error: ExecError, model_level_cooling: bool) -> ExecE
     error
 }
 
-/// `ParseClaudeRateLimitReset` now, with Go's 1–30 s fuzz.
-pub(crate) fn rate_limit_reset(headers: &HeaderMap) -> Option<Duration> {
-    reset(headers, SystemTime::now(), fuzz())
+/// `ParseClaudeRateLimitResetForError` now, with Go's 1–30 s fuzz.
+pub(crate) fn rate_limit_reset_for_error(headers: &HeaderMap, body: &[u8]) -> Option<Duration> {
+    reset_for_error(headers, body, SystemTime::now(), fuzz())
+}
+
+/// [`reset`] with one exception: an explicit per-minute rate-limit error carries no
+/// quota window, so an unclassified unified reset must not stretch its short
+/// `Retry-After` into an hours-long cooldown. It applies only when the body is exactly
+/// one per-minute message, no status header declares a quota window, and `Retry-After`
+/// is one value inside the deadline filter's range.
+pub(crate) fn reset_for_error(headers: &HeaderMap, body: &[u8], now: SystemTime, fuzz: Duration) -> Option<Duration> {
+    let declares_window = QUOTA_STATUS.iter().any(|name| {
+        headers
+            .get_all(*name)
+            .iter()
+            .any(|v| !v.as_bytes().trim_ascii().is_empty())
+    });
+    let mut values = headers.get_all("retry-after").iter();
+    let single = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    };
+    let short = single
+        .and_then(|raw| retry_after(raw, now))
+        .and_then(|t| t.duration_since(now).ok())
+        .is_some_and(|d| !d.is_zero() && d <= MAX_WINDOW);
+    if declares_window || !short || !per_minute_body(body) {
+        return reset(headers, now, fuzz);
+    }
+    // Only the unclassified unified reset can stretch the cooldown here: each window's
+    // own reset counts only when that window is rejected.
+    let mut headers = headers.clone();
+    headers.remove("anthropic-ratelimit-unified-reset");
+    reset(&headers, now, fuzz)
+}
+
+/// `claudeQuotaStatusHeaders`: a non-empty value declares a quota window.
+const QUOTA_STATUS: [&str; 5] = [
+    "anthropic-ratelimit-unified-status",
+    "anthropic-ratelimit-unified-5h-status",
+    "anthropic-ratelimit-unified-7d-status",
+    "anthropic-ratelimit-unified-7d_oi-status",
+    "anthropic-ratelimit-unified-overage-status",
+];
+
+/// `claudeBodyIsExplicitPerMinuteRateLimit`: the body decodes as Go's
+/// `{"error":{"type","message"}}` envelope with type `rate_limit_error` and exactly one
+/// of the per-minute messages (case and surrounding whitespace aside).
+fn per_minute_body(body: &[u8]) -> bool {
+    const MESSAGES: [&str; 3] = [
+        "this request would exceed the requests per minute rate limit. please try again later.",
+        "this request would exceed the input tokens per minute rate limit. please try again later.",
+        "this request would exceed the output tokens per minute rate limit. please try again later.",
+    ];
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    // encoding/json decodes every key that folds to a field name in order, merging
+    // nested objects; null leaves a field unchanged and any other type fails the decode.
+    // serde_json keeps only the last of two byte-identical keys, so `"error":{..},
+    // "error":null` reads as null where Go keeps the object (DIFFERENCES-FROM-GO.md).
+    let (mut kind, mut message) = ("", "");
+    for error in go_fields(&root, "error") {
+        let serde_json::Value::Object(error) = error else {
+            if error.is_null() {
+                continue;
+            }
+            return false;
+        };
+        for (slot, name) in [(&mut kind, "type"), (&mut message, "message")] {
+            for value in go_fields(error, name) {
+                match value {
+                    serde_json::Value::String(s) => *slot = s,
+                    serde_json::Value::Null => {}
+                    _ => return false,
+                }
+            }
+        }
+    }
+    kind == "rate_limit_error" && MESSAGES.contains(&message.trim().go_lower().as_str())
+}
+
+/// The values encoding/json decodes into the struct field `name`, in key order: keys
+/// equal to it under Go's case folding (ASCII case, plus U+017F for `s` and U+212A for
+/// `k`).
+fn go_fields<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    name: &'a str,
+) -> impl Iterator<Item = &'a serde_json::Value> + 'a {
+    let fold = |c: char| match c {
+        '\u{17F}' => 's',
+        '\u{212A}' => 'k',
+        c => c.to_ascii_lowercase(),
+    };
+    object
+        .iter()
+        .filter(move |(key, _)| key.chars().map(fold).eq(name.chars()))
+        .map(|(_, v)| v)
 }
 
 fn fuzz() -> Duration {
@@ -127,7 +223,7 @@ fn overage_billing_boundary(headers: &HeaderMap, unified_reset: &str) -> bool {
         })
 }
 
-fn reset(headers: &HeaderMap, now: SystemTime, fuzz: Duration) -> Option<Duration> {
+pub(crate) fn reset(headers: &HeaderMap, now: SystemTime, fuzz: Duration) -> Option<Duration> {
     let overage = overage_only(headers);
     let five = status(headers, "5h-");
     let seven = status(headers, "7d-");

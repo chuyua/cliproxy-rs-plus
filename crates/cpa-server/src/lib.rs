@@ -9,6 +9,7 @@ pub mod antigravity_health;
 pub mod antigravity_proxy_bridge;
 pub mod antigravity_proxy_group;
 pub mod antigravity_proxy_sqlite;
+pub mod body_limit;
 pub mod capabilities;
 mod classify;
 mod claude;
@@ -36,6 +37,7 @@ pub mod observability;
 mod openai;
 pub mod persist;
 pub mod plugins;
+pub mod pprof;
 mod realtime;
 mod refresh;
 pub mod registry;
@@ -49,6 +51,7 @@ pub mod safe_mode;
 mod sanitize;
 pub mod scheduler;
 mod session;
+mod speech;
 #[doc(hidden)]
 pub mod testing;
 pub mod usage;
@@ -97,10 +100,15 @@ fn api(rt: Arc<Runtime>) -> Router {
     let auth = || middleware::from_fn_with_state(rt.clone(), access::require_client_key);
     let v1 = Router::new()
         .route("/v1/models", get(models::unified))
+        // Gin's `/models/*model` also matches the bare trailing slash, with an empty ID.
+        .route("/v1/models/", get(models::detail))
+        .route("/v1/models/{*model}", get(models::detail))
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/audio/speech", post(speech::speech))
+        .route("/v1/tts", post(speech::speech))
         .route("/v1/videos", post(videos::native_post))
         .route("/v1/videos/generations", post(videos::native_post))
         .route("/v1/videos/edits", post(videos::native_post))
@@ -246,12 +254,19 @@ async fn callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri)
     };
     let (code, state, error) = callback_query(uri.query().unwrap_or_default(), false);
     if !state.is_empty() {
-        let _ = rt.deliver_oauth_callback(&runtime::OAuthCallback {
+        let delivery = rt.deliver_oauth_callback(&runtime::OAuthCallback {
             provider,
             state,
             code,
             error,
         });
+        // Go v8.0.35 `ae3ee3be`: only the Codex route reports the refusal.
+        if provider == "codex" && delivery == runtime::OAuthDelivery::RequiresV8 {
+            return respond::gin_json(
+                409,
+                r#"{"error":"SIWC callbacks require /v8/management/oauth/callback"}"#.into(),
+            );
+        }
     }
     html()
 }
@@ -275,7 +290,7 @@ async fn devin_callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): Origin
         code,
         error,
     });
-    if !delivered {
+    if delivered != runtime::OAuthDelivery::Delivered {
         return no_store(respond::gin_json(
             400,
             r#"{"error":"invalid or expired OAuth callback"}"#.into(),

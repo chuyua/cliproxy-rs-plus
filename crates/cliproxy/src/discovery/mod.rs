@@ -1,6 +1,7 @@
 //! LAN discovery over mDNS / DNS-SD (Go `internal/discovery`, `internal/cmd/discover.go`
 //! and `sdk/cliproxy/discovery_advertiser.go`): the `discover` command and the server's
 //! opt-in `_ai-gateway._tcp` advertisement.
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -187,7 +188,7 @@ pub fn instance_id(dir: Option<&Path>) -> String {
         .map(|s| go_trim(&s).to_owned())
         .filter(|s| is_hex4(s))
     {
-        let id = id.to_uppercase();
+        let id = id.go_upper();
         cache.insert(key, id.clone());
         return id;
     }
@@ -250,7 +251,7 @@ pub fn sanitize_instance_name(name: &str) -> String {
 
 /// Go `FormatInstanceName`: `CPA-<ID>` or `<name>-<ID>` within the 63-byte label limit.
 pub fn format_instance_name(custom: &str, id: &str) -> String {
-    let id = if is_hex4(id) { id.to_uppercase() } else { "0001".into() };
+    let id = if is_hex4(id) { id.go_upper() } else { "0001".into() };
     let suffix = format!("-{id}");
     let default = format!("{DEFAULT_INSTANCE_PREFIX}{id}");
     let mut base = sanitize_instance_name(custom);

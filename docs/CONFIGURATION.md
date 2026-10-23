@@ -2,7 +2,7 @@
 
 cliproxy-rs reads one YAML file, `config.yaml`. Pass its path with `--config`; without it, the server reads `config.yaml` in the current directory. It accepts CLIProxyAPI's v8 layout (shown here) and the older flat layout, and every setting in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/6fecc6e5567912661654a4eaf9b8f5436facd1c2/config.example.yaml) is accepted. Settings for features that are not ported yet are kept in the file but have no effect.
 
-The server watches the file and applies most changes within a second, without a restart. `server.host`, `server.port`, `server.tls` and `server.trusted-proxies` are read at start, so restart after changing them. When the dashboard or the Management API changes a setting, only that key is rewritten; the rest of the file, comments included, stays as it was.
+The server watches the file and applies most changes within a second, without a restart. `server.host`, `server.port`, `server.tls` and `server.trusted-proxies` are read at start, so restart after changing them. When the dashboard or the Management API changes a setting, only that key is rewritten; the rest of the file, comments included, stays as it was. The first such save of a file in an older layout moves its settings to the current layout, with their comments, and writes Windows (CRLF) line endings as LF. Saves through the older `/v0/management` setting endpoints are the exception: as in CLIProxyAPI, they keep a file that has no current-layout sections in its older layout. When the file uses YAML that cannot be moved line by line, such as anchors, that save writes the file again from its values: the comments at the top are kept, and other comments may be lost.
 
 ## A complete small example
 
@@ -35,6 +35,8 @@ observability:
 | `host` | The address to listen on. `"127.0.0.1"` accepts only this computer; `""` listens on every interface. |
 | `port` | The port, `8317` by default. |
 | `tls.enable`, `tls.cert`, `tls.key` | Serve HTTPS on the same port with this certificate and key file. |
+| `max-request-body-bytes` | The largest request body accepted, in bytes; `0` (the default) or a negative value sets no limit. A larger body gets `413` before it is processed: on the client routes, the Management API and plugin routes. As in Go, a streamed body whose JSON value or multipart form ends before the limit is handled from the bytes before it. Changes apply to the next request. The client routes also stop at 64 MiB whatever this says. The older top-level `max-request-body-bytes` also works; the one under `server` wins. |
+| `github-token` | A GitHub token. CLIProxyAPI sends it to the GitHub API ahead of the `GITHUB_TOKEN` environment variable: on its release checks, its panel downloads and plugin store requests that no `plugins.store-auth` rule covers. cliproxy-rs keeps the setting but sends it nowhere yet: its release check sends no token, its dashboard is built in, and the plugin store use is upcoming. Management API config reads show it, as in CLIProxyAPI. The older top-level `github-token` also works; the one under `server` wins. |
 | `trusted-proxies` | Addresses of reverse proxies or tunnels whose `X-Forwarded-For` header is trusted. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`. See [running it safely](GETTING-STARTED.md#running-it-safely). |
 
 ## access
@@ -56,7 +58,20 @@ observability:
 | Setting | What it does |
 |---|---|
 | `auth-dir` | The folder for account sign-in files, `~/.cli-proxy-api` by default. `~` is expanded. The server watches it, so a file added, edited or removed there takes effect without a restart. |
+| `providers.codex.signin-with-chatgpt-identifier` | The agent name sent when binding Sign in with ChatGPT tokens to a Codex credential (`POST /v8/management/oauth/siwc/bind`), `CLIProxyAPI` when empty. Legacy spelling: `codex.signin-with-chatgpt-identifier`. Go also uses it as the SIWC request User-Agent prefix; cliproxy-rs does not send SIWC requests yet. |
 | `providers.codex.chatgpt-keep-alive` | A cliproxy-rs addition, `false` by default. `true` keeps up to 2 idle connections to `chatgpt.com` per proxy for 90 seconds, so Codex HTTP requests skip the TCP and TLS handshake. Off, every Codex request opens its own connection, as CLIProxyAPI does. A change applies from the next request, without a restart. Go starts with the key in the file and ignores it. A config edit through Go's v8 Management API moves the key into a comment, so the setting is off again when you return to cliproxy-rs; edits through Go's v0 endpoints keep it. Setting the key through Go's v8 API is refused, as for any key Go does not know. |
+
+## upstream
+
+Provider settings shared by account sign-ins and provider API keys. Settings left under `oauth.providers`, such as `oauth.providers.codex.header-defaults`, apply to sign-ins only.
+
+| Setting | What it does |
+|---|---|
+| `codex.disable-codex-cloaking`, `codex.stream-bootstrap-buffering`, `codex.stream-bootstrap-timeout`, `codex.orphan-delegation-compatibility`, `codex.model-level-cooling`, `codex.response-steering` | Codex request shaping, stream start-up, cooldown scope and full-duplex WebSocket steering. |
+| `claude.model-level-cooling`, `claude.disable-cloaking-model-list`, `claude.disable-claude-cloak-mode`, `claude.header-defaults.*` | Claude cooldown scope, cloaking and the fallback request headers (`user-agent`, `package-version`, `runtime-version`, `os`, `arch`, `timeout`, `timezone`, `stabilize-device-profile`). |
+| `xai.inject-x-search` | Adds the `x_search` tool to xAI requests. |
+
+Older files spell these as `oauth.providers.codex.*`, `oauth.providers.claude.*` (with `claude-code.disable-cloaking-model-list`) and `oauth.providers.xai.*`, or as the flat `codex`, `claude`, `claude-code`, `disable-claude-cloak-mode`, `claude-header-defaults` and `xai` keys. They load the same way; when a setting appears more than once, `upstream` wins, then `oauth.providers`, then the flat key. The next save through the dashboard or the v8 Management API writes it under `upstream`. The Management API reads and writes these at `/v8/management/config/upstream/...`. It also accepts the `oauth/providers/...` paths, as CLIProxyAPI does: a read there shows the current value, and a write or delete there changes it under `upstream`. The same goes for `client.codex.optimize-multi-agent-v2` at its older `oauth/providers/codex`, `providers/codex` and `codex` paths.
 
 ## api-keys
 
@@ -119,6 +134,7 @@ Uncomment the block to use it. `oauth-request-scoped-errors` is the legacy spell
 | Setting | What it does |
 |---|---|
 | `proxy-url` | An outbound proxy for every upstream request, such as `socks5://127.0.0.1:1080` or `http://proxy:3128`. A single account can use its own proxy instead; see [per-account proxies](MULTI-ACCOUNT.md#per-account-proxies-and-request-shaping). |
+| `tls-handshake-timeout-seconds` | Seconds a new connection to `api.anthropic.com` (Claude) or `chatgpt.com` (Codex) may take to be ready, so a server that accepts the connection but never answers the TLS handshake fails the attempt and request retry can engage. The default `0` waits indefinitely. It never limits a request once connected. In cliproxy-rs it also covers the DNS lookup, the TCP connect and a proxy's CONNECT, which Go leaves unbounded. |
 
 Claude accounts ignore `HTTPS_PROXY` and `HTTP_PROXY`. Without an explicit proxy, they connect directly. Set `requests.proxy-url` or the account's `proxy_url` when you need one. Claude API keys pointed at a custom, non-Anthropic base URL use the standard transport, which can inherit environment proxies.
 
@@ -130,6 +146,30 @@ Claude accounts ignore `HTTPS_PROXY` and `HTTP_PROXY`. Without an explicit proxy
 | `logs.logs-max-total-size-mb` | The most disk space the log files may use. |
 | `logs.request-log` | `true` writes one file per request with client and upstream request/response sections. Recognised sensitive headers and URL fields are masked, but bodies can contain credentials, including Realtime client secrets, as well as private prompts and output. Keep the logs private. |
 | `usage.claude-cache-telemetry` | A cliproxy-rs addition, `false` by default. With `usage.usage-statistics-enabled: true` and management enabled, adds content-free final-wire Claude cache observations to the existing usage queue and RESP channel. No tokenizer or maintenance requests run. Hashes rotate on restart; additional records without returned usage have `usage_observed: false`. Large payloads add parsing and hashing work before upstream send. See [Claude cache telemetry](CLAUDE-CACHE-TELEMETRY.md). Go ignores the setting at startup, preserves it on v0 saves, and archives it on v8 edits. |
+| `pprof.enable` | `false` by default. `true` starts a separate plain-HTTP debug listener, without API keys, management authentication or TLS. Keep it on loopback: its command-line route can expose arguments, and profiling consumes CPU. Changes apply without a restart. |
+| `pprof.addr` | The debug listener address, `"127.0.0.1:8316"` by default, also used for an empty or whitespace-only value. Changes move the listener without a restart. A bind failure is logged without stopping the main server; another config publication retries it. |
+
+The legacy top-level `pprof` mapping works too. `/debug/pprof/` lists the routes;
+`cmdline` returns NUL-separated arguments and `symbol` accepts program counters in
+the raw query or a POST body, separated by `+`. Go runtime profiles return plain-text
+`501` answers. CPU `profile?seconds=30` requires a Unix build with
+`cargo build --release -p cliproxy --features cpa-server/pprof` and returns a pprof
+protobuf. Default builds, published release binaries and Docker images exclude the
+profiler and symbol resolver. Their `symbol` route consumes POST bodies but returns
+only `num_symbols: 1`, without resolving any names, including shared-library names.
+With the feature, an unstripped build gives more symbol names. Do not use another
+SIGPROF profiler in the same process. Listener changes allow five seconds for active
+requests to finish. On timeout, the error is logged, active requests continue, and
+no replacement starts until another config publication. Temporary accept errors
+keep the listener open and back off from 5 ms to one second; config changes and
+shutdown interrupt the wait. Addresses require numeric ports; unlike Go, `:` and
+service-name ports such as `:http` are not accepted.
+
+## models
+
+| Setting | What it does |
+|---|---|
+| `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cliproxy-rs checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
 
 ## worker-threads
 
@@ -145,4 +185,4 @@ This setting exists only in cliproxy-rs. CLIProxyAPI starts with it in the file 
 - `TOKIO_WORKER_THREADS`: the number of request threads, instead of `worker-threads`.
 - `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`.
 - A `.env` file in the working directory is loaded at start, as in CLIProxyAPI.
-- `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI.
+- `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.

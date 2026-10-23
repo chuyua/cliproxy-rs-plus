@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use bytes::{Bytes, BytesMut};
+use cpa_common::gostr::GoStr;
 use cpa_core::config::Config;
 use cpa_core::exec::{Caller, ExecError, ExecRequest, ExecStream, Operation, ResponseBody};
 use cpa_core::format::Format;
@@ -50,8 +51,8 @@ pub struct Call {
     /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
     /// ordinary HTTP requests.
     pub turn: Option<Arc<SessionTurn>>,
-    /// A media route (Go's `openai-image` / `openai-video` handler types), `None` for
-    /// inference routes.
+    /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
+    /// types), `None` for inference routes.
     pub media: Option<Arc<Media>>,
 }
 
@@ -89,15 +90,23 @@ pub enum MediaKind {
     Images,
     /// [`cpa_exec::Executors::videos`].
     Videos,
+    /// [`cpa_exec::Executors::speech`]; speech-only models are allowed, and no
+    /// non-stream keep-alive runs: its newlines would prefix the audio.
+    Speech,
 }
 
 impl Call {
-    /// `WithPinnedAuthID` of a session turn or media call.
-    pub(crate) fn pinned(&self) -> Option<&str> {
+    /// `WithPinnedAuthID` of a session turn, media call or host model callback.
+    pub(crate) fn pinned(&self) -> Option<String> {
         self.turn
             .as_ref()
-            .and_then(|t| t.pinned.as_deref())
-            .or_else(|| self.media.as_ref().and_then(|m| m.pinned.as_deref()))
+            .and_then(|t| t.pinned.clone())
+            .or_else(|| self.media.as_ref().and_then(|m| m.pinned.clone()))
+            .or_else(|| {
+                crate::plugins::model_callbacks::context()
+                    .map(|c| c.auth_id)
+                    .filter(|id| !id.is_empty())
+            })
     }
 
     /// `WithSelectedAuthIDCallback` of a session turn or media call.
@@ -180,6 +189,8 @@ pub enum Failure {
     UnknownModel(String),
     /// An image-only model on a non-image route.
     ImageOnly(String),
+    /// A speech-only model on a non-speech route (Go `validateSpeechOnlyModel`).
+    SpeechOnly(String),
     /// `auth_not_found` / `auth_unavailable`, enriched like Go.
     Unavailable {
         code: &'static str,
@@ -201,7 +212,7 @@ impl Failure {
     pub fn status(&self) -> u16 {
         match self {
             Failure::Exec(e) | Failure::Remote { error: e, .. } => classify::response_status(e),
-            Failure::UnknownModel(_) => 400,
+            Failure::UnknownModel(_) | Failure::SpeechOnly(_) => 400,
             Failure::ImageOnly(_) | Failure::Unavailable { .. } => 503,
             Failure::Cooldown { .. } => 429,
         }
@@ -217,41 +228,21 @@ impl Failure {
                     r#"{{"error":{{"message":{message},"type":"invalid_request_error","code":"model_not_found","param":"model"}}}}"#
                 )
             }
-            Failure::ImageOnly(model) => {
-                let base = model.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(model);
-                format!(
-                    "model {} is only supported on /v1/images/generations and /v1/images/edits",
-                    base.trim()
-                )
-            }
+            Failure::ImageOnly(model) => format!(
+                "model {} is only supported on /v1/images/generations and /v1/images/edits",
+                route_base_name(model)
+            ),
+            Failure::SpeechOnly(model) => format!(
+                "model {} is only supported on /v1/audio/speech and /v1/tts",
+                route_base_name(model)
+            ),
             Failure::Unavailable {
                 code,
                 providers,
                 model,
                 cause,
                 ..
-            } => {
-                let providers = if providers.is_empty() {
-                    "unknown".into()
-                } else {
-                    providers.join(",")
-                };
-                let model = if gojson::trim(model).is_empty() {
-                    "unknown"
-                } else {
-                    gojson::trim(model)
-                };
-                let mut detail = match cause.as_deref().map(upstream_summary).filter(|s| !s.is_empty()) {
-                    Some(summary) => format!(
-                        "no auth available (providers={providers}, model={model}; last upstream error: {summary})"
-                    ),
-                    None => format!("no auth available (providers={providers}, model={model})"),
-                };
-                if format!(",{providers},").contains(",claude,") {
-                    detail.push_str("; check Claude auth/key session and cooldown state via /v0/management/auth-files");
-                }
-                format!("{code}: {detail}")
-            }
+            } => unavailable_text(code, "no auth available", providers, model, cause.as_deref()),
             Failure::Cooldown {
                 model,
                 provider,
@@ -309,6 +300,32 @@ impl Failure {
     }
 }
 
+/// Go `enrichAuthSelectionError`: a selection error's `code: message` text with the
+/// providers, the model and the last upstream error.
+fn unavailable_text(code: &str, base: &str, providers: &[String], model: &str, cause: Option<&str>) -> String {
+    let providers = if providers.is_empty() {
+        "unknown".into()
+    } else {
+        providers.join(",")
+    };
+    let model = if gojson::trim(model).is_empty() {
+        "unknown"
+    } else {
+        gojson::trim(model)
+    };
+    let mut detail = match cause
+        .map(upstream_summary)
+        .filter(|s| !s.is_empty() && !base.contains(s.as_str()))
+    {
+        Some(summary) => format!("{base} (providers={providers}, model={model}; last upstream error: {summary})"),
+        None => format!("{base} (providers={providers}, model={model})"),
+    };
+    if format!(",{providers},").contains(",claude,") {
+        detail.push_str("; check Claude auth/key session and cooldown state via /v0/management/auth-files");
+    }
+    format!("{code}: {detail}")
+}
+
 fn ceil_seconds(d: Duration) -> u64 {
     d.as_secs() + u64::from(d.subsec_nanos() > 0)
 }
@@ -345,11 +362,7 @@ pub fn upstream_summary(raw: &str) -> String {
             message = s(v.get("message"));
         }
         let summary = match (code.is_empty(), message.is_empty()) {
-            (false, false)
-                if code.eq_ignore_ascii_case(&message) || message.to_lowercase().contains(&code.to_lowercase()) =>
-            {
-                message
-            }
+            (false, false) if code.go_eq_fold(&message) || message.go_lower().contains(&code.go_lower()) => message,
             (false, false) => format!("{code}: {message}"),
             (true, false) => message,
             (false, true) => code,
@@ -361,6 +374,35 @@ pub fn upstream_summary(raw: &str) -> String {
     }
     crate::sanitize::summary(raw)
 }
+
+/// Go `routeModelBaseName`: the part after the last `/`, unless that is empty.
+fn route_base_name(model: &str) -> &str {
+    let model = model.trim();
+    model
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(model)
+        .trim()
+}
+
+/// Go `validateImageOnlyModel` and `validateSpeechOnlyModel` on a suffix-free model:
+/// image-only models serve only the image routes, speech-only models only the speech
+/// routes.
+fn check_route_only(base: &str, call: &Call) -> Result<(), RunError> {
+    let name = route_base_name(base).go_lower();
+    let kind = call.media.as_ref().map(|m| m.kind);
+    if IMAGE_ONLY.contains(&name.as_str()) && kind != Some(MediaKind::Images) {
+        return Err(Failure::ImageOnly(base.to_owned()).into());
+    }
+    if SPEECH_ONLY.contains(&name.as_str()) && kind != Some(MediaKind::Speech) {
+        return Err(Failure::SpeechOnly(base.to_owned()).into());
+    }
+    Ok(())
+}
+
+/// Go `isXAISpeechOnlyModel`.
+const SPEECH_ONLY: [&str; 2] = ["grok-tts", "grok-voice-tts-1.0"];
 
 const IMAGE_ONLY: [&str; 8] = [
     "gpt-image-1.5",
@@ -381,24 +423,15 @@ fn route(
     routed: Option<&(String, Option<String>)>,
 ) -> Result<(Vec<String>, String), RunError> {
     if let Some(provider) = &call.forced_provider {
-        return Ok((vec![provider.clone()], gojson::trim(&call.model).to_owned()));
+        let model = gojson::trim(&call.model);
+        check_route_only(gojson::trim(canonical_model_raw(model)), call)?;
+        return Ok((vec![provider.clone()], model.to_owned()));
     }
     // Go `providersForExecution` with a router's provider: that provider, the router's
     // model or else the client's, and only the image-only check.
     if let Some((provider, model)) = routed {
         let model = model.clone().unwrap_or_else(|| call.model.clone());
-        let base = gojson::trim(canonical_model_raw(&model));
-        let image = base
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(base)
-            .trim()
-            .to_lowercase();
-        let images_route = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Images);
-        if IMAGE_ONLY.contains(&image.as_str()) && !images_route {
-            return Err(Failure::ImageOnly(base.to_owned()).into());
-        }
+        check_route_only(gojson::trim(canonical_model_raw(&model)), call)?;
         let mut providers = vec![provider.clone()];
         adjust_for_entry(call.entry, &mut providers);
         return Ok((providers, model));
@@ -419,17 +452,7 @@ fn route(
         model.to_owned()
     };
     let base = gojson::trim(canonical_model_raw(&resolved)).to_owned();
-    let image = base
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&base)
-        .trim()
-        .to_lowercase();
-    let images_route = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Images);
-    if IMAGE_ONLY.contains(&image.as_str()) && !images_route {
-        return Err(Failure::ImageOnly(base).into());
-    }
+    check_route_only(&base, call)?;
     if remote {
         return Ok((vec!["home".to_owned()], resolved));
     }
@@ -481,6 +504,7 @@ where
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
 {
     let sse = call.media.as_ref().is_some_and(|m| m.sse);
+    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
     let interval = if sse {
         crate::respond::keepalive(&rt.config())
     } else {
@@ -492,7 +516,23 @@ where
         let (rt, trace) = (rt.clone(), trace.clone());
         async move {
             let result = run_with_bootstrap_retries(&rt, call, &trace).await;
-            let upstream = upstream_headers(&rt.config(), &result);
+            let cfg = rt.config();
+            let upstream = upstream_headers(&cfg, &result);
+            let result = match result {
+                // Go's speech handler reads the downstream headers the execution hands
+                // back (`downstreamHeadersAfterInterceptors`): the final filtered headers
+                // under passthrough, else what interceptors changed.
+                Ok(Done::Buffered { headers, body }) if speech => {
+                    let headers = if respond::passthrough_headers(&cfg) {
+                        respond::filter_upstream_headers(&headers)
+                    } else {
+                        // A snapshot: the rendered response still gets them below.
+                        respond::filter_upstream_headers(&trace.intercepted_headers_snapshot())
+                    };
+                    Ok(Done::Buffered { headers, body })
+                }
+                result => result,
+            };
             (result, upstream)
         }
     }));
@@ -591,6 +631,8 @@ enum Upstream {
     Error(HeaderMap),
 }
 
+/// An error contributes only its [`ExecError::addon`] (Go `executionErrorMessage` reads
+/// `Headers()`); speech errors, like most, carry none.
 fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upstream> {
     if !respond::passthrough_headers(cfg) {
         return None;
@@ -599,7 +641,7 @@ fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upst
         Ok(Done::Buffered { headers, .. } | Done::Stream { headers, .. }) => {
             Some(Upstream::Success(respond::filter_upstream_headers(headers)))
         }
-        Err(Failure::Exec(error)) if !error.direct => Some(Upstream::Error((*error.headers).clone())),
+        Err(Failure::Exec(error)) if !error.direct => error.addon.as_deref().cloned().map(Upstream::Error),
         Err(_) => None,
     }
 }
@@ -607,9 +649,10 @@ fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upst
 /// `requests.nonstream-keepalive-interval` seconds (Go `NonStreamingKeepAliveInterval`;
 /// 0 or below disables it), for the calls whose Go handler starts the keep-alive: only
 /// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
-/// gemini_handlers.go) never call `StartNonStreamingKeepAlive`.
+/// gemini_handlers.go) and the speech handler never call `StartNonStreamingKeepAlive`.
 fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    if call.stream || call.operation != Operation::Generate {
+    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
+    if call.stream || call.operation != Operation::Generate || speech {
         return None;
     }
     let seconds = cfg
@@ -639,7 +682,7 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
     // executor takes the request whole; a provider decision replaces the registry route.
     use crate::plugins::execution::{self as plugin_execution, Route};
     let query = plugin_execution::query();
-    let forced = call.forced_provider.as_deref().map(|p| p.trim().to_lowercase());
+    let forced = call.forced_provider.as_deref().map(|p| p.trim().go_lower());
     let routed = match (plugin_execution::route(rt, &call, &query, trace).await, forced) {
         (None, _) => None,
         // Go `validateNativeInteractionsExecution` / `providersForExecution`: a forced
@@ -665,7 +708,7 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         trace.prompt_prefix(call.entry, &call.body);
     }
     let mut call = call;
-    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1, true).await?;
+    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1).await?;
     let result = retry_bootstrap(rt, call, trace, &resolved, hooks.as_ref()).await;
     match hooks {
         Some(hooks) => hooks.finish(result, trace).await,
@@ -802,6 +845,10 @@ impl Trace {
         *self.3.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = headers;
     }
 
+    fn intercepted_headers_snapshot(&self) -> HeaderMap {
+        self.3.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     fn intercepted_headers(&self) -> HeaderMap {
         std::mem::take(&mut *self.3.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
@@ -894,14 +941,16 @@ impl From<Failure> for RunError {
 #[derive(Clone)]
 struct Fault {
     error: ExecError,
-    bootstrap: bool,
+    /// The stream's headers, when it failed before its first payload (Go
+    /// `streamBootstrapError`).
+    bootstrap: Option<Box<HeaderMap>>,
 }
 
 impl Fault {
     fn into_run_error(self) -> RunError {
         RunError {
             failure: Failure::Exec(self.error),
-            bootstrap: self.bootstrap,
+            bootstrap: self.bootstrap.is_some(),
         }
     }
 }
@@ -984,6 +1033,15 @@ async fn run_routed(
         exclude: pinned_exclusion.clone(),
         ..Selection::default()
     };
+    if rt.plugins().has_scheduler() {
+        let route_model = selection.model.clone();
+        selection.scheduler = Some(Arc::new(crate::plugins::execution::scheduler_context(
+            &call,
+            &route_model,
+            policy.session_affinity,
+            session.derived.as_deref(),
+        )));
+    }
     let request = ExecRequest {
         operation: call.operation,
         source_format: call.entry,
@@ -993,6 +1051,7 @@ async fn run_routed(
         original_body: call.body.clone(),
         body: call.body.clone(),
         stream: call.stream,
+        stream_payloads: hooks.is_some() || crate::plugins::model_callbacks::context().is_some(),
         alt: call.alt.clone(),
         session: session.id,
         execution_session: call.execution_session.clone(),
@@ -1040,10 +1099,7 @@ async fn run_routed(
                 Err(AcquireError::Prepare { id, error }) => {
                     attempted.push(id.clone());
                     selection.exclude.push(id);
-                    last = Some(Fault {
-                        error,
-                        bootstrap: false,
-                    });
+                    last = Some(Fault { error, bootstrap: None });
                     continue;
                 }
                 Err(AcquireError::Cooldown { wait, cause }) => {
@@ -1059,6 +1115,10 @@ async fn run_routed(
                         cause,
                     });
                 }
+                Err(AcquireError::Rejected { code, message }) => {
+                    break Some(scheduler_rejection(code, message, &providers, &model));
+                }
+                Err(AcquireError::Scheduler(error)) => break Some(Failure::Exec(error)),
                 Err(AcquireError::Unavailable { retry_after, cause }) => {
                     break Some(Failure::Unavailable {
                         code: if retry_after.is_some() {
@@ -1081,9 +1141,9 @@ async fn run_routed(
                 // Go `nextModelPoolOffset`: rotate the alias pool once per selection.
                 let key = format!(
                     "{}|{}|{}",
-                    lease.credential.id.trim().to_lowercase(),
+                    lease.credential.id.trim().go_lower(),
                     registry::provider_key(&lease.credential),
-                    canonical_model(registry::strip_prefix(&selection.model, &lease.credential)).to_lowercase()
+                    canonical_model(registry::strip_prefix(&selection.model, &lease.credential)).go_lower()
                 );
                 let offset = rt.next_pool_offset(&key, models.len());
                 models.rotate_left(offset);
@@ -1148,11 +1208,12 @@ async fn run_routed(
             _ => (0, false),
         };
         let terminal = |round_error: RunError| upstream.clone().map(Fault::into_run_error).unwrap_or(round_error);
+        let pinned = call.pinned();
         let credits = Credits {
             providers: &providers,
             model: &model,
             aliases: &aliases,
-            pinned: call.pinned(),
+            pinned: pinned.as_deref(),
             compact,
         };
         if !retry_round {
@@ -1170,7 +1231,7 @@ async fn run_routed(
                 .await;
         }
         let wait = {
-            let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors);
+            let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors, rt.plugin_runtime());
             rt.store().retry_wait(&selection, &policy, status, &attempted, &admit)
         };
         let Some(wait) = wait else {
@@ -1255,7 +1316,7 @@ impl RemoteFault {
             upstream: classify::upstream_attempted(&fault.error),
             invalid: classify::is_request_invalid(&fault.error),
             failure: Failure::Exec(fault.error),
-            bootstrap: fault.bootstrap,
+            bootstrap: fault.bootstrap.is_some(),
             stop,
             kind: crate::remote::RemoteErrorKind::Plain,
             exhausted: None,
@@ -1566,7 +1627,7 @@ async fn remote_round(
                         count <= 1 && round <= 0,
                         &selection.model,
                         &selection.exclude,
-                        cx.call.pinned(),
+                        cx.call.pinned().as_deref(),
                         &releases,
                     )
                 });
@@ -1609,7 +1670,7 @@ async fn remote_round(
                     }
                     // Go `shouldReturnLastErrorOnPickFailure` in Home mode.
                     if matches!(
-                        code.to_lowercase().as_str(),
+                        code.go_lower().as_str(),
                         "auth_not_found" | "auth_unavailable" | "request_retry_exceeded"
                     ) {
                         return Err(
@@ -1685,14 +1746,22 @@ async fn remote_round(
                 request.caller.principal = user_key.clone();
                 let usage = cx.usage.map(|facts| {
                     let mut facts = (**facts).clone();
-                    facts.client.api_key = user_key;
+                    facts.client.api_key = user_key.clone();
                     Arc::new(facts)
                 });
-                (request, usage)
+                // A count_tokens Home 401 record too: Go's handler context drops the
+                // middleware's usage key (`GetContextWithCancel` over a background
+                // context), so `usage.APIKeyFromContext` reads the gin key Home set.
+                let unauthorized = cx.unauthorized.map(|facts| {
+                    let mut facts = (**facts).clone();
+                    facts.client.api_key = user_key.clone();
+                    Arc::new(facts)
+                });
+                (request, usage, unauthorized)
             });
-            let (request, usage) = match &home_caller {
-                Some((request, usage)) => (request, usage.as_ref()),
-                None => (cx.request, cx.usage),
+            let (request, usage, unauthorized) = match &home_caller {
+                Some((request, usage, unauthorized)) => (request, usage.as_ref(), unauthorized.as_ref()),
+                None => (cx.request, cx.usage, cx.unauthorized),
             };
             // Go `executeHomeOnce`: Home's upstream model when it chose one, and only the
             // first model either way.
@@ -1738,7 +1807,7 @@ async fn remote_round(
                 alias: &alias,
                 compact: cx.compact,
                 keep_model: cx.call.selection_model.is_some(),
-                unauthorized: cx.unauthorized,
+                unauthorized,
             };
             let cancelled = lease
                 .remote_cancelled()
@@ -1756,13 +1825,7 @@ async fn remote_round(
                     ),
                     Err(error) => {
                         lease.complete(Outcome::Failure(error.clone()));
-                        (
-                            Attempt::Next(Fault {
-                                error,
-                                bootstrap: false,
-                            }),
-                            true,
-                        )
+                        (Attempt::Next(Fault { error, bootstrap: None }), true)
                     }
                 }
             };
@@ -1772,7 +1835,7 @@ async fn remote_round(
                 _ = cancelled => (
                     Attempt::Next(Fault {
                         error: crate::remote::cancelled_error(),
-                        bootstrap: false,
+                        bootstrap: None,
                     }),
                     false,
                 ),
@@ -1823,7 +1886,7 @@ fn lifecycle(e: &ExecError) -> bool {
     if classify::go_status(e) != 0 {
         return false;
     }
-    let lower = classify::error_text(e).trim().to_lowercase();
+    let lower = classify::error_text(e).trim().go_lower();
     matches!(
         lower.as_str(),
         "context canceled" | "context deadline exceeded" | "eof" | "unexpected eof"
@@ -1835,6 +1898,27 @@ fn lifecycle(e: &ExecError) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// A plugin scheduler's reject, Go `&Error{Code, Message}`: an `auth_not_found` or
+/// `auth_unavailable` code is enriched like any selection failure
+/// (`enrichAuthSelectionError`, 503); another code keeps its `code: message` text and,
+/// without a status, answers 500.
+pub(crate) fn scheduler_rejection(code: String, message: String, providers: &[String], model: &str) -> Failure {
+    match code.as_str() {
+        // Request scope: the reject carries no status before enrichment, so it starts no
+        // retry round.
+        "auth_not_found" | "auth_unavailable" => Failure::Exec(ExecError::local(
+            503,
+            cpa_core::exec::FailureScope::Request,
+            unavailable_text(&code, &message, providers, model, None),
+        )),
+        _ => Failure::Exec(ExecError::local(
+            0,
+            cpa_core::exec::FailureScope::Model,
+            format!("{code}: {message}"),
+        )),
+    }
 }
 
 /// Go's `&Error{Code: "auth_not_found", Message: "no auth available"}`.
@@ -1938,7 +2022,7 @@ impl Credits<'_> {
         // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
         if request.operation == Operation::CountTokens
             || !self.wanted(cfg, &error)
-            || !self.model.to_lowercase().contains("claude")
+            || !self.model.go_lower().contains("claude")
         {
             return Err(error);
         }
@@ -2081,10 +2165,7 @@ async fn attempt(
                 .await
         {
             lease.complete(Outcome::Neutral(error.clone()));
-            return Attempt::Stop(Fault {
-                error,
-                bootstrap: false,
-            });
+            return Attempt::Stop(Fault { error, bootstrap: None });
         }
         let start = |credential: &cpa_core::credential::Credential, req: &mut ExecRequest| {
             usage.map(|facts| {
@@ -2096,10 +2177,32 @@ async fn attempt(
                 tracker
             })
         };
+        // Go `Options.WebSocketResponseObserver`, bound to the credential the executor gets.
+        let observe = |credential: &cpa_core::credential::Credential, req: &mut ExecRequest| {
+            if let Some(hooks) = hooks {
+                let observer = hooks.websocket_observer(req, credential, &route_model);
+                req.usage = std::mem::take(&mut req.usage).with_websocket(observer);
+            }
+        };
         let mut tracker = start(&lease.credential, &mut req);
+        observe(&lease.credential, &mut req);
         let session = session.as_ref();
+        let private = lease.home_private().map(|p| p.attributes.clone()).unwrap_or_default();
+        let private = &private;
         let execute = |credential: Arc<cpa_core::credential::Credential>, req: ExecRequest| async move {
+            let credential = match crate::plugins::model_callbacks::context().filter(|c| !c.proxy_url.is_empty()) {
+                Some(context) => {
+                    let mut credential = (*credential).clone();
+                    credential.attributes.insert("proxy_url".into(), context.proxy_url);
+                    Arc::new(credential)
+                }
+                None => credential,
+            };
             let credential = rt.for_executor(&credential);
+            if let Some(adapter) = rt.plugin_runtime().executor(&credential, cfg) {
+                return crate::plugins::execution::execute_credential(rt, call, &adapter, &credential, private, req)
+                    .await;
+            }
             match (session, call.media.as_ref().map(|m| m.kind)) {
                 (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
                 // An after-auth interceptor may rewrite the path (Go's request_path metadata).
@@ -2111,10 +2214,14 @@ async fn attempt(
                     let path = req.request_path.clone();
                     rt.executors.videos(&credential, req, &path, cfg).await
                 }
+                (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
                 (None, None) => rt.executors.execute(&credential, req, cfg).await,
             }
         };
         tracing::trace!(target: "cpa_latency", stage = "selected");
+        // Each pooled model is its own upstream dispatch, stamped right before it runs:
+        // after preparation and the after-auth interceptor (Go `nextExecutionSeq`).
+        lease.redispatch();
         let mut executed = execute(lease.credential.clone(), req.clone()).await;
         // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential. Home
         // credentials never refresh here (Go home_unauthorized_refresh): the 401 goes to
@@ -2130,7 +2237,9 @@ async fn attempt(
                 t.fail(error);
             }
             lease.credential = current;
+            lease.redispatch();
             tracker = start(&lease.credential, &mut req);
+            observe(&lease.credential, &mut req);
             executed = execute(lease.credential.clone(), req).await;
         }
         if let (Ok(response), Some(t)) = (&executed, tracker.as_mut()) {
@@ -2177,10 +2286,7 @@ async fn attempt(
                 if let Some(t) = tracker.take() {
                     t.fail(&error);
                 }
-                Fault {
-                    error,
-                    bootstrap: false,
-                }
+                Fault { error, bootstrap: None }
             }
         };
         let error = &fault.error;
@@ -2212,7 +2318,17 @@ async fn attempt(
             (target.compact && classify::is_compact_fault(error)) || classify::is_request_invalid(error)
         };
         // A credential-wide quota ends this credential's model pool.
-        if stop || i + 1 == target.models.len() || classify::credential_scoped(error) {
+        let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
+        // Go returns a stopping bootstrap failure as is: an error, not a stream, so the
+        // handler's bootstrap retries never see it. Any other one goes on as a
+        // `streamBootstrapError`, whose `Headers()` are the stream's.
+        let mut fault = fault;
+        if stop {
+            fault.bootstrap = None;
+        } else if let Some(headers) = &fault.bootstrap {
+            fault.error.addon = Some(headers.clone());
+        }
+        if last_here {
             // Go `End`: the socket that retained the pick closes before the release.
             drop(guard.take());
             lease.complete(outcome);
@@ -2241,10 +2357,11 @@ fn keep_home(
         return Some(lease);
     };
     let pick = guard.defuse()?;
-    let (credential, route) = (lease.credential.id.clone(), lease.selection.model.clone());
+    let (credential, route) = (lease.credential.clone(), lease.selection.model.clone());
+    let availability = lease.home_private().map(|p| p.availability.clone()).unwrap_or_default();
     match pick.keep(lease) {
         None => {
-            home.keep(pick, &credential, &route, user_key.to_owned());
+            home.keep(pick, &credential, availability, &route, user_key.to_owned());
             None
         }
         Some(lease) => {
@@ -2262,6 +2379,13 @@ fn usage_client(
     trace: &Trace,
     session: &crate::session::Session,
 ) -> crate::usage_record::Client {
+    // A nested `host.model.*` call has no caller of its own; its records carry the
+    // parent request's identity (Go restores the parent callback context).
+    let nested = (call.caller.principal.is_empty() && call.caller.provider.is_empty())
+        .then(crate::plugins::model_callbacks::nested_usage_identity)
+        .flatten();
+    let (api_key, access_provider) =
+        nested.unwrap_or_else(|| (call.caller.principal.clone(), call.caller.provider.clone()));
     crate::usage_record::Client {
         session_id: session.id.clone().unwrap_or_default(),
         parent_session_id: session.parent.clone().unwrap_or_default(),
@@ -2276,7 +2400,8 @@ fn usage_client(
             if call.turn.is_some() { "GET" } else { "POST" },
             call.request_path
         ),
-        api_key: call.caller.principal.clone(),
+        api_key,
+        access_provider,
         ..request_client(cfg, &call.headers, call.peer)
     }
 }
@@ -2410,20 +2535,23 @@ fn attempt_request(
 
 /// Bootstraps a stream (first event before committing) or buffers a body.
 async fn finish(call: &Call, response: cpa_core::exec::ExecResponse) -> Result<Done, Fault> {
-    let fault = |error| Fault { error, bootstrap: true };
     match response.body {
         ResponseBody::Buffered(body) => Ok(Done::Buffered {
             headers: response.headers,
             body,
         }),
         ResponseBody::Stream(mut stream) if call.stream => {
+            let bootstrap = |error| Fault {
+                error,
+                bootstrap: Some(Box::new(response.headers.clone())),
+            };
             let first = loop {
                 match stream.next().await {
                     Some(Ok(bytes)) if bytes.is_empty() => continue,
                     Some(Ok(bytes)) => break bytes,
-                    Some(Err(error)) => return Err(fault(error)),
+                    Some(Err(error)) => return Err(bootstrap(error)),
                     // Go conductor_stream.go: an empty stream is a failed attempt.
-                    None => return Err(fault(classify::empty_stream())),
+                    None => return Err(bootstrap(classify::empty_stream())),
                 }
             };
             Ok(Done::Stream {
@@ -2435,10 +2563,7 @@ async fn finish(call: &Call, response: cpa_core::exec::ExecResponse) -> Result<D
         ResponseBody::Stream(mut stream) => {
             let mut body = BytesMut::new();
             while let Some(event) = stream.next().await {
-                body.extend_from_slice(&event.map_err(|error| Fault {
-                    error,
-                    bootstrap: false,
-                })?);
+                body.extend_from_slice(&event.map_err(|error| Fault { error, bootstrap: None })?);
             }
             Ok(Done::Buffered {
                 headers: response.headers,
@@ -2671,6 +2796,7 @@ mod tests {
             caller: Caller {
                 principal: String::new(),
                 source: "",
+                provider: String::new(),
             },
             forced_provider: None,
             selection_model: None,
@@ -2721,6 +2847,7 @@ mod tests {
             operation: Operation::Generate,
             source_format: Format::OpenAI,
             response_format: Format::OpenAI,
+            stream_payloads: false,
             requested_model: "sol".into(),
             model: "sol".into(),
             original_body: Bytes::new(),
@@ -2735,6 +2862,7 @@ mod tests {
             caller: Caller {
                 principal: String::new(),
                 source: "",
+                provider: String::new(),
             },
             resolved_model: None,
             usage: Default::default(),

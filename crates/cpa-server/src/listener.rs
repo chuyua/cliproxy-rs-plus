@@ -5,13 +5,64 @@
 //! On shutdown Go closes the server at once (`Server.Stop` calls `http.Server.Close`,
 //! documented "without graceful draining"), so the caller simply drops the future.
 
-use std::net::SocketAddr;
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use btls::ssl::{AlpnError, Ssl, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
 use cpa_core::config::Config;
+use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Binds like Go's `net.Listen("tcp", host:port)`. An empty host is one dual-stack socket
+/// on `[::]` with `IPV6_V6ONLY` cleared, falling back to `0.0.0.0` only when the host has
+/// no usable IPv6. Other errors, such as the port being in use, are returned.
+pub fn bind(host: &str, port: u16) -> io::Result<std::net::TcpListener> {
+    if !host.is_empty() {
+        let listener = std::net::TcpListener::bind((host, port))?;
+        listener.set_nonblocking(true)?;
+        return Ok(listener);
+    }
+    match listen(Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), true) {
+        Err(e) if no_ipv6(&e) => listen(Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)), false),
+        other => other,
+    }
+}
+
+/// The host has no usable IPv6: the address family is unsupported or `::` cannot be
+/// assigned. Windows reports Winsock codes, not the C runtime's errno values.
+fn no_ipv6(e: &io::Error) -> bool {
+    #[cfg(not(windows))]
+    const EAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
+    #[cfg(windows)]
+    const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
+    e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(EAFNOSUPPORT)
+}
+
+fn listen(domain: Domain, addr: SocketAddr, dual_stack: bool) -> io::Result<std::net::TcpListener> {
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    if dual_stack {
+        socket.set_only_v6(false)?;
+    }
+    // Go sets SO_REUSEADDR except on Windows, where it would let another socket bind a
+    // port already in use (net/sockopt_windows.go).
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn only_missing_ipv6_falls_back_to_ipv4() {
+    assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EAFNOSUPPORT)));
+    assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)));
+    assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EADDRINUSE)));
+    assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EACCES)));
+}
 
 /// ALPN offer in wire form, in Go's order (`NextProtos: {"h2", "http/1.1"}`); the
 /// server's preference wins, as in Go's `negotiateALPN`.

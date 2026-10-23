@@ -5,6 +5,7 @@
 //! its storage (`pluginTokenStorage`) as raw JSON merged with metadata on save. The
 //! server maps it onto its credential store.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -92,7 +93,7 @@ pub fn auth_id_for_path(path: &str, auth_dir: &str) -> String {
         .into_owned();
     // Go `filepath.ToSlash` only rewrites the OS separator.
     if cfg!(windows) {
-        id.replace('\\', "/").to_lowercase()
+        id.replace('\\', "/").go_lower()
     } else {
         id
     }
@@ -291,7 +292,7 @@ impl PluginAuth {
 /// Go `IsAuthTokenPayloadKey`.
 fn is_auth_token_payload_key(key: &str) -> bool {
     matches!(
-        key.trim().to_lowercase().as_str(),
+        key.trim().go_lower().as_str(),
         "access_token"
             | "refresh_token"
             | "id_token"
@@ -505,31 +506,35 @@ fn plugin_oauth_aliases(cfg: &cpa_core::config::Config) -> BTreeMap<String, Vec<
     out
 }
 
+/// Go `hostConfigSummary` for `cfg`.
+pub(crate) fn host_config_summary_of(cfg: &cpa_core::config::Config) -> HostConfigSummary {
+    let proxy_url = cfg
+        .document
+        .get("requests")
+        .and_then(|r| r.get("proxy-url"))
+        .map(crate::config::yaml_string)
+        .unwrap_or_default();
+    HostConfigSummary {
+        auth_dir: cfg.auth_dir.to_string_lossy().trim().to_owned(),
+        proxy_url: proxy_url.trim().to_owned(),
+        force_model_prefix: cfg.routing.force_model_prefix,
+        oauth_model_alias: plugin_oauth_aliases(cfg),
+        excluded_models: cpa_core::config::credentials::oauth_excluded(cfg)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let k = normalize_provider(&k);
+                (!k.is_empty()).then_some((k, v))
+            })
+            .collect(),
+    }
+}
+
 impl Host {
     /// Go `hostConfigSummary`.
     pub fn host_config_summary(&self) -> HostConfigSummary {
-        let Some(cfg) = self.config() else {
-            return HostConfigSummary::default();
-        };
-        let proxy_url = cfg
-            .document
-            .get("requests")
-            .and_then(|r| r.get("proxy-url"))
-            .map(crate::config::yaml_string)
-            .unwrap_or_default();
-        HostConfigSummary {
-            auth_dir: cfg.auth_dir.to_string_lossy().trim().to_owned(),
-            proxy_url: proxy_url.trim().to_owned(),
-            force_model_prefix: cfg.routing.force_model_prefix,
-            oauth_model_alias: plugin_oauth_aliases(&cfg),
-            excluded_models: cpa_core::config::credentials::oauth_excluded(&cfg)
-                .into_iter()
-                .filter_map(|(k, v)| {
-                    let k = normalize_provider(&k);
-                    (!k.is_empty()).then_some((k, v))
-                })
-                .collect(),
-        }
+        self.config()
+            .map(|cfg| host_config_summary_of(&cfg))
+            .unwrap_or_default()
     }
 
     /// Go `AuthProviderIdentifiers`.
@@ -561,19 +566,25 @@ impl Host {
     }
 
     /// Go `ParseAuths`. With a provider, only that provider's plugin is asked; otherwise
-    /// every auth provider in order until one handles the material or fails.
-    pub async fn parse_auths(&self, req: AuthParseRequest) -> ParseAuthsResult {
+    /// every auth provider in order until one handles the material or fails. Blocking:
+    /// credential loading is synchronous, as Go's synthesizer is.
+    pub fn parse_auths(&self, req: AuthParseRequest) -> ParseAuthsResult {
+        self.parse_auths_for(req, false)
+    }
+
+    /// [`Self::parse_auths`]; `save`: for a `host.auth.save` (see [`SaveParse`]).
+    pub(crate) fn parse_auths_for(&self, req: AuthParseRequest, save: bool) -> ParseAuthsResult {
         if !req.provider.trim().is_empty() {
             let Some(record) = self.auth_provider_record(&req.provider) else {
                 return ParseAuthsResult::default();
             };
-            return self.call_parse_auths(&record, req).await;
+            return self.call_parse_auths(&record, req, save);
         }
         for record in self.active_records() {
             if !record.plugin.caps.auth_provider || self.is_fused(&record.id) {
                 continue;
             }
-            let result = self.call_parse_auths(&record, req.clone()).await;
+            let result = self.call_parse_auths(&record, req.clone(), save);
             if result.error.is_some() || result.handled {
                 return result;
             }
@@ -583,7 +594,7 @@ impl Host {
 
     /// Go `callParseAuths`: an RPC failure is not handled; invalid auth data in a handled
     /// answer is.
-    async fn call_parse_auths(&self, record: &Record, mut req: AuthParseRequest) -> ParseAuthsResult {
+    fn call_parse_auths(&self, record: &Record, mut req: AuthParseRequest, save: bool) -> ParseAuthsResult {
         if self.is_fused(&record.id) || !self.record_current(record) {
             return ParseAuthsResult::default();
         }
@@ -595,7 +606,20 @@ impl Host {
         if req.provider.is_empty() {
             req.provider = identifier.clone();
         }
-        let resp: AuthParseResponse = match self.call(record, method::AUTH_PARSE, &req).await {
+        let parsing = Parsing::new(self, record, &req.path, save);
+        // The thread entry goes on the thread that calls the plugin, where its
+        // synchronous callbacks arrive (not this one under a current-thread runtime).
+        let (instance, path) = (parsing.instance.clone(), parsing.path.clone());
+        let resp = record
+            .client
+            .call_blocking_in(method::AUTH_PARSE, &crate::gojson::to_vec(&req), move || {
+                ParsingHere::enter(instance, path)
+            })
+            .map_err(CallError::from)
+            .and_then(|raw| crate::rpc::decode_response(method::AUTH_PARSE, &raw));
+        let resp = self.fuse_on_panic(&record.id, method::AUTH_PARSE, resp);
+        drop(parsing);
+        let resp: AuthParseResponse = match resp {
             Ok(resp) => resp,
             Err(e) => return ParseAuthsResult::failed(false, e),
         };
@@ -791,12 +815,197 @@ pub struct ParseAuthsResult {
     pub error: Option<CallError>,
 }
 
+std::thread_local! {
+    /// The `auth.parse` calls this thread is blocked in: the plugin instance and the auth
+    /// file's cleaned absolute path. A native plugin's synchronous host callbacks arrive
+    /// on the thread blocked in the plugin call (cgo runs an exported Go function locked
+    /// to the calling C thread, and its C calls back on that thread).
+    static PARSING_HERE: std::cell::RefCell<Vec<(std::sync::Arc<crate::client::CallbackInstance>, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An `auth.parse` call in flight, for [`Host::save_parse`]. Dropped, unwinding included,
+/// when the call returns.
+struct Parsing<'a> {
+    host: &'a Host,
+    instance: std::sync::Arc<crate::client::CallbackInstance>,
+    path: std::path::PathBuf,
+    save: bool,
+}
+
+impl<'a> Parsing<'a> {
+    fn new(host: &'a Host, record: &Record, path: &str, save: bool) -> Self {
+        let instance = record.client.instance().clone();
+        let path = cpa_core::config::credentials::absolute_clean_path(std::path::Path::new(path));
+        crate::host::lock(&host.inner.auth_parses).push((instance.clone(), path.clone(), save));
+        Self {
+            host,
+            instance,
+            path,
+            save,
+        }
+    }
+
+    fn is(&self, instance: &std::sync::Arc<crate::client::CallbackInstance>, path: &std::path::Path) -> bool {
+        std::sync::Arc::ptr_eq(instance, &self.instance) && path == self.path
+    }
+}
+
+/// This thread's entry in [`PARSING_HERE`] while it calls the plugin's `auth.parse`.
+/// Dropped, unwinding included, when the call returns.
+struct ParsingHere {
+    instance: std::sync::Arc<crate::client::CallbackInstance>,
+    path: std::path::PathBuf,
+}
+
+impl ParsingHere {
+    fn enter(instance: std::sync::Arc<crate::client::CallbackInstance>, path: std::path::PathBuf) -> Self {
+        PARSING_HERE.with_borrow_mut(|here| here.push((instance.clone(), path.clone())));
+        Self { instance, path }
+    }
+}
+
+impl Drop for ParsingHere {
+    fn drop(&mut self) {
+        PARSING_HERE.with_borrow_mut(|here| {
+            if let Some(at) = here
+                .iter()
+                .rposition(|(i, p)| std::sync::Arc::ptr_eq(i, &self.instance) && *p == self.path)
+            {
+                here.remove(at);
+            }
+        });
+    }
+}
+
+impl Drop for Parsing<'_> {
+    fn drop(&mut self) {
+        let mut parses = crate::host::lock(&self.host.inner.auth_parses);
+        if let Some(at) = parses
+            .iter()
+            .position(|(i, p, save)| self.is(i, p) && *save == self.save)
+        {
+            parses.swap_remove(at);
+        }
+    }
+}
+
+/// How a plugin's `host.auth.save` to an auth file treats the parse Go makes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveParse {
+    /// Parse the saved file first, as Go does.
+    Parse,
+    /// The save comes from inside this plugin's `auth.parse` of the file, on the
+    /// parsing thread: write without parsing again (Go recurses without bound). The
+    /// parse's answer is published, and the watcher parses the saved bytes next.
+    Nested,
+    /// The save comes from another thread while a save of the file by this plugin is
+    /// being parsed: refused, as it may be that parse recursing from a thread it
+    /// spawned.
+    Refused,
+}
+
+impl Host {
+    /// How a `host.auth.save` from plugin `instance` to the auth file at `path` is parsed.
+    pub(crate) fn save_parse(
+        &self,
+        instance: &std::sync::Arc<crate::client::CallbackInstance>,
+        path: &std::path::Path,
+    ) -> SaveParse {
+        let path = cpa_core::config::credentials::absolute_clean_path(path);
+        let same = |i: &std::sync::Arc<crate::client::CallbackInstance>, p: &std::path::PathBuf| {
+            std::sync::Arc::ptr_eq(i, instance) && *p == path
+        };
+        if PARSING_HERE.with_borrow(|here| here.iter().any(|(i, p)| same(i, p))) {
+            return SaveParse::Nested;
+        }
+        if crate::host::lock(&self.inner.auth_parses)
+            .iter()
+            .any(|(i, p, save)| *save && same(i, p))
+        {
+            return SaveParse::Refused;
+        }
+        SaveParse::Parse
+    }
+}
+
 impl ParseAuthsResult {
     fn failed(handled: bool, error: CallError) -> Self {
         Self {
             auths: Vec::new(),
             handled,
             error: Some(error),
+        }
+    }
+}
+
+impl Host {
+    /// This host as Go's `PluginAuthParser` for credential loading
+    /// (`RegisterPluginAuthParser(pluginHost)`), held weakly. From then on, this host
+    /// keeps cpa-core's auth-parser flag current, so without an auth provider loading
+    /// skips the parser after one atomic load.
+    pub fn auth_parser(&self) -> std::sync::Arc<dyn cpa_core::config::credentials::PluginAuthParser> {
+        self.inner
+            .auth_parser_installed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let state = self.state();
+        self.publish_hook_activity(&state, &self.snapshot().records);
+        drop(state);
+        // The same parser every time, so installing it again changes nothing.
+        self.inner
+            .auth_parser
+            .get_or_init(|| std::sync::Arc::new(AuthParser(std::sync::Arc::downgrade(&self.inner))))
+            .clone()
+    }
+}
+
+struct AuthParser(std::sync::Weak<crate::host::Inner>);
+
+impl cpa_core::config::credentials::PluginAuthParser for AuthParser {
+    fn parse_auths(
+        &self,
+        req: &cpa_core::config::credentials::ParseRequest<'_>,
+    ) -> cpa_core::config::credentials::Parsed {
+        use cpa_core::config::credentials::Parsed;
+        let Some(inner) = self.0.upgrade() else {
+            return Parsed::NotHandled;
+        };
+        let result = Host::from_inner(inner).parse_auths(AuthParseRequest {
+            provider: req.provider.to_owned(),
+            path: req.path.display().to_string(),
+            file_name: req.file_name.to_owned(),
+            raw_json: Bytes::copy_from_slice(req.raw_json),
+            ..Default::default()
+        });
+        // Go falls back to the built-in synthesizer on any parse error.
+        if result.error.is_some() || !result.handled {
+            return Parsed::NotHandled;
+        }
+        Parsed::Handled(result.auths.into_iter().map(PluginAuth::into_parsed).collect())
+    }
+}
+
+impl PluginAuth {
+    /// The auth as credential loading takes it. The credential keeps one JSON document,
+    /// the one Go saves for it (`pluginTokenStorage`): the plugin's storage overlaid
+    /// with its metadata.
+    pub(crate) fn into_parsed(self) -> cpa_core::config::credentials::ParsedAuth {
+        let metadata = self
+            .storage_payload()
+            .ok()
+            .and_then(|payload| serde_json::from_slice(&payload).ok())
+            .unwrap_or_else(|| self.metadata.clone().into_iter().collect());
+        cpa_core::config::credentials::ParsedAuth {
+            provider: self.provider,
+            id: self.id,
+            file_name: self.file_name,
+            label: self.label,
+            prefix: self.prefix,
+            proxy_url: self.proxy_url,
+            disabled: self.disabled,
+            metadata,
+            attributes: self.attributes,
+            next_refresh_after: self.next_refresh_after.0.map(std::time::SystemTime::from),
         }
     }
 }

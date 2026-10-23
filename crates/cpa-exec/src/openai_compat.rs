@@ -134,8 +134,10 @@ fn not_registered(what: &str, from: Format, to: Format) -> ExecError {
 
 /// `helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent` for this executor
 /// (no target executor): Codex-client rewrites, then the pair or its compat variant.
-// ponytail: the configuration-update intent is not exposed by crate::codex_client
-// (owner: Codex), so thinking always sees `updates_changed: false`.
+// ponytail: the configuration-update intent crate::codex_client reports is not read
+// here yet, so thinking always sees `updates_changed: false`, and equal original and
+// working payloads are translated twice (Go translates once); the OpenAI-compatible
+// port reads it.
 fn translate_body(
     req: &ExecRequest,
     cfg: &Config,
@@ -147,6 +149,7 @@ fn translate_body(
 ) -> Result<Vec<u8>, ExecError> {
     let client = crate::codex_client::Client::new(&req.headers, cfg, "", is_compat);
     crate::codex_client::translate_request(req.source_format, target, &RequestCtx { model, stream }, body, &client)
+        .map(|t| t.body)
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
 
@@ -280,7 +283,6 @@ impl OpenAICompatExecutor {
         )?;
         let mut body = translate_body(&req, cfg, target, &base_model, req.stream, &req.body, is_compat)?;
         body = apply_thinking(body, &req, target, &credential.provider, caps.as_ref())?;
-        body = apply_payload_rules(cfg, &req, &base_model, target, &original, body);
         let requested = route_model(&req);
         if payload::excludes_images(compat.as_ref(), &base_model, requested) {
             body = payload::normalize_tool_results_text_only(body);
@@ -300,6 +302,8 @@ impl OpenAICompatExecutor {
         if req.usage.enabled() {
             req.usage.request(target, &body);
         }
+        // The payload rules are the last change to the body (868e137).
+        body = apply_payload_rules(cfg, &req, &base_model, target, &original, body);
         let mut headers = base_headers(&api_key, "application/json");
         apply_custom(&mut headers, credential, &req);
         if req.stream {
@@ -331,11 +335,15 @@ impl OpenAICompatExecutor {
         };
         if req.stream {
             let translator: Box<dyn StreamTranslator> = match response_pair {
-                Some(pair) => (pair.stream)(&ResponseCtx {
-                    model: &req.model,
-                    original_request: &original,
-                    translated_request: &body,
-                }),
+                Some(pair) => crate::translate::stream(
+                    pair,
+                    &ResponseCtx {
+                        model: &req.model,
+                        original_request: &original,
+                        translated_request: &body,
+                    },
+                    &req,
+                ),
                 None => Box::new(Identity),
             };
             let mut lines = wire::lines(upstream, MAX_LINE);
@@ -370,17 +378,19 @@ impl OpenAICompatExecutor {
         if req.usage.enabled() {
             req.usage.response_body(target, &raw);
         }
+        let ctx = ResponseCtx {
+            model: &req.model,
+            original_request: &original,
+            translated_request: &body,
+        };
         let mut out = match response_pair {
-            Some(pair) => (pair.non_stream)(
-                &ResponseCtx {
-                    model: &req.model,
-                    original_request: &original,
-                    translated_request: &body,
-                },
-                &raw,
-            )
-            .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
-            None => raw.to_vec(),
+            Some(pair) => (pair.non_stream)(&ctx, &raw)
+                .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
+            // Go's TranslateNonStream still runs the plugin response hooks.
+            None => {
+                cpa_translate::hooks::unregistered_non_stream(target.as_str(), req.response_format.as_str(), &ctx, &raw)
+                    .unwrap_or_else(|| raw.to_vec())
+            }
         };
         if out.is_empty() {
             return Err(ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION));
@@ -410,19 +420,28 @@ impl OpenAICompatExecutor {
         if base_url.is_empty() {
             return Err(missing_base_url());
         }
-        let content_type = req
+        let client_content_type = req
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let (body, content_type) = prepare_images_payload(&req.body, &base_model, &content_type, req.stream)?;
+        let (body, content_type) = prepare_images_payload(&req.body, &base_model, &client_content_type, req.stream)?;
         let content_type = if content_type.is_empty() {
             "application/json".to_owned()
         } else {
             content_type
         };
+        let (body, content_type) = media_barrier(
+            credential,
+            &req,
+            cfg,
+            &base_model,
+            &body,
+            &content_type,
+            &client_content_type,
+        )?;
         let path = if request_path.trim().ends_with(IMAGES_EDITS) {
             IMAGES_EDITS
         } else {
@@ -486,6 +505,37 @@ impl OpenAICompatExecutor {
             body: ResponseBody::Buffered(data),
         })
     }
+}
+
+/// `ApplyMediaPayloadConfig` on a prepared images request (868e137): the payload rules
+/// run last, on the body's JSON view, against the client's original request.
+fn media_barrier(
+    credential: &Credential,
+    req: &ExecRequest,
+    cfg: &Config,
+    model: &str,
+    body: &[u8],
+    content_type: &str,
+    client_content_type: &str,
+) -> Result<(Bytes, String), ExecError> {
+    let original = if req.original_body.is_empty() {
+        &req.body
+    } else {
+        &req.original_body
+    };
+    let (body, content_type) =
+        crate::payload_media::apply(body, content_type, original, client_content_type, |view, original| {
+            crate::payload_barrier::Barrier {
+                executor: &credential.provider,
+                model,
+                protocol: Format::OpenAI.as_str(),
+                root: "",
+                original,
+            }
+            .apply(cfg, req, view)
+        })
+        .map_err(plain_err)?;
+    Ok((Bytes::from(body), content_type))
 }
 
 /// `prepareOpenAICompatImagesPayload`.
@@ -590,7 +640,30 @@ fn count_tokens(credential: &Credential, req: &ExecRequest, cfg: &Config) -> Res
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
     let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
     let body = translate_body(req, cfg, Format::OpenAI, &base_model, false, &req.body, is_compat)?;
+    // The rule baseline: the translated original, else the translated body before
+    // thinking. Go counts with a failed translation's partial body; this refuses.
+    let original = if req.original_body.is_empty() {
+        body.clone()
+    } else {
+        translate_body(
+            req,
+            cfg,
+            Format::OpenAI,
+            &base_model,
+            false,
+            &req.original_body,
+            is_compat,
+        )?
+    };
     let body = apply_thinking(body, req, Format::OpenAI, &credential.provider, caps.as_ref())?;
+    let body = crate::payload_barrier::Barrier {
+        executor: &credential.provider,
+        model: &base_model,
+        protocol: Format::OpenAI.as_str(),
+        root: "",
+        original: &original,
+    }
+    .apply(cfg, req, body);
     let count = payload::count_chat_tokens(&base_model, &body).map_err(|e| {
         ExecError::local(
             500,
@@ -615,7 +688,7 @@ impl StreamTranslator for Identity {
         Ok(if event.starts_with(b"data: [DONE]") {
             Vec::new()
         } else {
-            vec![Bytes::copy_from_slice(event)]
+            vec![Bytes::from([event, b"\n\n"].concat())]
         })
     }
 
@@ -672,10 +745,10 @@ impl Frames {
         self.failed = true;
     }
 
+    /// One Go `TranslateStream` call per frame's joined `data:` line: no blank line
+    /// follows it, so plugin stream hooks run once per line, as in Go.
     fn translate(&mut self, line: &[u8]) -> bool {
-        let mut event = line.to_vec();
-        event.extend_from_slice(b"\n\n");
-        match self.translator.event(&event) {
+        match self.translator.event(line) {
             Ok(out) => {
                 self.ready.extend(out.into_iter().map(Ok));
                 false

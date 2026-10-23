@@ -7,6 +7,7 @@ use crate::{
     thinking,
 };
 use cpa_common::json::{self as gj, Kind, Res};
+use cpa_core::gostr::GoStr;
 use std::collections::{HashMap, HashSet};
 
 pub static PAIR: Registered = registered!(
@@ -18,13 +19,13 @@ pub static PAIR: Registered = registered!(
 );
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, ctx.stream, false))
+    convert(ctx.model, body, ctx.stream, false)
 }
 
 /// Compatibility endpoints may accept unsigned assistant thinking history
 /// (ConvertOpenAIRequestToClaudeWithCompat). Native Claude uses the registered pair.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, ctx.stream, true))
+    convert(ctx.model, body, ctx.stream, true)
 }
 
 fn thinking_config(out: &mut Vec<u8>, root: &Res<'_>, model: &str) {
@@ -37,7 +38,7 @@ pub(crate) fn apply_effort(out: &mut Vec<u8>, v: &Res<'_>, model: &str) {
     if !v.exists() {
         return;
     }
-    let effort = v.str().trim().to_lowercase();
+    let effort = v.str().trim().go_lower();
     if effort.is_empty() {
         return;
     }
@@ -58,7 +59,11 @@ pub(crate) fn apply_effort(out: &mut Vec<u8>, v: &Res<'_>, model: &str) {
                 gj::delete(out, "output_config.effort");
             }
             _ => {
-                let effort = thinking::map_to_claude_effort(&effort, supports_max).unwrap_or(&effort);
+                let effort = if thinking::has_level(&levels, &effort) {
+                    &effort
+                } else {
+                    thinking::map_to_claude_effort(&effort, supports_max).unwrap_or(&effort)
+                };
                 gj::set_str(out, "thinking.type", "adaptive");
                 gj::delete(out, "thinking.budget_tokens");
                 gj::set_str(out, "output_config.effort", effort);
@@ -87,16 +92,23 @@ pub(crate) fn text_part(text: &[u8]) -> Vec<u8> {
     part
 }
 
-fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Vec<u8> {
+fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Result<Vec<u8>, Error> {
+    let mut drops = common::UserTurnDrops::default();
     let user_id = common::derive_claude_user_id(raw);
     let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", &user_id);
+    gj::set_int(
+        &mut out,
+        "max_tokens",
+        crate::claude_responses::default_max_tokens(model),
+    );
     let root = gj::parse(raw);
     thinking_config(&mut out, &root, model);
     gj::set_str(&mut out, "model", model);
+    // Go's firstExisting: a JSON null does not count.
     let max_tokens = [root.get("max_tokens"), root.get("max_completion_tokens")]
         .into_iter()
-        .find(Res::exists);
+        .find(|r| r.exists() && r.kind != Kind::Null);
     if let Some(max_tokens) = max_tokens {
         gj::set_int(&mut out, "max_tokens", max_tokens.int());
     }
@@ -178,9 +190,14 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
                         content.each(|_, part| {
                             if let Some(p) = content_part(&part) {
                                 blocks.push(common::attach_cache_control(p, &part));
+                            } else if role == b"user" && matches!(&*part.get("type").s, b"file" | b"input_audio") {
+                                drops.drop_part(&part.get("type").str());
                             }
                             true
                         });
+                    }
+                    if role == b"user" {
+                        drops.end_turn(blocks.len());
                     }
                     let calls = message.get("tool_calls");
                     if calls.is_array() && role == b"assistant" {
@@ -222,6 +239,9 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
     if !instruction.is_empty() {
         system.push(text_part(&instruction));
     }
+    // Decided per user turn, so neither a system prompt nor the blank turn below hides
+    // an emptied turn.
+    drops.result()?;
     if message_blocks.is_empty() && !system.is_empty() {
         message_blocks.push(br#"{"role":"user","content":[{"type":"text","text":""}]}"#.to_vec());
     }
@@ -244,7 +264,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Ve
             );
         }
     }
-    thinking::apply_translated_summary_to_claude(out, raw, "openai", model)
+    Ok(thinking::apply_translated_summary_to_claude(out, raw, "openai", model))
 }
 
 fn tool_use(call: &Res<'_>) -> Vec<u8> {
@@ -293,9 +313,9 @@ fn tools(out: &mut Vec<u8>, root: &Res<'_>) {
                 allowed_names.insert(name);
             }
         }
-        let mut value = choice.get("allowed_tools.mode").str().trim().to_lowercase();
+        let mut value = choice.get("allowed_tools.mode").str().trim().go_lower();
         if value.is_empty() {
-            value = choice.get("mode").str().trim().to_lowercase();
+            value = choice.get("mode").str().trim().go_lower();
         }
         if !value.is_empty() {
             mode = value;

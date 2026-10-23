@@ -140,6 +140,7 @@ impl ProxyGroupDb {
     }
 
     pub fn add_group(&self, id: i64, name: &str, strategy: Strategy, enabled: bool) -> Result<()> {
+        ensure!(id > 0, "group ID must be positive");
         ensure!(!name.trim().is_empty(), "group name required");
         let label = match strategy {
             Strategy::RoundRobin => "round_robin",
@@ -154,7 +155,11 @@ impl ProxyGroupDb {
     }
 
     pub fn add_node(&self, node: Node, proxy_url: &str) -> Result<()> {
-        ensure!(!proxy_url.trim().is_empty(), "proxy URL required");
+        ensure!(node.id > 0 && node.group_id > 0, "node and group IDs must be positive");
+        ensure!(
+            matches!(cpa_exec::proxy::Proxy::parse(proxy_url), cpa_exec::proxy::Proxy::Url(_)),
+            "proxy node requires a supported proxy URL"
+        );
         let failures = i64::try_from(node.failure_count).context("failure count too large")?;
         self.connection()?.execute(
             "INSERT INTO rust_ag_nodes(id,group_id,proxy_url,enabled,failure_count,cooldown_until)
@@ -172,6 +177,7 @@ impl ProxyGroupDb {
     }
 
     pub fn add_account(&self, name: &str, group_id: i64) -> Result<()> {
+        ensure!(group_id > 0, "group ID must be positive");
         ensure!(!name.trim().is_empty(), "credential name required");
         ensure!(
             Path::new(name).file_name().is_some_and(|base| base == name),
@@ -236,6 +242,12 @@ impl ProxyGroupDb {
     /// Stable assignment: concurrent callers get the same bound node.
     /// The caller supplies an RNG index for Strategy::Random.
     pub fn select_and_bind(&self, name: &str, now: i64, random_slot: usize) -> Result<Option<BoundProxy>> {
+        // Hot path: already-bound accounts do not need a write transaction.
+        // This snapshot can race an invalidation; callers must revalidate
+        // the generation before dispatching a request.
+        if let Some(active) = self.active_bound_proxy(name, now)? {
+            return Ok(Some(active.binding));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let selected = bind_in_tx(&tx, name, now, random_slot)?;
@@ -266,6 +278,10 @@ impl ProxyGroupDb {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transaction helper carries the complete optimistic binding/version preconditions"
+    )]
     fn invalidate_inner(
         &self,
         name: &str,
@@ -276,6 +292,7 @@ impl ProxyGroupDb {
         random_slot: usize,
         inject_failure: bool,
     ) -> Result<Option<BoundProxy>> {
+        ensure!(cooldown_seconds > 0, "failed proxy cooldown must be positive");
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (group_id, node_id, generation): (i64, Option<i64>, i64) = tx
@@ -293,7 +310,7 @@ impl ProxyGroupDb {
             node_id == expected_node_id && generation == expected_generation,
             "stale proxy failure: binding node or generation changed"
         );
-        let until = now.saturating_add(cooldown_seconds.max(0));
+        let until = now.saturating_add(cooldown_seconds);
         let updated = tx.execute(
             "UPDATE rust_ag_nodes SET failure_count=CASE
                WHEN failure_count < 9223372036854775807 THEN failure_count+1
@@ -471,6 +488,61 @@ mod tests {
 
     fn db_value(db: &ProxyGroupDb, query: &str) -> i64 {
         db.connection().unwrap().query_row(query, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rejects_invalid_proxy_nodes_without_persisting_them() {
+        let (db, dir) = sandbox();
+        for (offset, url) in ["", " ", "direct", "none", "not-a-url", "ftp://example.com"]
+            .iter()
+            .enumerate()
+        {
+            let id = 100 + offset as i64;
+            assert!(
+                db.add_node(
+                    Node {
+                        id,
+                        group_id: 10,
+                        enabled: true,
+                        cooldown_until: None,
+                        failure_count: 0
+                    },
+                    url
+                )
+                .is_err(),
+                "unexpectedly accepted {url:?}"
+            );
+        }
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonpositive_identifiers_before_writing_sqlite() {
+        let (db, dir) = sandbox();
+        assert!(db.add_group(0, "invalid", Strategy::RoundRobin, true).is_err());
+        assert!(db.add_account("invalid.json", 0).is_err());
+        for (id, group_id) in [(0, 10), (-1, 10), (100, 0), (100, -1)] {
+            assert!(
+                db.add_node(
+                    Node {
+                        id,
+                        group_id,
+                        enabled: true,
+                        cooldown_until: None,
+                        failure_count: 0,
+                    },
+                    "http://127.0.0.1:8080"
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_groups"), 2);
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_accounts"), 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -655,6 +727,40 @@ mod tests {
     }
 
     #[test]
+    fn bound_account_hot_path_preserves_cursor_and_generation() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        let initial = db.binding("mock-1.json").unwrap();
+        for slot in 0..128 {
+            let next = db.select_and_bind("mock-1.json", 101, slot).unwrap().unwrap();
+            assert_eq!(next.node_id, first.node_id);
+            assert_eq!(next.binding_generation, first.binding_generation);
+        }
+        assert_eq!(db.binding("mock-1.json").unwrap(), initial);
+        assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_failure_cooldown_cannot_reselect_failed_node() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        for seconds in [0, -1, i64::MIN] {
+            assert!(
+                db.invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, seconds, 0)
+                    .is_err()
+            );
+            let still_bound = db.select_and_bind("mock-1.json", 101, 0).unwrap().unwrap();
+            assert_eq!(still_bound.node_id, first.node_id);
+            assert_eq!(still_bound.binding_generation, first.binding_generation);
+        }
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 0);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn concurrent_double_bind_keeps_single_node_and_one_cursor_advance() {
         let (db, dir) = sandbox();
         let a = db.clone();
@@ -664,6 +770,71 @@ mod tests {
         assert_eq!(first.join().unwrap(), 1);
         assert_eq!(second.join().unwrap(), 1);
         assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stress_parallel_binding_keeps_one_generation_and_cursor() {
+        let (db, dir) = sandbox();
+        let mut workers = Vec::new();
+        for worker in 0..12 {
+            let db = db.clone();
+            workers.push(std::thread::spawn(move || {
+                for iteration in 0..100 {
+                    let binding = db
+                        .select_and_bind("mock-1.json", 100, worker + iteration)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(binding.node_id, 1);
+                    assert_eq!(binding.binding_generation, 1);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        assert_eq!(
+            db_value(
+                &db,
+                "SELECT binding_generation FROM rust_ag_accounts WHERE credential_name='mock-1.json'"
+            ),
+            1
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stress_stale_failure_cannot_cool_new_binding() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        let second = db
+            .invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, 300, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.node_id, 2);
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let db = db.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert!(
+                        db.invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 102, 300, 0)
+                            .is_err()
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let current = db.select_and_bind("mock-1.json", 102, 0).unwrap().unwrap();
+        assert_eq!(current.node_id, second.node_id);
+        assert_eq!(current.binding_generation, second.binding_generation);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 1);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=2"), 0);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }

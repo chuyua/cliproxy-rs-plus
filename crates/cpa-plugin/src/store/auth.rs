@@ -7,6 +7,7 @@ use super::url;
 use super::{REQUEST_KIND_ARTIFACT, REQUEST_KIND_METADATA, REQUEST_KIND_REGISTRY};
 use crate::go_struct;
 use crate::gojson::{self, GoJson, Node};
+use cpa_core::gostr::GoStr;
 
 pub const AUTH_TYPE_NONE: &str = "none";
 pub const AUTH_TYPE_BEARER: &str = "bearer";
@@ -94,7 +95,7 @@ pub fn validate_resolved_auth_config(item: &ResolvedAuthConfig) -> Result<(), St
         return Err("plugin store resolved auth match must not contain credentials, query, or fragment".into());
     }
     for kind in &item.apply_to {
-        let k = kind.trim().to_lowercase();
+        let k = kind.trim().go_lower();
         if !matches!(
             k.as_str(),
             REQUEST_KIND_REGISTRY | REQUEST_KIND_METADATA | REQUEST_KIND_ARTIFACT
@@ -105,7 +106,7 @@ pub fn validate_resolved_auth_config(item: &ResolvedAuthConfig) -> Result<(), St
             ));
         }
     }
-    match item.auth_type.trim().to_lowercase().as_str() {
+    match item.auth_type.trim().go_lower().as_str() {
         "" | AUTH_TYPE_NONE => Ok(()),
         AUTH_TYPE_BEARER | AUTH_TYPE_GITHUB_TOKEN if item.token.0.is_empty() => {
             Err("plugin store resolved auth token is empty".into())
@@ -138,7 +139,7 @@ pub fn normalize_auth_configs(auth: &[AuthConfig]) -> Vec<AuthConfig> {
         .filter_map(|item| {
             let mut item = item.clone();
             item.matches = item.matches.trim().into();
-            item.auth_type = item.auth_type.trim().to_lowercase();
+            item.auth_type = item.auth_type.trim().go_lower();
             for field in [
                 &mut item.token_env,
                 &mut item.username_env,
@@ -156,7 +157,7 @@ pub fn normalize_auth_configs(auth: &[AuthConfig]) -> Vec<AuthConfig> {
             }
             let mut apply_to: Vec<String> = Vec::new();
             for value in &item.apply_to {
-                let value = value.trim().to_lowercase();
+                let value = value.trim().go_lower();
                 if !value.is_empty() && !apply_to.contains(&value) {
                     apply_to.push(value);
                 }
@@ -176,7 +177,7 @@ pub fn auth_configured(auth: &[AuthConfig], request_url: &str, kind: &str) -> bo
     let Some(item) = matching_auth_config(auth, request_url, kind) else {
         return false;
     };
-    match item.auth_type.trim().to_lowercase().as_str() {
+    match item.auth_type.trim().go_lower().as_str() {
         AUTH_TYPE_BEARER | AUTH_TYPE_GITHUB_TOKEN => !env(&item.token_env).is_empty(),
         AUTH_TYPE_BASIC => !env(&item.username_env).is_empty() && !env(&item.password_env).is_empty(),
         AUTH_TYPE_HEADER => !item.header_name.is_empty() && !env(&item.header_value_env).is_empty(),
@@ -232,7 +233,7 @@ pub(super) fn apply_auth(
     let Some(item) = matching_auth_config(auth, request_url, kind) else {
         return Ok(false);
     };
-    match item.auth_type.trim().to_lowercase().as_str() {
+    match item.auth_type.trim().go_lower().as_str() {
         "" | AUTH_TYPE_NONE => return Ok(false),
         AUTH_TYPE_BEARER | AUTH_TYPE_GITHUB_TOKEN => {
             let token = env_value_required(&item.token_env, "token-env")?;
@@ -263,7 +264,7 @@ pub(super) fn apply_auth(
 }
 
 fn apply_resolved(headers: &mut Headers, item: &ResolvedAuthConfig) -> Result<bool, String> {
-    match item.auth_type.trim().to_lowercase().as_str() {
+    match item.auth_type.trim().go_lower().as_str() {
         "" | AUTH_TYPE_NONE => return Ok(false),
         AUTH_TYPE_BEARER | AUTH_TYPE_GITHUB_TOKEN => {
             if item.token.0.is_empty() {
@@ -352,7 +353,7 @@ pub(super) fn validate_resolved_auth_expiry(
 
 /// Go `matchingAuthConfig`: the first normalised rule matching the URL and kind.
 pub(super) fn matching_auth_config(auth: &[AuthConfig], request_url: &str, kind: &str) -> Option<AuthConfig> {
-    let kind = kind.trim().to_lowercase();
+    let kind = kind.trim().go_lower();
     normalize_auth_configs(auth)
         .into_iter()
         .find(|item| url_matches_rule(request_url.trim(), &item.matches) && applies_to(&item.apply_to, &kind))
@@ -364,7 +365,7 @@ pub(super) fn matching_resolved_auth_config<'a>(
     request_url: &str,
     kind: &str,
 ) -> Option<&'a ResolvedAuthConfig> {
-    let kind = kind.trim().to_lowercase();
+    let kind = kind.trim().go_lower();
     auth.iter()
         .find(|item| url_matches_rule(request_url.trim(), item.matches.trim()) && applies_to(&item.apply_to, &kind))
 }
@@ -375,7 +376,7 @@ fn applies_to(apply_to: &[String], kind: &str) -> bool {
 
 /// Go `resolvedAuthConfigured`.
 pub(super) fn resolved_auth_configured(item: &ResolvedAuthConfig) -> bool {
-    match item.auth_type.trim().to_lowercase().as_str() {
+    match item.auth_type.trim().go_lower().as_str() {
         AUTH_TYPE_BEARER | AUTH_TYPE_GITHUB_TOKEN => !item.token.0.is_empty(),
         AUTH_TYPE_BASIC => !item.username.0.is_empty() && !item.password.0.is_empty(),
         AUTH_TYPE_HEADER => !item.header_name.trim().is_empty() && !item.header_value.0.is_empty(),

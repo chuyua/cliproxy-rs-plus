@@ -2,6 +2,7 @@
 //! management caller's behalf, optionally with a credential's token substituted for
 //! `$TOKEN$` and through that credential's proxy.
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,35 +36,63 @@ struct Request {
     data: String,
 }
 
-/// A top-level JSON object as its members in order, duplicates kept; `None` for null.
-pub(super) struct Members(pub(super) Option<Vec<(String, Value)>>);
-
-impl<'de> serde::Deserialize<'de> for Members {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Visit;
-        impl<'de> serde::de::Visitor<'de> for Visit {
-            type Value = Members;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an object or null")
-            }
-            fn visit_unit<E>(self) -> Result<Members, E> {
-                Ok(Members(None))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
-                let mut out = Vec::new();
-                while let Some(entry) = map.next_entry::<String, Value>()? {
-                    out.push(entry);
-                }
-                Ok(Members(Some(out)))
-            }
+/// The members of the first JSON value in `body` (what follows it is never read) that
+/// `select` names, in order with duplicates kept; empty for null; `None` when the value
+/// is not an object. Other members are skipped unconverted (`IgnoredAny`), as
+/// `encoding/json` skips unknown fields.
+fn first_members<K>(body: &[u8], select: impl Fn(&str) -> Option<K>) -> Option<Vec<(K, Value)>> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    struct Seed<F>(F);
+    impl<'de, K, F: Fn(&str) -> Option<K>> DeserializeSeed<'de> for Seed<F> {
+        type Value = Vec<(K, Value)>;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(self)
         }
-        d.deserialize_any(Visit)
     }
+    impl<'de, K, F: Fn(&str) -> Option<K>> Visitor<'de> for Seed<F> {
+        type Value = Vec<(K, Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an object or null")
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                match (self.0)(&key) {
+                    Some(k) => out.push((k, map.next_value()?)),
+                    None => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+    Seed(select)
+        .deserialize(&mut serde_json::Deserializer::from_slice(body))
+        .ok()
+}
+
+/// gin `ShouldBindJSON` into a struct with these JSON field names: each matching
+/// member as its field's index, in order; see [`first_members`].
+pub(super) fn bind_struct(body: &[u8], fields: &[&str]) -> Option<Vec<(usize, Value)>> {
+    first_members(body, |key| go_field(fields, key))
+}
+
+/// The struct field `key` decodes into (`encoding/json`): an exact name first, else
+/// the first name equal under Unicode case folding.
+pub(super) fn go_field(fields: &[&str], key: &str) -> Option<usize> {
+    fields
+        .iter()
+        .position(|f| *f == key)
+        .or_else(|| fields.iter().position(|f| f.go_eq_fold(key)))
 }
 
 /// gin `ShouldBindJSON` into `apiCallRequest`: the first JSON value only (trailing data
 /// is ignored); every member applied in order with field names matched exactly first
-/// and then case-insensitively in struct order; null leaves a string as it was, clears
+/// and then under Unicode case folding in struct order; null leaves a string as it was, clears
 /// a pointer and nils the header map; a later header object merges into the map; any
 /// type mismatch fails the bind.
 fn decode(body: &[u8]) -> Option<Request> {
@@ -77,10 +106,7 @@ fn decode(body: &[u8]) -> Option<Request> {
         "header",
         "data",
     ];
-    let Members(members) = serde_json::Deserializer::from_slice(body)
-        .into_iter::<Members>()
-        .next()?
-        .ok()?;
+    let members = bind_struct(body, &FIELDS)?;
     let mut req = Request::default();
     let text = |v: &Value, slot: &mut String| -> Option<()> {
         match v {
@@ -90,23 +116,19 @@ fn decode(body: &[u8]) -> Option<Request> {
         }
         Some(())
     };
-    for (key, v) in members.unwrap_or_default() {
-        let field = FIELDS
-            .iter()
-            .position(|f| *f == key)
-            .or_else(|| FIELDS.iter().position(|f| f.eq_ignore_ascii_case(&key)));
+    for (field, v) in members {
         match field {
-            Some(i @ 0..=2) => {
+            i @ 0..=2 => {
                 req.auth_index[i] = match v {
                     Value::String(s) => Some(s),
                     Value::Null => None,
                     _ => return None,
                 }
             }
-            Some(3) => text(&v, &mut req.method)?,
-            Some(4) => text(&v, &mut req.url)?,
-            Some(5) => text(&v, &mut req.proxy_url)?,
-            Some(6) => match v {
+            3 => text(&v, &mut req.method)?,
+            4 => text(&v, &mut req.url)?,
+            5 => text(&v, &mut req.proxy_url)?,
+            6 => match v {
                 Value::Null => req.header = None,
                 Value::Object(m) => {
                     let header = req.header.get_or_insert_with(Vec::new);
@@ -124,8 +146,7 @@ fn decode(body: &[u8]) -> Option<Request> {
                 }
                 _ => return None,
             },
-            Some(7) => text(&v, &mut req.data)?,
-            _ => {}
+            _ => text(&v, &mut req.data)?,
         }
     }
     Some(req)
@@ -214,11 +235,18 @@ pub(super) fn client_for(
         .or_else(direct)
 }
 
-pub(crate) async fn api_call(State(state): State<Arc<Management>>, body: Bytes) -> Response {
+pub(crate) async fn api_call(
+    State(state): State<Arc<Management>>,
+    body: Result<crate::body_limit::FirstJson, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(crate::body_limit::FirstJson(body)) => body,
+        Err(rejection) => return fail(super::read_status(&rejection), "invalid body"),
+    };
     let Some(mut req) = decode(&body) else {
         return fail(StatusCode::BAD_REQUEST, "invalid body");
     };
-    let method = req.method.trim().to_uppercase();
+    let method = req.method.trim().go_upper();
     if method.is_empty() {
         return fail(StatusCode::BAD_REQUEST, "missing method");
     }

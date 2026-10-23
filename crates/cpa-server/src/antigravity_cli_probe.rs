@@ -92,6 +92,10 @@ impl ProbeVerdict {
 /// Tries no more than three accounts. A 2xx fetchAvailableModels response is
 /// positive evidence; failed or forbidden accounts are skipped without being
 /// disabled, retried, cooled or logged. The caller alone may persist adoption.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit opt-in probe boundary keeps the account identity and CLI headers separate"
+)]
 pub async fn probe_candidate(
     clients: &GoClients,
     config: &Config,

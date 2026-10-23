@@ -1,6 +1,7 @@
 //! `-home-jwt` bootstrap against a fake enrollment endpoint and a throwaway CA, then
 //! mTLS with the persisted files.
 
+use cpa_core::gostr::GoStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ fn jwt(fingerprint: &str, port: u16) -> String {
 
 /// `AB:CD:...`, the spelling operators paste; normalization must accept it.
 fn colon_fingerprint(pem: &str) -> String {
-    let hex = certificate_fingerprint(pem.as_bytes()).unwrap().to_uppercase();
+    let hex = certificate_fingerprint(pem.as_bytes()).unwrap().go_upper();
     hex.as_bytes()
         .chunks(2)
         .map(|c| std::str::from_utf8(c).unwrap())

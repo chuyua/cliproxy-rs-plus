@@ -202,6 +202,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> (ExecRequest, String)
         },
         source_format: source,
         response_format: response,
+        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,
@@ -218,6 +219,7 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> (ExecRequest, String)
         caller: Caller {
             principal: "fake-client-key".into(),
             source: "authorization",
+            provider: String::new(),
         },
     };
     (req, op.to_owned())
@@ -588,7 +590,13 @@ fn go_primitive_vectors() {
                 .collect();
             MediaType::Ok(media.to_owned(), params)
         } else if media.is_empty() {
-            MediaType::Invalid
+            match parse_media_type(input) {
+                MediaType::Invalid(reason) => {
+                    assert_eq!(reason, error, "mime.ParseMediaType({input:?})");
+                    MediaType::Invalid(reason)
+                }
+                _ => MediaType::Invalid("<expected invalid>"),
+            }
         } else {
             MediaType::BadParams(media.to_owned())
         };
@@ -642,4 +650,95 @@ async fn terminal_errors_flush_pending_frames_first() {
         assert_eq!(out[0].as_ref().unwrap(), &Bytes::from_static(b"event: pending\n\n"));
         assert_eq!(out[1].as_ref().unwrap_err().status, status);
     }
+}
+
+/// Go 868e137 gives CountTokens the payload barrier: the rules run after thinking,
+/// before the local tokenizer, so a configured message changes the count.
+#[test]
+fn count_tokens_sees_the_payload_rules() {
+    let s = serde_json::json!({
+        "op": "count", "source": "openai", "model": "gpt-4o", "provider": "openai-compatibility", "config_auth": -1,
+        "payload": r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+    });
+    let count = |config: &str| {
+        let cfg = Config::parse(config).unwrap();
+        let (req, _) = request(&s, Default::default());
+        let out = super::count_tokens(&credential(&s, &cfg, "127.0.0.1:9"), &req, &cfg).unwrap();
+        let ResponseBody::Buffered(bytes) = out.body else {
+            panic!("count answers are buffered")
+        };
+        gj::get(&bytes, "usage.prompt_tokens").int()
+    };
+    let plain = count("");
+    let configured = count(
+        "payload:\n  override:\n    - models: [{name: gpt-4o}]\n      params: {messages.0.content: one two three four five six seven eight nine ten}\n",
+    );
+    assert!(plain > 0);
+    assert!(configured > plain + 5, "{plain} -> {configured}");
+}
+
+/// Go 868e137: the chat rules run after the built-in stream options, so a filter on
+/// `stream_options` removes the `include_usage` the executor sets.
+#[tokio::test]
+async fn chat_payload_rules_run_after_the_stream_options() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let mut s = fixture["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "stream_basic")
+        .unwrap()
+        .clone();
+    let rule = "\npayload:\n  filter:\n    - models: [{name: acme-chat}]\n      params: [stream_options]\n";
+    s["config"] = Value::String(format!("{}{rule}", s["config"].as_str().unwrap()));
+    let mock = Mock::start(&s["upstream"]).await;
+    let cfg = Config::parse(&s["config"].as_str().unwrap().replace("UPSTREAM", &mock.addr)).unwrap();
+    let cred = credential(&s, &cfg, &mock.addr);
+    let (req, _) = request(&s, Default::default());
+    let ResponseBody::Stream(mut stream) = OpenAICompatExecutor::default()
+        .execute(&cred, req, &cfg)
+        .await
+        .unwrap()
+        .body
+    else {
+        panic!("a stream")
+    };
+    while stream.next().await.is_some() {}
+    let wire = String::from_utf8(mock.request().unwrap()).unwrap();
+    assert!(wire.contains("\r\n\r\n{"), "{wire}");
+    assert!(!wire.contains("stream_options"), "{wire}");
+}
+
+/// Go 868e137 (`ApplyMediaPayloadConfig`): the rules see a multipart edit as JSON and
+/// the form is rebuilt from their result, files kept.
+#[tokio::test]
+async fn images_multipart_payload_rules_run_last() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let mut s = fixture["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "images_edits_multipart_rewritten")
+        .unwrap()
+        .clone();
+    let rule = "\npayload:\n  override:\n    - models: [{name: \"*\", protocol: openai}]\n      params: {size: auto}\n";
+    s["config"] = Value::String(format!("{}{rule}", s["config"].as_str().unwrap()));
+    let mock = Mock::start(&s["upstream"]).await;
+    let cfg = Config::parse(&s["config"].as_str().unwrap().replace("UPSTREAM", &mock.addr)).unwrap();
+    let cred = credential(&s, &cfg, &mock.addr);
+    let (req, _) = request(&s, Default::default());
+    let path = s["request_path"].as_str().unwrap().to_owned();
+    OpenAICompatExecutor::default()
+        .images(&cred, req, &path, &cfg)
+        .await
+        .unwrap();
+    let wire = mock.request().unwrap();
+    let at = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&wire[..at]).into_owned();
+    let content_type = head.lines().find_map(|l| l.strip_prefix("Content-Type: ")).unwrap();
+    let boundary = content_type.strip_prefix("multipart/form-data; boundary=").unwrap();
+    let parts = crate::openai_compat_multipart::parts(&wire[at + 4..], boundary).unwrap();
+    let size = parts.iter().find(|p| p.name == "size").expect("size part");
+    assert_eq!(size.body, b"auto");
+    assert!(parts.iter().any(|p| !p.filename.is_empty()), "{head}");
 }

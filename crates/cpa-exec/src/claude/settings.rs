@@ -1,10 +1,10 @@
 //! The Claude slice of `config.yaml`, read from the presence-preserving document.
 //!
-//! API-key credentials read Go's `Config.ForAPIKey` view (the executor scopes `cfg`):
-//! `oauth.providers.claude.*` written in the v8 layout is OAuth-only there, while the
-//! legacy top-level spellings apply to API keys too.
+//! The shared `upstream.claude` settings apply to OAuth and API-key credentials alike
+//! (Go v8.0.35 52d5507d); their older spellings are already moved there.
 
 use cpa_core::config::Config;
+use cpa_core::gostr::GoStr;
 use serde_yaml_ng::Value;
 
 #[derive(Debug, Clone, Default)]
@@ -56,14 +56,13 @@ fn flag(v: Option<&Value>) -> bool {
 }
 
 impl Settings {
-    /// Settings for `credential`. API-key credentials do not see OAuth-scoped fields.
     pub fn from_config(cfg: &Config) -> Self {
         let doc = &cfg.document;
         let mut s = Self {
             keys: keys(doc),
             ..Self::default()
         };
-        let claude = at(doc, &["oauth", "providers", "claude"]);
+        let claude = at(doc, &["upstream", "claude"]);
         let h = claude.and_then(|c| c.get("header-defaults"));
         let field = |k: &str| text(h.and_then(|h| h.get(k)));
         s.header_defaults = HeaderDefaults {
@@ -88,10 +87,8 @@ impl Settings {
             return None;
         }
         self.keys.iter().find(|k| {
-            k.api_key.trim().eq_ignore_ascii_case(api_key)
-                && (base_url.is_empty()
-                    || k.base_url.trim().is_empty()
-                    || k.base_url.trim().eq_ignore_ascii_case(base_url))
+            k.api_key.trim().go_eq_fold(api_key)
+                && (base_url.is_empty() || k.base_url.trim().is_empty() || k.base_url.trim().go_eq_fold(base_url))
         })
     }
 }

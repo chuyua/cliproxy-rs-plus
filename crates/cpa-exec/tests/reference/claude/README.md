@@ -2,7 +2,53 @@
 
 `../../../src/claude/testdata/go_executor.json` holds outputs of CLIProxyAPI at
 `6fecc6e`, produced in-process by `main.go` from the inputs in `scenarios.json` (the
-v8.0.27 goldens below use the same generator).
+v8.0.27 goldens below use the same generator). `../../../src/claude/testdata/go_unit.json`
+holds Go's own executor tests at `6fecc6e`, recorded by `unit/record.py`.
+
+## Translator commits in the recorded trees
+
+The translators to Claude follow v8.0.35 (`docs/parity-audit/upstream-v8.0.35.md`), and
+Go's executor recordings carry the translated bodies. Each recorded tree is therefore
+its reference commit with the translator commits that change those bodies
+cherry-picked on top, in a scratch clone (the reference checkout is not modified):
+
+| Recording | Tree |
+| --- | --- |
+| `go_executor.json`, `go_unit.json`, `../../fixtures/xai_go.json` | `6fecc6e` + `a881c036`, `d510dccf`, `2c1dcc7c`, `0d18d3b3` |
+| `go_executor_v8.0.27.json`, `go_unit_v8.0.27.json` | `bf93416` (v8.0.27, which already has the first three) + `0d18d3b3` |
+
+- `a881c036` and `0d18d3b3`: Responses and Chat Completions clients that send no
+  output limit get the registry's `max_tokens` for the model instead of 32000.
+  `0d18d3b3` also strips that synthesized limit from the original translation that
+  payload rules read, so a `payload.default` rule for `max_tokens` still applies
+  (Go's `TestClaudeExecutor_ChatCompletionsDefaultMaxTokensAndPayloadDefaultRule`,
+  recorded in `go_unit.json`).
+- `d510dccf`: a Gemini client's camelCase `systemInstruction` reaches Claude.
+- `2c1dcc7c`: Claude clients with a web search tool ask Codex and xAI for
+  `web_search_call.action.sources`.
+
+The first three apply cleanly to `6fecc6e`. `0d18d3b3` conflicts only where `6fecc6e`
+calls the payload rules from another place: the resolution keeps `6fecc6e`'s code,
+passes `stripTranslatedDefaultMaxTokens(from, originalPayload, originalTranslated)` to
+its `ApplyPayloadConfigWithTrackedPaths` calls in `claude_executor_execute.go` and
+`claude_executor_stream.go`, imports `sdktranslator` in `claude_executor.go`, and fixes
+the two translator tests to `6fecc6e`'s single-value converter signatures (and the
+model the upstream test switched to); that resolved commit is
+[`0d18d3b3-on-6fecc6e.patch`](0d18d3b3-on-6fecc6e.patch). On v8.0.27, `0d18d3b3`
+cherry-picks cleanly. Rebuild and check the trees with:
+
+```sh
+git checkout 6fecc6e && git cherry-pick a881c036 d510dccf 2c1dcc7c \
+  && git am /absolute/path/to/cliproxy-rs/crates/cpa-exec/tests/reference/claude/0d18d3b3-on-6fecc6e.patch
+git rev-parse 'HEAD^{tree}'   # e3c8744a1617762452581257505d5d72a12700b1
+git checkout bf93416 && git cherry-pick 0d18d3b3
+git rev-parse 'HEAD^{tree}'   # f24923ca2defe533990dd22bd29ebad6e0ee07db
+```
+
+`go test` passes for the touched translator
+packages and that executor test. Re-recording changed only `max_tokens`, the Gemini
+system text, the Codex/xAI `include` list, and the values the replays already
+normalize (dates, ports, random IDs and the CCH over them).
 
 For each scenario the generator writes the scenario's `config.yaml` and fake auth
 file, loads them with Go's `config.LoadConfig` and watcher synthesizers, and runs the
@@ -28,7 +74,7 @@ Regenerate with a temporary module inside the reference module's internal-packag
 boundary (the reference checkout is not modified):
 
 ```sh
-reference=/absolute/path/to/CLIProxyAPI   # at 6fecc6e
+reference=/absolute/path/to/CLIProxyAPI   # 6fecc6e with the commits above
 crate=/absolute/path/to/cliproxy-rs/crates/cpa-exec
 tmp=$(mktemp -d)
 cp "$crate/tests/reference/claude/main.go" "$tmp/main.go"
@@ -38,8 +84,11 @@ cp "$crate/tests/reference/claude/main.go" "$tmp/main.go"
   go mod edit -require=github.com/router-for-me/CLIProxyAPI/v8@v8.0.0
   go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v8="$reference"
   go mod tidy
-  go run . "$crate/tests/reference/claude/scenarios.json" "$crate/src/claude/testdata/go_executor.json"
+  go run . "$crate/tests/reference/claude/scenarios.json" "$crate/src/claude/testdata/go_executor.json" \
+    '6fecc6e with 0d18d3b3, a881c036, d510dccf and 2c1dcc7c'
 )
+RSFIX_REFERENCE='6fecc6e with 0d18d3b3, a881c036, d510dccf and 2c1dcc7c' \
+  python3 "$crate/tests/reference/claude/unit/record.py" "$reference" "$crate/src/claude/testdata/go_unit.json"
 ```
 
 The date in the current-date reminder is the generation date in the credential's
@@ -48,8 +97,9 @@ time zone and is recorded per scenario; the replay pins its clock to it.
 ## v8.0.27 goldens
 
 The Claude prompt-cache and prompt-shaping fixes this executor follows from v8.0.27
-(see `docs/parity-audit/upstream-v8.0.27.md`) have their own goldens, recorded from a
-v8.0.27 checkout (`bf93416`) the same way; everything else stays on `6fecc6e`.
+(see `docs/parity-audit/upstream-v8.0.35.md`) have their own goldens, recorded from a
+v8.0.27 checkout (`bf93416`, with `0d18d3b3` as above) the same way; everything else
+stays on `6fecc6e`.
 
 - `../../../src/claude/testdata/go_executor_v8.0.27.json`: this generator on
   `scenarios-v8.0.27.json`, replayed by
@@ -73,7 +123,7 @@ every other byte is compared as recorded. `6fecc6e`'s recordings of the same req
 replay unchanged.
 
 ```sh
-reference=/absolute/path/to/CLIProxyAPI   # at v8.0.27
+reference=/absolute/path/to/CLIProxyAPI   # v8.0.27 with 0d18d3b3
 crate=/absolute/path/to/cliproxy-rs/crates/cpa-exec
 tmp=$(mktemp -d)
 cp "$crate/tests/reference/claude/main.go" "$tmp/main.go"
@@ -84,19 +134,62 @@ cp "$crate/tests/reference/claude/main.go" "$tmp/main.go"
   go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v8="$reference"
   go mod tidy
   go run . "$crate/tests/reference/claude/scenarios-v8.0.27.json" \
-    "$crate/src/claude/testdata/go_executor_v8.0.27.json" v8.0.27
+    "$crate/src/claude/testdata/go_executor_v8.0.27.json" 'v8.0.27 with 0d18d3b3'
 )
-RSFIX_REFERENCE=v8.0.27 \
+RSFIX_REFERENCE='v8.0.27 with 0d18d3b3' \
 RSFIX_FILES=claude_prompt_cache_options_test.go,claude_cloaked_date_pin_test.go,claude_effort_directive_test.go,claude_executor_test.go \
 RSFIX_ONLY='^(TestClaudeExecutor_PromptCacheOptions\w*|TestClaudeExecutor_CountTokens_StripsPromptCacheOptions|TestClaudeExecutor_CountTokensUpstream_\w*|TestClaudeCloakedDateReminder(PinnedToSessionAcrossMidnight|SessionByteStability)|TestClaudeExecutor_EffortDirectiveAfterCompaction|TestClaudeExecutor_CopiedVSCodeAgentSDKHeadersWithoutMetadataAreCloaked)$' \
   python3 "$crate/tests/reference/claude/unit/record.py" "$reference" "$crate/src/claude/testdata/go_unit_v8.0.27.json"
 ```
 
-Both ran with the network denied (`unshare -rn` with loopback up), `GOTOOLCHAIN=local
+All of them ran with the network denied (`unshare -rn` with loopback up), `GOTOOLCHAIN=local
 GOPROXY=off` and Go 1.26 after a `go mod download` in each checkout. The tests left out
 of the v8.0.27 recording are those whose answers depend on v8.0.27's later move of
-payload rules to the end of the pipeline (`868e137`), which is not ported yet. One of
-them, `TestClaudeCloakedDateReminderProbeOverrideDoesNotReinitializeSessionDate`, also
-checks the date a probe keeps when a payload rule makes it an ordinary request;
-`claude::tests::declassified_probes_keep_their_own_date` checks that date instead.
+payload rules to the end of the pipeline (`868e137`); the v8.0.35 recordings below
+cover them.
 
+## v8.0.35 recordings
+
+`../../../src/claude/testdata/go_unit_v8.0.35.json` holds Go's own v8.0.35 tests whose
+answers changed with a v8.0.35 behaviour the executor follows. It is replayed by
+`claude::go_unit::v8_0_35_executor`, and the 6fecc6e recordings of the same tests are
+skipped (`SUPERSEDED` in `claude/go_unit.rs`; the 6fecc6e tests 868e137 deleted are
+in `REMOVED_IN_868E137`). It holds `TestClaudeExecutor_DisabledThinkingStripsDisplayBeta`,
+whose `thinking` object Go ad9e456d (`disableThinking`) now replaces whole, and the 868e137
+payload-barrier tests: payload rules run once, on the fully prepared body, and nothing
+repairs their result. They are replayed by `v8_0_35_executor`, `v8_0_35_mid_system_model`,
+`v8_0_35_cloaked_date_pin`, `v8_0_35_payload_barrier` and `v8_0_35_payload_review`. The
+preserved-thinking tests in the same files (911f49cb) are not recorded: that commit is not
+ported.
+
+The recording's `source` names the checkout's full commit (`git rev-parse HEAD` in the
+reference, `ae3ee3be303fb07fb8173279923413005bf32177`, with a clean worktree).
+
+```sh
+reference=/absolute/path/to/CLIProxyAPI   # at v8.0.35
+RSFIX_REFERENCE="v8.0.35 ($(git -C "$reference" rev-parse HEAD))" \
+RSFIX_FILES=claude_executor_test.go,claude_mid_system_model_test.go,claude_cloaked_date_pin_test.go,payload_barrier_test.go,payload_review_test.go \
+RSFIX_ONLY='^(TestClaudeExecutor_DisabledThinkingStripsDisplayBeta|TestClaudeExecutorPayloadOverrideDisabledThinking|TestClaudeExecutorPayloadOverrideReenablesThinking|TestClaudeExecutor_ChatCompletionsDefaultMaxTokensAndPayloadDefaultRule|TestClaudeExecutor_ExecutePayloadStreamOverrideDoesNotChangeResponseParser|TestClaudeExecutor_Payload(CustomReportingOutcomesPreservedOnRewrite|FableProbeOverrideKeepsBuiltinAdditions|FableThinkingAdaptiveToDisabledKeepsBuiltinDisplay|FableToSonnetPreservesObfuscatedBuiltins|FilterFallbacksPreservesRemovalOnFable|MaxTokensOverrideDoesNotReclassifyBuiltins|OverrideFableModelLeavesBuiltinsUnchanged|OverrideNonFableModelDoesNotInjectFableBuiltins|OverrideParentThinkingPreventsDisplayUpdates|OverridePreservesExplicitFallbacks|OverrideProbeWithExplicitDiagnosticsPreserved|OverrideRawPreservesExplicitFallbacks|ProbeToNormalDoesNotReinitializeBuiltins|ReplacesSystemOnOriginalFableWithoutReinjection|SonnetToFableDoesNotAddReporting|SonnetToFableWithSensitiveWordsDoesNotInjectReporting|StringSystemFableWinsReportingBlock|StringSystemMentioningReportingOutcomesStaysExact|StringSystemWithExactReportingPromptDoesNotDuplicate|SystemTTLOverrideKeepsBuiltinFableReporting|UnrelatedRuleLeavesBuiltinFallbacksUnchanged)|TestClaudeExecutorPayloadRepairsLegacyMidSystemMessage|TestClaudeExecutor_PayloadOverride(CannotSmuggleLegacyMidSystemMessage|DoesNotClaimMatchingCallerTurn|DoesNotRerunSystemPlacement)|TestClaudeCloakedDateReminderProbeOverrideDoesNotReinitializeSessionDate|TestPayloadBarrierClaudeDoesNotReplayFiltersOrReinjectIdentity|TestClaudePayloadConditions(EvaluateOnceAtFinalBarrier|ObserveBuiltinThinkingRemoval))$' \
+  python3 "$crate/tests/reference/claude/unit/record.py" "$reference" "$crate/src/claude/testdata/go_unit_v8.0.35.json"
+```
+
+The recorder no longer prunes `params` maps, which dropped
+`false` values; recordings made before that fix may lack `false` params.
+
+`../../../src/claude/testdata/go_executor_v8.0.35.json` runs `scenarios-v8.0.35.json`
+through v8.0.35's executor with the same `main.go` as the v8.0.27 recording (a temporary
+module whose `replace` points at the v8.0.35 checkout). It holds the 6fecc6e payload
+scenarios Go now answers differently (`FOLLOWS_V8_0_35` in `claude/tests.rs`) and two
+count_tokens scenarios with rules: upstream through OAuth and local through a gateway key.
+Three scenarios without rules (`NO_RULES_V8_0_35`) cover requests that cloaking turns
+into a probe or a helper, or out of one: Go classifies the cloaked body, so a quota
+probe whose system text becomes a role:system turn on a modern model is no longer a
+probe, a legacy model's title prompt moved into a user reminder stays a helper, and
+`max_tokens: 1` with `Hi` becomes a probe once cloaking adds `cache_control`.
+`claude::tests::v8_0_35_payload_barrier_scenarios_match_go` replays them, and checks that
+each sent body's CCH signs that body.
+
+```sh
+go run . "$crate/tests/reference/claude/scenarios-v8.0.35.json" \
+  "$crate/src/claude/testdata/go_executor_v8.0.35.json" 'v8.0.35 (ae3ee3be303fb07fb8173279923413005bf32177)'
+```

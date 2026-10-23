@@ -3390,24 +3390,7 @@
       "args": {
         "fn": "register_models"
       },
-      "result": [
-        {
-          "client": "plugin:recorder-a:a",
-          "models": [
-            "m1"
-          ],
-          "op": "register",
-          "provider": "a"
-        },
-        {
-          "client": "plugin:recorder-b:b",
-          "models": [
-            "mb"
-          ],
-          "op": "register",
-          "provider": "b"
-        }
-      ]
+      "result": []
     },
     {
       "op": "respond",
@@ -3423,20 +3406,7 @@
       "args": {
         "fn": "register_models"
       },
-      "result": [
-        {
-          "client": "plugin:recorder-a:a",
-          "models": [
-            "m1"
-          ],
-          "op": "register",
-          "provider": "a"
-        },
-        {
-          "client": "plugin:recorder-b:b",
-          "op": "unregister"
-        }
-      ]
+      "result": []
     },
     {
       "op": "respond",

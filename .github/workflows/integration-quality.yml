@@ -1,0 +1,57 @@
+name: Integration quality gates
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upstream:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: upstream ancestry and negative controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch upstream master from the original project
+        run: git fetch --no-tags https://github.com/vayungodara/cliproxy-rs.git +refs/heads/master:refs/remotes/provenance/master
+      - name: Verify exact upstream commit is contained in the integration
+        run: python3 scripts/verify_upstream.py --require-tip
+      - name: Negative-control tests must catch forged or stale provenance
+        run: python3 -m unittest discover -s scripts -p 'test_verify_upstream.py' -v
+
+  dashboard:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: dashboard behavior and checked-in build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install exactly locked UI dependencies
+        working-directory: ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: UI regression, including shell escaping and bilingual selection
+        working-directory: ui
+        run: npm test
+      - name: Strict Svelte and TypeScript diagnostics
+        working-directory: ui
+        run: npm run check
+      - name: Build both distributed dashboard formats with hard size limits
+        working-directory: ui
+        run: npm run build
+      - name: Reject missing or stale checked-in dashboard outputs
+        run: |
+          git diff --exit-code -- ui/dist ui/dist-panel ui/PANEL.md
+          test -z "$(git status --porcelain -- ui/dist ui/dist-panel ui/PANEL.md)"

@@ -15,12 +15,13 @@
 //! Edits go through `crate::json` (tidwall sjson semantics), so untouched bytes stay
 //! byte for byte.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cpa_core::config::Config;
 use http::HeaderMap;
 use serde_yaml_ng::Value as Yaml;
 
+use crate::gostr::GoStr;
 use crate::json::{self, GoValue, Kind, Res};
 
 /// One request's context for payload rules (Go's parameters to
@@ -249,7 +250,7 @@ impl Rules {
             .collect();
         let image_generation = match doc.get("multimedia").and_then(|m| m.get("disable-image-generation")) {
             Some(Yaml::Bool(true)) => ImageGeneration::All,
-            Some(Yaml::String(s)) => match s.trim().to_lowercase().as_str() {
+            Some(Yaml::String(s)) => match s.trim().go_lower().as_str() {
                 "true" | "1" | "on" | "yes" => ImageGeneration::All,
                 "chat" => ImageGeneration::Chat,
                 "passthrough" => ImageGeneration::Passthrough,
@@ -342,7 +343,7 @@ pub fn apply_tracked(
     if let Some(headers) = req.headers
         && is_codex_user_agent(headers)
         && !matches!(
-            req.target_executor.trim().to_lowercase().as_str(),
+            req.target_executor.trim().go_lower().as_str(),
             "codex" | "codex-websockets" | "codex_websockets"
         )
     {
@@ -362,11 +363,9 @@ pub fn apply_tracked(
 fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut(&str)) -> Vec<u8> {
     // Go: defaults check the original request, else the body as it entered (after the
     // Codex normalization, before image-generation stripping).
-    let source = if req.original.is_empty() {
-        out.clone()
-    } else {
-        req.original.to_vec()
-    };
+    let needs_source = !(rules.default.is_empty() && rules.default_raw.is_empty());
+    let entered = (needs_source && req.original.is_empty()).then(|| out.clone());
+    let source: &[u8] = entered.as_deref().unwrap_or(req.original);
     if strip_image_generation(rules.image_generation, req.request_path) {
         out = remove_tool_type(&out, &build_path(req.root, "tools"), "image_generation");
         out = remove_tool_choice(&out, &build_path(req.root, "tool_choice"), "image_generation");
@@ -388,15 +387,19 @@ fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut
             if full.is_empty() {
                 continue;
             }
-            for resolved in resolve_paths(&out, &full) {
-                if json::get(&source, &resolved).exists() || defaulted.contains(&resolved) {
-                    continue;
+            let targets = resolve_targets(&out, &full);
+            let in_source = in_source(source, &targets);
+            let mut n = 0;
+            each_target(&mut out, &targets, Mode::Any, |doc, path, resolved| {
+                n += 1;
+                if in_source[n - 1] || defaulted.contains(resolved) {
+                    return None;
                 }
-                if sjson_set(&mut out, &resolved, value) {
-                    defaulted.insert(resolved.clone());
-                    mark(&resolved);
-                }
-            }
+                let next = sjson_set(doc, path, value)?;
+                defaulted.insert(resolved.to_owned());
+                mark(resolved);
+                Some(next)
+            });
         }
     }
     for rule in &rules.default_raw {
@@ -408,17 +411,20 @@ fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut
             if full.is_empty() {
                 continue;
             }
-            for resolved in resolve_paths(&out, &full) {
-                if json::get(&source, &resolved).exists() || defaulted.contains(&resolved) {
-                    continue;
+            let targets = resolve_targets(&out, &full);
+            let in_source = in_source(source, &targets);
+            let mut n = 0;
+            each_target(&mut out, &targets, Mode::Any, |doc, path, resolved| {
+                n += 1;
+                if in_source[n - 1] || defaulted.contains(resolved) {
+                    return None;
                 }
-                let Some(raw) = raw_value(value) else { continue };
-                if let Ok(next) = json::try_set_raw(&out, &resolved, &raw) {
-                    out = next;
-                    defaulted.insert(resolved.clone());
-                    mark(&resolved);
-                }
-            }
+                let raw = raw_value(value)?;
+                let next = set_raw_at(doc, path, &raw)?;
+                defaulted.insert(resolved.to_owned());
+                mark(resolved);
+                Some(next)
+            });
         }
     }
     for rule in &rules.overrides {
@@ -430,11 +436,12 @@ fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut
             if full.is_empty() {
                 continue;
             }
-            for resolved in resolve_paths(&out, &full) {
-                if set_if_different(&mut out, &resolved, value) {
-                    mark(&resolved);
-                }
-            }
+            let targets = resolve_targets(&out, &full);
+            each_target(&mut out, &targets, Mode::Any, |doc, path, resolved| {
+                let next = set_if_different(doc, path, value).ok()?;
+                mark(resolved);
+                next
+            });
         }
     }
     for rule in &rules.override_raw {
@@ -447,18 +454,20 @@ fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut
                 continue;
             }
             let Some(raw) = raw_value(value) else { continue };
-            for resolved in resolve_paths(&out, &full) {
-                let current = json::get(&out, &resolved);
+            let targets = resolve_targets(&out, &full);
+            each_target(&mut out, &targets, Mode::Any, |doc, path, resolved| {
+                let current = get_at(doc, path);
                 let same = current.exists()
                     && current.indexes.as_ref().is_none_or(Vec::is_empty)
                     && current.raw() == raw.as_slice();
                 if same {
-                    mark(&resolved);
-                } else if let Ok(next) = json::try_set_raw(&out, &resolved, &raw) {
-                    out = next;
-                    mark(&resolved);
+                    mark(resolved);
+                    return None;
                 }
-            }
+                let next = set_raw_at(doc, path, &raw)?;
+                mark(resolved);
+                Some(next)
+            });
         }
     }
     for rule in &rules.filter {
@@ -470,54 +479,58 @@ fn edit(rules: &Rules, req: &Request<'_>, mut out: Vec<u8>, mark: &mut dyn FnMut
             if full.is_empty() {
                 continue;
             }
-            for resolved in resolve_paths(&out, &full).into_iter().rev() {
-                if let Ok(next) = json::try_delete(&out, &resolved) {
-                    out = next;
-                    mark(&resolved);
-                }
+            let targets = resolve_targets(&out, &full);
+            if let Some(next) = locals(&targets, Mode::Delete).and_then(|l| delete_elements(&out, &l)) {
+                out = next;
+                targets.iter().for_each(|t| mark(&t.path));
+                continue;
             }
+            // Go deletes in reverse, so earlier indexes still name the same elements. Edits
+            // inside separate elements do not depend on their order.
+            let mut targets = targets;
+            if locals(&targets, Mode::Fields).is_none() {
+                targets.reverse();
+            }
+            each_target(&mut out, &targets, Mode::Fields, |doc, path, resolved| {
+                let next = json::try_delete(doc, path).ok()?;
+                mark(resolved);
+                Some(next)
+            });
         }
     }
     out
 }
 
-/// `sjson.SetBytes(out, path, value)` for a configured value.
-fn sjson_set(out: &mut Vec<u8>, path: &str, value: &Param) -> bool {
+/// `sjson.SetBytes(doc, path, value)` for a configured value: the new document, or
+/// `None` when sjson returns an error.
+fn sjson_set(doc: &[u8], path: &str, value: &Param) -> Option<Vec<u8>> {
     match value {
-        Param::Str(s) => json::try_set_str(out, path, s),
-        other => match other.sjson_raw() {
-            Some(raw) => json::try_set_raw(out, path, raw),
-            None => return false,
-        },
+        Param::Str(s) if path.is_empty() => Some(json::stringify(s.as_bytes())),
+        Param::Str(s) => json::try_set_str(doc, path, s).ok(),
+        other => set_raw_at(doc, path, &other.sjson_raw()?),
     }
-    .map(|next| *out = next)
-    .is_ok()
 }
 
-/// Go `setPayloadValueIfDifferentTracked`: an equal value counts as applied.
-fn set_if_different(out: &mut Vec<u8>, path: &str, value: &Param) -> bool {
-    let current = json::get(out, path);
+/// Go `setPayloadValueIfDifferentTracked`: an equal value counts as applied and leaves
+/// the document as it is (`Ok(None)`); `Err` when sjson returns an error.
+fn set_if_different(doc: &[u8], path: &str, value: &Param) -> Result<Option<Vec<u8>>, ()> {
+    let current = get_at(doc, path);
     let same = match value {
         Param::Str(s) => current.kind == Kind::String && *current.str() == **s,
         Param::Bool(b) => current.kind == if *b { Kind::True } else { Kind::False },
         Param::Null => current.raw() == b"null",
         other => {
-            let Some(expected) = other.sjson_raw() else {
-                return false;
-            };
+            let expected = other.sjson_raw().ok_or(())?;
             if current.indexes.as_ref().is_none_or(Vec::is_empty) && current.raw() == expected.as_slice() {
-                return true;
+                return Ok(None);
             }
-            return match json::try_set_raw(out, path, expected) {
-                Ok(next) => {
-                    *out = next;
-                    true
-                }
-                Err(_) => false,
-            };
+            return set_raw_at(doc, path, &expected).map(Some).ok_or(());
         }
     };
-    same || sjson_set(out, path, value)
+    if same {
+        return Ok(None);
+    }
+    sjson_set(doc, path, value).map(Some).ok_or(())
 }
 
 /// Go `payloadRawValue`: strings are raw JSON as written; other values are marshaled.
@@ -550,7 +563,7 @@ fn rules_match(models: &[ModelRule], req: &Request<'_>, payload: &[u8], candidat
                 return false;
             }
             let protocol = entry.protocol.trim();
-            if !protocol.is_empty() && !req.protocol.is_empty() && !protocol.eq_ignore_ascii_case(req.protocol) {
+            if !protocol.is_empty() && !req.protocol.is_empty() && !protocol.go_eq_fold(req.protocol) {
                 return false;
             }
             from_protocol_matches(&entry.from_protocol, req.from_protocol)
@@ -582,21 +595,90 @@ fn path_matches_value(payload: &[u8], path: &str, value: &Param) -> bool {
     let Some(expected) = value.marshal().and_then(|m| GoValue::parse_f64(&m)) else {
         return false;
     };
-    resolve_paths(payload, path).iter().any(|p| {
-        let r = json::get(payload, p);
+    any_target(payload, path, |r| {
         r.exists() && GoValue::parse_f64(r.raw().trim_ascii()).is_some_and(|actual| actual == expected)
     })
 }
 
 fn path_exists(payload: &[u8], path: &str) -> bool {
-    resolve_paths(payload, path).iter().any(|p| {
-        let r = json::get(payload, p);
-        r.exists() && r.kind != Kind::Null
-    })
+    any_target(payload, path, |r| r.exists() && r.kind != Kind::Null)
+}
+
+/// Whether any resolved path's value passes `test`, reading inside each target's element.
+fn any_target(payload: &[u8], path: &str, test: impl Fn(&Res<'_>) -> bool) -> bool {
+    let targets = resolve_targets(payload, path);
+    match locals(&targets, Mode::Any) {
+        Some(locals) => locals
+            .iter()
+            .any(|l| test(&get_at(&payload[l.elem.0..l.elem.1], &l.rest))),
+        None => targets.iter().any(|t| test(&json::get(payload, &t.path))),
+    }
+}
+
+/// `gjson.GetBytes(source, path).Exists()` for each target. Each source array a target
+/// reads is parsed once, so the check stays linear in the source.
+fn in_source(source: &[u8], targets: &[Target]) -> Vec<bool> {
+    let Some(locals) = locals(targets, Mode::Any) else {
+        return targets.iter().map(|t| json::get(source, &t.path).exists()).collect();
+    };
+    // ponytail: a nested query's targets each name a different inner array, so each is
+    // located from the source's root (one get per outer element); caching the shared
+    // ancestors would make nested defaults linear too.
+    let mut bases: HashMap<&str, Base<'_>> = HashMap::new();
+    targets
+        .iter()
+        .zip(locals)
+        .map(|(t, l)| {
+            let base = bases.entry(&l.base).or_insert_with(|| match route(source, &l.base) {
+                Route::Missing => Base::Missing,
+                Route::Ambiguous => Base::Ambiguous,
+                Route::Found(bytes) => {
+                    let value = json::parse(bytes);
+                    match value.raw().first() {
+                        Some(b'[') => Base::Array(value.array()),
+                        // A numeric part reads an object key in gjson, which tries each
+                        // member with that key in turn.
+                        Some(b'{') => {
+                            let mut keys: HashMap<Vec<u8>, Vec<Res<'_>>> = HashMap::new();
+                            value.each(|k, v| {
+                                keys.entry(k.bytes().into_owned()).or_default().push(v);
+                                true
+                            });
+                            Base::Object(keys)
+                        }
+                        _ => Base::Missing,
+                    }
+                }
+            });
+            // A path through a scalar is missing, as in a whole-source get.
+            let holds = |item: &Res<'_>| {
+                l.rest.is_empty() || (matches!(item.raw().first(), Some(b'{' | b'[')) && item.get(&l.rest).exists())
+            };
+            match base {
+                Base::Missing => false,
+                Base::Array(items) => items.get(l.index).is_some_and(holds),
+                Base::Object(keys) => keys
+                    .get(l.index.to_string().as_bytes())
+                    .is_some_and(|items| items.iter().any(holds)),
+                // ponytail: O(N × source) when a key on the route is duplicated (Go has
+                // the same shape); indexing the ordered duplicate candidates once would make
+                // it linear.
+                Base::Ambiguous => json::get(source, &t.path).exists(),
+            }
+        })
+        .collect()
+}
+
+/// What the source holds at a target array's path, read once for all its targets.
+enum Base<'s> {
+    Missing,
+    Array(Vec<Res<'s>>),
+    Object(HashMap<Vec<u8>, Vec<Res<'s>>>),
+    Ambiguous,
 }
 
 fn normalize_from_protocol(p: &str) -> String {
-    match p.trim().to_lowercase().as_str() {
+    match p.trim().go_lower().as_str() {
         "openai-response" | "openai-responses" | "response" => "responses".into(),
         other => other.to_owned(),
     }
@@ -608,7 +690,7 @@ fn from_protocol_matches(pattern: &str, from: &str) -> bool {
         return true;
     }
     let from = normalize_from_protocol(from);
-    !from.is_empty() && pattern.eq_ignore_ascii_case(&from)
+    !from.is_empty() && pattern.go_eq_fold(&from)
 }
 
 fn headers_match(headers: Option<&HeaderMap>, rules: &[(String, String)]) -> bool {
@@ -626,12 +708,14 @@ fn headers_match(headers: Option<&HeaderMap>, rules: &[(String, String)]) -> boo
 }
 
 /// Go `payloadModelCandidates`: the upstream model, the client's suffix-free model and,
-/// when it has a thinking suffix, the client's model as written (case-insensitive dedup).
+/// when it has a thinking suffix, the client's model as written, deduplicated by
+/// `strings.ToLower` key (σ and ς stay distinct; `İ` and `i` collapse).
 fn model_candidates(model: &str, requested: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     let mut add = |v: &str| {
         let v = v.trim();
-        if !v.is_empty() && !out.iter().any(|c| c.eq_ignore_ascii_case(v)) {
+        if !v.is_empty() && seen.insert(v.go_lower()) {
             out.push(v.to_owned());
         }
     };
@@ -665,48 +749,354 @@ fn targets_path(path: &str, tracked: &str) -> bool {
         && (path == tracked || path.starts_with(&format!("{tracked}.")) || tracked.starts_with(&format!("{path}.")))
 }
 
+/// A resolved rule path. When the path went through a `#(...)` query, `elem` is the byte
+/// range (in the body it was resolved against) of the array element the last query
+/// selected, `rest` the path inside that element, `array` the range of the array holding
+/// it, and `base` and `index` the array's path and the element's position in it.
+struct Target {
+    path: String,
+    local: Option<Local>,
+}
+
+#[derive(Clone)]
+struct Local {
+    /// The route from the body's root to the element has one candidate at every level,
+    /// so reading inside the element finds what gjson finds from the root.
+    unique: bool,
+    elem: (usize, usize),
+    /// The element is an object or array; a path inside a scalar reads nothing.
+    container: bool,
+    rest: String,
+    array: (usize, usize),
+    base: String,
+    index: usize,
+}
+
+/// A path part gjson and sjson read the same at any depth: a plain key or index. A
+/// leading `:` is a key to gjson but forces an object key in sjson.
+fn plain(part: &str) -> bool {
+    !part.is_empty() && !part.bytes().any(|c| b"|@*?#\\!=<>%:".contains(&c))
+}
+
+/// Where a plain path leads in `doc`, when gjson cannot read it differently.
+enum Route<'d> {
+    /// No candidate at some level, so gjson finds nothing either.
+    Missing,
+    /// The value's bytes, a slice of `doc`.
+    Found(&'d [u8]),
+    /// A part that is not plain, a duplicate key (gjson tries each in turn), or a
+    /// part an array does not read as a plain index: read the full path from the root.
+    Ambiguous,
+}
+
+/// Walks `path` through `doc` one level at a time, visiting each container on the route
+/// once. An empty path is the document.
+fn route<'d>(doc: &'d [u8], path: &str) -> Route<'d> {
+    let mut cur = doc;
+    if path.is_empty() {
+        return Route::Found(cur);
+    }
+    for part in path.split('.') {
+        if !plain(part) {
+            return Route::Ambiguous;
+        }
+        let value = json::parse(cur);
+        let mut found = None;
+        let mut ambiguous = false;
+        match value.raw().first() {
+            Some(b'{') => value.each(|k, v| {
+                if *k.bytes() == *part.as_bytes() {
+                    ambiguous |= found.is_some();
+                    found = Some(v);
+                }
+                !ambiguous
+            }),
+            Some(b'[') => {
+                if !part.bytes().all(|c| c.is_ascii_digit()) || (part.len() > 1 && part.starts_with('0')) {
+                    return Route::Ambiguous;
+                }
+                // gjson's parseUint wraps past u64::MAX; the full-path read does too.
+                let Ok(i) = part.parse::<usize>() else {
+                    return Route::Ambiguous;
+                };
+                found = value.array().into_iter().nth(i);
+            }
+            _ => return Route::Missing,
+        }
+        if ambiguous {
+            return Route::Ambiguous;
+        }
+        let Some(v) = found else { return Route::Missing };
+        // Indexes count from the start of `cur`.
+        match cur.get(v.index..v.index + v.raw().len()) {
+            Some(bytes) if bytes == v.raw() => cur = bytes,
+            _ => return Route::Ambiguous,
+        }
+    }
+    Route::Found(cur)
+}
+
 /// Go `resolvePayloadRulePaths`: `#(query)` and `#(query)#` segments become the matching
-/// array indexes; other paths are used as written.
-fn resolve_paths(payload: &[u8], path: &str) -> Vec<String> {
+/// array indexes; other paths are used as written. Arrays are read inside the element
+/// the previous query selected, so a nested query reads each element once.
+fn resolve_targets(payload: &[u8], path: &str) -> Vec<Target> {
     let path = path.trim();
     if path.is_empty() {
         return Vec::new();
     }
     if !path.contains("#(") {
-        return vec![path.to_owned()];
+        return vec![Target {
+            path: path.to_owned(),
+            local: None,
+        }];
     }
-    let mut paths = vec![String::new()];
+    let mut targets = vec![Target {
+        path: String::new(),
+        local: None,
+    }];
     for part in split_path(path) {
         let Some((query, all)) = query_part(part) else {
-            paths.iter_mut().for_each(|p| *p = join(p, part));
+            for t in &mut targets {
+                t.path = join(&t.path, part);
+                if let Some(local) = &mut t.local {
+                    local.rest = join(&local.rest, part);
+                }
+            }
             continue;
         };
         let mut next = Vec::new();
-        for base in &paths {
-            let array = if base.is_empty() {
-                json::parse(payload)
-            } else {
-                json::get(payload, base)
+        for t in &targets {
+            // Read the array inside the element the previous query selected only when
+            // gjson's search from the root could not go anywhere else: every part is
+            // plain and every level on the route has one candidate. Otherwise (a
+            // wildcard or duplicate key before it) gjson moves on to the next candidate
+            // when the rest is missing, so read the full path from the root.
+            let routed = match &t.local {
+                Some(l) if l.unique && (l.rest.is_empty() || l.container) => {
+                    route(&payload[l.elem.0..l.elem.1], &l.rest)
+                }
+                Some(_) => Route::Ambiguous,
+                None => route(payload, &t.path),
+            };
+            let (array, offset, unique) = match routed {
+                Route::Missing => continue,
+                Route::Found(bytes) => {
+                    let offset = bytes.as_ptr() as usize - payload.as_ptr() as usize;
+                    (json::parse(bytes), offset, true)
+                }
+                Route::Ambiguous if t.path.is_empty() => (json::parse(payload), 0, false),
+                Route::Ambiguous => (json::get(payload, &t.path), 0, false),
             };
             if !array.is_array() {
                 continue;
             }
+            let located = matches!(array.raw, std::borrow::Cow::Borrowed(_))
+                && payload.get(offset + array.index..offset + array.index + array.raw().len()) == Some(array.raw());
             for (index, item) in array.array().iter().enumerate() {
                 if !query_matches(item, query) {
                     continue;
                 }
-                next.push(join(base, &index.to_string()));
+                let start = offset + item.index;
+                let path = join(&t.path, &index.to_string());
+                let local =
+                    (located && payload.get(start..start + item.raw().len()) == Some(item.raw())).then(|| Local {
+                        unique,
+                        elem: (start, start + item.raw().len()),
+                        container: matches!(item.raw().first(), Some(b'{' | b'[')),
+                        rest: String::new(),
+                        array: (offset + array.index, offset + array.index + array.raw().len()),
+                        base: t.path.clone(),
+                        index,
+                    });
+                next.push(Target { path, local });
                 if !all {
                     break;
                 }
             }
         }
-        paths = next;
-        if paths.is_empty() {
-            return paths;
+        targets = next;
+        if targets.is_empty() {
+            return targets;
         }
     }
-    paths
+    targets
+}
+
+/// Which element-local targets a batch takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Whole elements only (filters that delete elements).
+    Delete,
+    /// Paths inside elements only (filters that delete fields).
+    Fields,
+    /// Whole elements and paths inside elements (setters and reads).
+    Any,
+}
+
+/// Element-local targets, in body order and disjoint, when the edit of each touches only
+/// its own element; `None` when the edits must run one by one on the whole body.
+fn locals(targets: &[Target], mode: Mode) -> Option<Vec<&Local>> {
+    if targets.len() < 2 {
+        return None;
+    }
+    let mut out: Vec<&Local> = Vec::with_capacity(targets.len());
+    for t in targets {
+        let l = t.local.as_ref()?;
+        let whole = l.rest.is_empty();
+        let fits = match mode {
+            Mode::Delete => whole,
+            Mode::Fields => !whole,
+            Mode::Any => true,
+        };
+        // The whole resolved path must be plain: sjson refuses a complex path (a
+        // wildcard before the query included) on the whole body. A path inside a
+        // scalar reads nothing in gjson, while the scalar's own bytes may parse.
+        if !fits || !l.unique || !(whole || l.container) || !t.path.split('.').all(plain) {
+            return None;
+        }
+        // sjson's delete reads an unforced `-1` key as the last element (`Get("#")`),
+        // even in an object, so a delete under one may land outside this element.
+        if mode != Mode::Any && l.base.split('.').any(|p| p == "-1") {
+            return None;
+        }
+        if out.last().is_some_and(|prev| prev.elem.1 > l.elem.0) {
+            return None;
+        }
+        out.push(l);
+    }
+    Some(out)
+}
+
+/// `gjson.GetBytes(doc, path)`, where an empty path (a whole element) is the document.
+fn get_at<'d>(doc: &'d [u8], path: &str) -> Res<'d> {
+    if path.is_empty() {
+        json::parse(doc)
+    } else {
+        json::get(doc, path)
+    }
+}
+
+/// `sjson.SetRawBytes(doc, path, raw)`; an existing element's whole path replaces it.
+fn set_raw_at(doc: &[u8], path: &str, raw: &[u8]) -> Option<Vec<u8>> {
+    if path.is_empty() {
+        return Some(raw.to_vec());
+    }
+    json::try_set_raw(doc, path, raw).ok()
+}
+
+/// Runs `op(doc, path, full_path)` for each target in order, as Go's loop over the
+/// resolved paths does. `op` returns the edited document. A target inside an array
+/// element edits only that element (sjson recurses into the element's bytes), so `op`
+/// runs on the element and the edited elements are joined in one pass over the body.
+fn each_target(
+    out: &mut Vec<u8>,
+    targets: &[Target],
+    mode: Mode,
+    mut op: impl FnMut(&[u8], &str, &str) -> Option<Vec<u8>>,
+) {
+    let Some(locals) = locals(targets, mode) else {
+        // ponytail: O(N × body) when a key on the rule's route is duplicated (Go has the
+        // same shape); indexing the ordered duplicate candidates once, separately for
+        // gjson reads and sjson edits, would make it linear.
+        for t in targets {
+            if let Some(next) = op(out, &t.path, &t.path) {
+                *out = next;
+            }
+        }
+        return;
+    };
+    let mut next = Vec::with_capacity(out.len());
+    let mut at = 0;
+    for (t, l) in targets.iter().zip(locals) {
+        let elem = &out[l.elem.0..l.elem.1];
+        next.extend_from_slice(&out[at..l.elem.0]);
+        match op(elem, &l.rest, &t.path) {
+            Some(edited) => next.extend_from_slice(&edited),
+            None => next.extend_from_slice(elem),
+        }
+        at = l.elem.1;
+    }
+    next.extend_from_slice(&out[at..]);
+    *out = next;
+}
+
+/// sjson's `DeleteBytes` of whole array elements, in Go's reverse order, in one pass.
+/// Deleting element `k > 0` removes the comma before it, the whitespace after that
+/// comma, and the element. Deleting element 0 (last, after the others) removes the
+/// element and, when an element is left after it, everything up to and including the
+/// next comma. `None` when the array's gaps are not plain whitespace and commas.
+fn delete_elements(out: &[u8], locals: &[&Local]) -> Option<Vec<u8>> {
+    let mut next = Vec::with_capacity(out.len());
+    let mut at = 0;
+    let mut i = 0;
+    while i < locals.len() {
+        let array = locals[i].array;
+        let group = locals[i..].iter().take_while(|l| l.array == array).count();
+        let deleted: HashSet<usize> = locals[i..i + group].iter().map(|l| l.index).collect();
+        next.extend_from_slice(&out[at..array.0]);
+        next.extend_from_slice(&delete_in_array(&out[array.0..array.1], &deleted)?);
+        at = array.1;
+        i += group;
+    }
+    next.extend_from_slice(&out[at..]);
+    Some(next)
+}
+
+fn delete_in_array(raw: &[u8], deleted: &HashSet<usize>) -> Option<Vec<u8>> {
+    let items = json::parse(raw).array();
+    let spans: Vec<(usize, usize)> = items.iter().map(|it| (it.index, it.index + it.raw().len())).collect();
+    if spans.is_empty() || raw.first() != Some(&b'[') || raw.last() != Some(&b']') {
+        return None;
+    }
+    // gap(i): the bytes before element i (after '[' for i = 0), split at its comma.
+    let gap = |i: usize| -> Option<(&[u8], &[u8])> {
+        let from = if i == 0 { 1 } else { spans[i - 1].1 };
+        let g = raw.get(from..spans[i].0)?;
+        let commas = g.iter().filter(|&&c| c == b',').count();
+        if g.iter().any(|&c| c > b' ' && c != b',') || commas != usize::from(i > 0) {
+            return None;
+        }
+        Some(match g.iter().position(|&c| c == b',') {
+            Some(c) => (&g[..c], &g[c + 1..]),
+            None => (g, &[][..]),
+        })
+    };
+    let tail = raw.get(spans[spans.len() - 1].1..raw.len() - 1)?;
+    if tail.iter().any(|&c| c > b' ') {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    out.push(b'[');
+    out.extend_from_slice(gap(0)?.0);
+    let first_kept = (0..spans.len()).find(|i| !deleted.contains(i));
+    let start = match first_kept {
+        Some(j) if j > 0 && deleted.contains(&0) => {
+            // Element 0's deletion ran past the leftover whitespace to j's comma.
+            for k in 1..j {
+                gap(k)?;
+            }
+            out.extend_from_slice(gap(j)?.1);
+            j
+        }
+        _ => 0,
+    };
+    for i in start..spans.len() {
+        let (before, after) = gap(i)?;
+        if i > start {
+            out.extend_from_slice(before);
+        }
+        if deleted.contains(&i) {
+            continue;
+        }
+        if i > start {
+            out.push(b',');
+            out.extend_from_slice(after);
+        }
+        out.extend_from_slice(&raw[spans[i].0..spans[i].1]);
+    }
+    out.extend_from_slice(tail);
+    out.push(b']');
+    Some(out)
 }
 
 fn join(path: &str, part: &str) -> String {
@@ -850,12 +1240,11 @@ fn remove_tool_type(payload: &[u8], tools_path: &str, tool_type: &str) -> Vec<u8
 fn remove_tool_choice(payload: &[u8], path: &str, tool_type: &str) -> Vec<u8> {
     let choice = json::get(payload, path);
     let delete = match choice.kind {
-        Kind::String => choice.str().trim().eq_ignore_ascii_case(tool_type),
+        Kind::String => choice.str().trim().go_eq_fold(tool_type),
         Kind::Json => {
             let kind = choice.get("type").str().trim().to_owned();
-            kind.eq_ignore_ascii_case(tool_type)
-                || (kind.eq_ignore_ascii_case("tool")
-                    && choice.get("name").str().trim().eq_ignore_ascii_case(tool_type))
+            kind.go_eq_fold(tool_type)
+                || (kind.go_eq_fold("tool") && choice.get("name").str().trim().go_eq_fold(tool_type))
         }
         _ => false,
     };
@@ -905,16 +1294,28 @@ pub fn is_codex_user_agent(headers: &HeaderMap) -> bool {
         .iter()
         .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
         .find(|v| !v.is_empty())
-        .is_some_and(|ua| ua.to_lowercase().contains("codex"))
+        .is_some_and(|ua| ua.go_lower().contains("codex"))
 }
 
-/// Codex client tools whose `number` parameters Codex deserializes as integers.
+/// `codexClientToolIntegerFields` and `matchCodexTargetTool`: the Codex client tools
+/// whose `number` parameters Codex deserializes as integers. Fields are paths under
+/// `parameters.properties`, not recursive names. A namespaced tool arrives as
+/// `namespace__name`.
 fn codex_integer_fields(tool: &str) -> &'static [&'static str] {
     let base = tool.trim();
     let base = base
         .strip_prefix("functions__")
         .or_else(|| base.strip_prefix("collab__"))
         .unwrap_or(base);
+    let base = match base {
+        "multi_agent_v1__wait_agent" | "collaboration__wait_agent" => "wait_agent",
+        "collaboration__get_channels"
+        | "collaboration__list_threads"
+        | "collaboration__search_posts"
+        | "collaboration__read_thread"
+        | "collaboration__read_post" => &base["collaboration__".len()..],
+        other => other,
+    };
     match base {
         "exec_command" => &["yield_time_ms", "max_output_tokens", "timeout_ms"],
         "write_stdin" => &["session_id", "yield_time_ms", "max_output_tokens"],
@@ -922,7 +1323,35 @@ fn codex_integer_fields(tool: &str) -> &'static [&'static str] {
         "wait_agent" => &["timeout_ms"],
         "wait" => &["yield_time_ms", "max_tokens"],
         "tool_search" => &["limit"],
-        "test_sync_tool" => &["sleep_before_ms", "sleep_after_ms", "participants", "timeout_ms"],
+        "test_sync_tool" => &[
+            "sleep_before_ms",
+            "sleep_after_ms",
+            "participants",
+            "timeout_ms",
+            "barrier.properties.participants",
+            "barrier.properties.timeout_ms",
+        ],
+        "create_goal" => &["token_budget"],
+        "get_channels" | "history__list_windows" | "history__search_contents" => &["limit"],
+        "list_threads" | "search_posts" | "read_thread" => &["limit", "max_chars_per_post"],
+        "read_post" | "history__read_item" => &["offset_chars", "limit_chars"],
+        "memories__list" | "notes__list_files_by_prefix" => &["max_results"],
+        "memories__read" => &["line_offset", "max_lines"],
+        "memories__search" => &["context_lines", "max_results"],
+        "history__list_items" => &["limit", "max_chars_per_item"],
+        // Codex declares signed line numbers in the first nullable union branch.
+        "notes__read_file" => &["start_line", "stop_line", "start_line.anyOf.0", "stop_line.anyOf.0"],
+        "notes__search_contents" => &["max_matches_per_file", "max_files"],
+        "image_gen__imagegen" => &["num_last_images_to_include"],
+        "web__run" => &[
+            "search_query.items.properties.recency",
+            "image_query.items.properties.recency",
+            "open.items.properties.lineno",
+            "click.items.properties.id",
+            "screenshot.items.properties.pageno",
+            "weather.items.properties.duration",
+            "sports.items.properties.num_games",
+        ],
         _ => &[],
     }
 }
@@ -937,7 +1366,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
         return body;
     }
     let tools = json::get(&body, "tools");
-    if let Some(updated) = normalize_tool_array(&tools)
+    if let Some(updated) = normalize_tool_array(&tools, "")
         && let Ok(next) = json::try_set_raw(&body, "tools", updated)
     {
         body = next;
@@ -948,7 +1377,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
             if *item.get("type").str() != *"additional_tools" {
                 continue;
             }
-            if let Some(updated) = normalize_tool_array(&item.get("tools"))
+            if let Some(updated) = normalize_tool_array(&item.get("tools"), "")
                 && let Ok(next) = json::try_set_raw(&body, &format!("input.{index}.tools"), updated)
             {
                 body = next;
@@ -959,7 +1388,7 @@ pub fn normalize_codex_tool_integer_types(body: &[u8], headers: &HeaderMap) -> V
 }
 
 /// Rewrites changed elements of a tool array, copying the bytes between them verbatim.
-fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
+fn normalize_tool_array(tools: &Res<'_>, namespace: &str) -> Option<Vec<u8>> {
     if !tools.is_array() {
         return None;
     }
@@ -967,7 +1396,7 @@ fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
     let mut out: Option<Vec<u8>> = None;
     let mut offset = 0;
     for tool in tools.array() {
-        let Some(updated) = normalize_tool(&tool) else {
+        let Some(updated) = normalize_tool(&tool, namespace) else {
             continue;
         };
         let start = tool.index.saturating_sub(tools.index);
@@ -981,16 +1410,21 @@ fn normalize_tool_array(tools: &Res<'_>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
+fn normalize_tool(tool: &Res<'_>, namespace: &str) -> Option<Vec<u8>> {
     let mut raw = tool.raw().to_vec();
     if *tool.get("type").str() == *"namespace" {
-        let updated = normalize_tool_array(&tool.get("tools"))?;
+        // One namespace level; its name qualifies the nested tools.
+        let name = tool.get("name").str().into_owned();
+        if !namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+        let updated = normalize_tool_array(&tool.get("tools"), &name)?;
         return json::try_set_raw(&raw, "tools", updated).ok();
     }
     for key in ["function_declarations", "functionDeclarations"] {
         let decls = tool.get(key);
         if decls.is_array() {
-            let updated = normalize_tool_array(&decls)?;
+            let updated = normalize_tool_array(&decls, namespace)?;
             return json::try_set_raw(&raw, key, updated).ok();
         }
     }
@@ -1017,6 +1451,9 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
             return None;
         }
     }
+    if !namespace.is_empty() {
+        name = format!("{namespace}__{name}");
+    }
     let fields = codex_integer_fields(&name);
     if fields.is_empty() {
         return None;
@@ -1028,8 +1465,8 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
         return None;
     }
     for field in fields {
-        let kind = properties.get(&escape_key(field)).get("type");
-        let path = format!("properties.{}.type", escape_key(field));
+        let kind = properties.get(field).get("type");
+        let path = format!("properties.{field}.type");
         if kind.kind == Kind::String && *kind.str() == *"number" {
             changed |= json::set_str(&mut updated, &path, "integer");
         } else if kind.is_array() {
@@ -1055,9 +1492,4 @@ fn normalize_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
     }
     raw = json::try_set_raw(&raw, path, updated).ok()?;
     Some(raw)
-}
-
-/// Go `escapeCodexSjsonKey`.
-fn escape_key(key: &str) -> String {
-    key.replace('\\', "\\\\").replace('.', "\\.").replace(':', "\\:")
 }

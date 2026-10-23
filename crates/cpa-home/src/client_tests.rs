@@ -2,6 +2,7 @@
 //! `tests/fixtures/go_home_golden.json`, produced by running Go's internal/home code
 //! (see `tests/fixtures/README.md`).
 
+use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -297,7 +298,7 @@ fn subscription_parameters_match_go_per_recovery_state() {
 /// Runs one operation against a fake answering like Go's golden harness.
 async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
     let reply = |args: &[String]| -> Reply {
-        let first = args[0].to_lowercase();
+        let first = args[0].go_lower();
         match first.as_str() {
             "ping" => fake::raw("+PONG\r\n"),
             _ => fake::raw("+OK\r\n"),
@@ -904,7 +905,7 @@ fn lifecycle_config_is_validated_before_use() {
 
 /// A fake Home serving one subscriber lifetime.
 async fn subscriber_home(ack: &'static str, ping_ok: Arc<AtomicUsize>) -> FakeHome {
-    FakeHome::start(move |args| match args[0].to_lowercase().as_str() {
+    FakeHome::start(move |args| match args[0].go_lower().as_str() {
         "get" => fake::bulk("port: 1\n"),
         "subscribe" => fake::raw(ack),
         "ping" => {
@@ -1143,7 +1144,7 @@ fn membership_errors_classify_like_go() {
 /// Go `TestClientLPushInFlightSnapshotErrorKeepsHeartbeat`.
 #[tokio::test]
 async fn a_failed_snapshot_push_keeps_the_heartbeat() {
-    let home = FakeHome::start(|args| match args[0].to_lowercase().as_str() {
+    let home = FakeHome::start(|args| match args[0].go_lower().as_str() {
         "lpush" => fake::raw("-ERR unavailable\r\n"),
         _ => fake::raw("+PONG\r\n"),
     })

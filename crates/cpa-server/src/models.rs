@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use cpa_common::gostr::GoStr;
+use cpa_core::exec::Caller;
 use serde_json::{Map, Value, json};
 
 use crate::registry::Spec;
@@ -19,7 +21,22 @@ const CLAUDE_MAX_OUTPUT: i64 = 64_000;
 /// clients (any `client_version` query key) the Codex client catalog, Anthropic clients
 /// (an `Anthropic-Version` header or a `claude-cli` User-Agent) the Anthropic catalog, and
 /// everyone else the OpenAI one.
-pub async fn unified(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri, headers: HeaderMap) -> Response {
+pub async fn unified(
+    State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<Caller>,
+    uri: OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    list(rt, caller, uri, headers, None).await
+}
+
+async fn list(
+    rt: Arc<Runtime>,
+    caller: Caller,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    detail: Option<&str>,
+) -> Response {
     let header = |name: &str| {
         headers
             .get(name)
@@ -30,10 +47,8 @@ pub async fn unified(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalU
     let disable_cloaking = || {
         rt.config()
             .document
-            .get("oauth")
-            .and_then(|o| o.get("providers"))
-            .and_then(|p| p.get("claude"))
-            .and_then(|c| c.get("claude-code"))
+            .get("upstream")
+            .and_then(|u| u.get("claude"))
             .and_then(|c| c.get("disable-cloaking-model-list"))
             .and_then(serde_yaml_ng::Value::as_bool)
             .unwrap_or(false)
@@ -42,7 +57,8 @@ pub async fn unified(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalU
     let intercept = |source: &'static str, response: Response| {
         let rt = rt.clone();
         let headers = headers.clone();
-        async move { crate::plugins::interceptors::model_list(&rt, source, &headers, response).await }
+        let caller = caller.clone();
+        async move { crate::plugins::interceptors::model_list(&rt, &caller, source, &headers, response, detail).await }
     };
     // Go Home mode: the catalog Home answers for this client.
     if let Some(remote) = rt.remote_dispatch() {
@@ -50,7 +66,7 @@ pub async fn unified(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalU
             Ok(entries) => entries,
             Err(response) => return *response,
         };
-        let grok_shell = header("user-agent").is_some_and(|ua| ua.to_lowercase().contains("grok-shell"));
+        let grok_shell = header("user-agent").is_some_and(|ua| ua.go_lower().contains("grok-shell"));
         // ponytail: Go builds the Codex client catalog (`client_version`) from Home's
         // model IDs with its template metadata; here such clients get the OpenAI list.
         let (source, body) = if grok_shell {
@@ -83,6 +99,75 @@ pub async fn unified(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalU
         )
     };
     intercept(source, respond::gin_json(200, body)).await
+}
+
+/// `GET /v1/models/*model`: the entry for `model` from the catalog `GET /v1/models` would
+/// answer this client, after plugin interceptors (Go `ModelDetailIDContextKey`).
+pub async fn detail(
+    State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<Caller>,
+    model: Option<Path<String>>,
+    uri: OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    let id = model.map(|Path(model)| model).unwrap_or_default();
+    list(rt, caller, uri, headers, Some(&id)).await
+}
+
+/// Go `WriteModelListResponse` with a detail ID: the first entry of `data`, then
+/// `models`, whose `id` (or `slug` when the ID is empty) equals `id`, as its raw bytes.
+/// `Err` when the catalog does not decode as Go's `{data, models []json.RawMessage}`.
+pub(crate) fn select_detail<'a>(body: &'a [u8], id: &str) -> Result<Option<&'a [u8]>, ()> {
+    use cpa_common::json::{self, Kind};
+    // encoding/json: a key matches a field case-insensitively, each match is decoded in
+    // document order (so the last one wins), and one mismatched type fails the decode.
+    fn fields<'a>(object: &'a [u8], names: [&str; 2], mut f: impl FnMut(usize, &'a [u8])) {
+        json::object_members(object, |key, _, value| {
+            if let Some(key) = json::go_unquote(&[b"\"", key, b"\""].concat()) {
+                (0..2).filter(|&i| key.go_eq_fold(names[i])).for_each(|i| f(i, value));
+            }
+            true
+        });
+    }
+    if !json::std_valid(body) {
+        return Err(());
+    }
+    let top = json::parse(body);
+    if top.kind == Kind::Null {
+        return Ok(None);
+    }
+    if !top.is_object() {
+        return Err(());
+    }
+    let (mut lists, mut mismatched) = ([None, None], false);
+    fields(body, ["data", "models"], |i, value| match json::parse(value) {
+        items if items.is_array() => lists[i] = Some(items),
+        items if items.kind == Kind::Null => lists[i] = None,
+        _ => mismatched = true,
+    });
+    if mismatched {
+        return Err(());
+    }
+    for item in lists.iter().flatten().flat_map(|list| list.array()) {
+        let std::borrow::Cow::Borrowed(raw) = item.raw else {
+            continue;
+        };
+        if !item.is_object() {
+            continue;
+        }
+        // A string sets the field and null leaves it alone; anything else fails the entry.
+        let (mut found, mut mismatched) = ([String::new(), String::new()], false);
+        fields(raw, ["id", "slug"], |i, value| match json::go_unquote(value) {
+            Some(text) => found[i] = text,
+            None => mismatched |= value != b"null",
+        });
+        let [entry_id, slug] = found;
+        let entry_id = if entry_id.is_empty() { slug } else { entry_id };
+        if !mismatched && !entry_id.is_empty() && entry_id == id {
+            return Ok(Some(raw));
+        }
+    }
+    Ok(None)
 }
 
 /// Go `c.Request.URL.Query()[key]` present, with `c.Query(key)`'s first value.
@@ -263,6 +348,7 @@ fn gemini_entry(m: &Spec) -> Map<String, Value> {
 /// `GET /v1beta/models` (Go `GeminiModels`).
 pub async fn gemini_list(
     State(rt): State<Arc<Runtime>>,
+    Extension(caller): Extension<Caller>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
@@ -272,7 +358,7 @@ pub async fn gemini_list(
             Ok(entries) => {
                 let models: Vec<Value> = entries.iter().map(crate::home_models::gemini).collect();
                 let response = respond::gin_json(200, gojson::sorted(&json!({ "models": models })));
-                crate::plugins::interceptors::model_list(&rt, "gemini", &headers, response).await
+                crate::plugins::interceptors::model_list(&rt, &caller, "gemini", &headers, response, None).await
             }
             Err(response) => *response,
         };
@@ -301,7 +387,7 @@ pub async fn gemini_list(
         })
         .collect();
     let response = respond::gin_json(200, gojson::sorted(&json!({ "models": models })));
-    crate::plugins::interceptors::model_list(&rt, "gemini", &headers, response).await
+    crate::plugins::interceptors::model_list(&rt, &caller, "gemini", &headers, response, None).await
 }
 
 /// `GET /v1beta/models/*action` (Go `GeminiGetHandler`).
@@ -381,5 +467,39 @@ mod tests {
             claude_list([&spec, &claude].into_iter(), false),
             r#"{"data":[{"display_name":"A","id":"claude-a","max_input_tokens":10,"max_tokens":64000,"object":"model","owned_by":"anthropic","type":"model"},{"created_at":"1970-01-01T00:00:05Z","display_name":"B","id":"claude-fable-5-dd-x-tpg","max_input_tokens":200000,"max_tokens":64000,"object":"model","owned_by":"openai","type":"model"}],"first_id":"claude-a","has_more":false,"last_id":"claude-fable-5-dd-x-tpg"}"#
         );
+    }
+
+    /// Go `WriteModelListResponse`'s detail selection, recorded with encoding/json (Go
+    /// 1.26): keys fold, the last match wins, a mistyped field fails its whole decode.
+    #[test]
+    fn detail_selection_decodes_the_catalog_like_go() {
+        for (body, id, want) in [
+            (
+                r#"{"Data":[{"id":"a" , "n":1.50}]}"#,
+                "a",
+                Ok(Some(r#"{"id":"a" , "n":1.50}"#)),
+            ),
+            (r#"{"data":[{"id":"a"}],"DATA":null}"#, "a", Ok(None)),
+            (r#"{"data":"x","models":[{"id":"a"}]}"#, "a", Err(())),
+            (
+                r#"{"data":[{"id":1},{"ID":"a","id":null}]}"#,
+                "a",
+                Ok(Some(r#"{"ID":"a","id":null}"#)),
+            ),
+            (
+                r#"{"models":[{"id":"","slug":"s"}],"data":[{"slug":"s","id":"t"}]}"#,
+                "s",
+                Ok(Some(r#"{"id":"","slug":"s"}"#)),
+            ),
+            (r#"{"data":[{"id":"a","slug":7}]}"#, "a", Ok(None)),
+            ("[]", "a", Err(())),
+            ("null", "a", Ok(None)),
+            (r#"{"data":[{"id":"\u0061"}]}"#, "a", Ok(Some(r#"{"id":"\u0061"}"#))),
+            (r#"{"data":[{"id":"k"}]}"#, "\u{212a}", Ok(None)),
+            (r#"{"dat\u0061":[{"id":"a"}]}"#, "a", Ok(Some(r#"{"id":"a"}"#))),
+        ] {
+            let got = select_detail(body.as_bytes(), id).map(|e| e.map(|e| std::str::from_utf8(e).unwrap()));
+            assert_eq!(got, want, "{body}");
+        }
     }
 }

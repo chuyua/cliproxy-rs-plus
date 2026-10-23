@@ -225,6 +225,9 @@ impl PostgresStore {
                             .map_err(|e| anyhow!("postgres store: copy example config: {e:#}"))?;
                     }
                 }
+                // As the object store: never seed a plaintext management secret.
+                cpa_core::config::prepare_for_upload(&self.config_path)
+                    .map_err(|e| anyhow!("postgres store: prepare local config for seeding: {e:#}"))?;
                 let data =
                     std::fs::read(&self.config_path).map_err(|e| anyhow!("postgres store: read local config: {e}"))?;
                 self.upsert_config(&data).await

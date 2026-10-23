@@ -18,6 +18,7 @@ use std::sync::{LazyLock, RwLock};
 use serde_json::{Map, Value};
 
 use super::ModelInfo;
+use crate::gostr::GoStr;
 
 const EMBEDDED: &[u8] = include_bytes!("devin_models.json");
 const BUILTIN_SWE16_SLOW_ID: &str = "devin/swe-1-6-slow";
@@ -317,12 +318,12 @@ fn builtin_swe16_slow() -> Model {
 /// (case-insensitive) and are appended at the end.
 fn with_builtins(models: Vec<Model>) -> Vec<Model> {
     let builtin = builtin_swe16_slow();
-    let key = builtin.id.to_lowercase();
+    let key = builtin.id.go_lower();
     let mut out: Vec<Model> = models
         .into_iter()
         .filter(|m| {
             let id = m.id.trim();
-            !id.is_empty() && id.to_lowercase() != key
+            !id.is_empty() && id.go_lower() != key
         })
         .collect();
     out.push(builtin);
@@ -538,6 +539,11 @@ pub fn split_model_id(clean: &str) -> (String, String) {
 }
 
 /// `cleanDevinDisplayName`: strips effort words from the end, repeatedly.
+/// ponytail: matches suffixes with ASCII lowercasing, a parity limit for non-ASCII
+/// names. Go compares `strings.ToLower` forms, then cuts the original by the suffix's
+/// byte length: it turns "X MİNİMAL" into "X M", and for "X ThİnKİng" it cuts inside
+/// U+0130 and yields invalid UTF-8, which a Rust `String` cannot hold. Upgrade path:
+/// compare `go_lower` forms and reproduce Go's byte cut where it lands on a char boundary.
 fn clean_display_name(name: &str) -> String {
     let mut trimmed = name.trim().to_owned();
     loop {
@@ -580,7 +586,7 @@ fn aggregate(models: Vec<Model>) -> Vec<Model> {
     let mut order: Vec<(Model, Vec<String>)> = Vec::new();
     for m in models {
         let clean = m.id.trim();
-        let clean = clean.strip_prefix("devin/").unwrap_or(clean).to_lowercase();
+        let clean = clean.strip_prefix("devin/").unwrap_or(clean).go_lower();
         let (mut base, effort) = split_model_id(&clean);
         if base.is_empty() {
             base.clone_from(&clean);
@@ -675,10 +681,10 @@ fn sanitize(models: Vec<Option<Model>>) -> Result<Vec<Model>, String> {
         if id.is_empty() {
             return Err(format!("model at index {i} has empty id"));
         }
-        if !id.to_lowercase().starts_with("devin/") {
+        if !id.go_lower().starts_with("devin/") {
             id = format!("devin/{id}");
         }
-        let id = id.to_lowercase();
+        let id = id.go_lower();
         if !seen.insert(id.clone()) {
             return Err(format!("duplicate model id: {}", go_quote(&id)));
         }
@@ -805,7 +811,7 @@ impl Store {
     /// `LookupDevinModel`: by namespaced or bare ID, case-insensitive; an effort variant
     /// falls back to its base model.
     pub fn lookup(&self, id: &str) -> Option<ModelInfo> {
-        let clean = id.trim().to_lowercase();
+        let clean = id.trim().go_lower();
         let clean = clean.strip_prefix("devin/").unwrap_or(&clean).to_owned();
         if clean.is_empty() {
             return None;
@@ -814,7 +820,7 @@ impl Store {
         if models.is_empty() {
             models = self.models();
         }
-        let bare = |m: &ModelInfo| m.id.strip_prefix("devin/").unwrap_or(&m.id).to_lowercase();
+        let bare = |m: &ModelInfo| m.id.strip_prefix("devin/").unwrap_or(&m.id).go_lower();
         if let Some(m) = models.iter().find(|m| bare(m) == clean) {
             return Some(m.clone());
         }
@@ -838,12 +844,12 @@ impl Store {
 /// `WithDevinBuiltins` over already rendered models.
 fn upsert_builtins(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     let builtin = builtin_swe16_slow().info();
-    let key = builtin.id.to_lowercase();
+    let key = builtin.id.go_lower();
     let mut out: Vec<ModelInfo> = models
         .into_iter()
         .filter(|m| {
             let id = m.id.trim();
-            !id.is_empty() && id.to_lowercase() != key
+            !id.is_empty() && id.go_lower() != key
         })
         .collect();
     out.push(builtin);

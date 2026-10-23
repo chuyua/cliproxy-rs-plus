@@ -119,8 +119,8 @@ fn body_error(error: super::http::ReadError) -> Response {
             "invalid_request_error",
             "invalid_request",
         ),
-        super::http::ReadError::Read(e) => realtime_error(
-            400,
+        super::http::ReadError::Read(e, status) => realtime_error(
+            status,
             &format!("failed to read Realtime client secret request: {e}"),
             "invalid_request_error",
             "invalid_request",
@@ -201,8 +201,8 @@ fn issue(
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return response;
     };
-    let Some(GoValue::Object(mut session)) =
-        live::session_response(&client, &created.grant.principal, created.expires_at)
+    let Some(Ok(mut session)) =
+        live::session_response(&client, &created.grant.principal, created.expires_at).map(GoValue::into_object)
     else {
         return realtime_error(
             500,

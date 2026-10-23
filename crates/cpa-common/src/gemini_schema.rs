@@ -461,9 +461,11 @@ fn normalize_malformed_schema_objects(json: Vec<u8>, add_missing_array_items: bo
     let Some(root) = decode_first(&json) else {
         return json;
     };
-    let root = match root {
-        GoValue::Bool(true) => return b"{}".to_vec(),
-        GoValue::Object(map) if !is_api_request_document(&map) => map,
+    if root == GoValue::Bool(true) {
+        return b"{}".to_vec();
+    }
+    let root = match root.into_object().ok() {
+        Some(map) if !is_api_request_document(&map) => map,
         _ => return json,
     };
     if root.len() == 1 {
@@ -761,7 +763,7 @@ fn resolve_refs(root: &GoValue, value: &GoValue, active: &mut std::collections::
                 active.insert(reference.clone());
                 let resolved = resolve_refs(root, target, active);
                 active.remove(reference);
-                if let GoValue::Object(target_map) = resolved {
+                if let Ok(target_map) = resolved.into_object() {
                     let mut out = target_map;
                     for (key, item) in node {
                         if key != "$ref" {

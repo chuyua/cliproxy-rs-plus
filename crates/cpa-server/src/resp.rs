@@ -6,6 +6,7 @@
 //! In Home mode (a remote dispatcher is installed) Go refuses these connections with
 //! one error before reading a command.
 
+use cpa_core::gostr::GoStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -238,7 +239,7 @@ where
             }
             continue;
         };
-        let cmd = first.trim().to_uppercase();
+        let cmd = first.trim().go_upper();
         if cmd != "AUTH" && !authed {
             let result = mgmt.authenticate_key(&ip, local, b"").await;
             reply.error(&banned_or(result, "NOAUTH Authentication required."));
@@ -275,7 +276,7 @@ where
                 } else {
                     let channel = args[1].trim().to_owned();
                     let queue = mgmt.rt.usage_queue();
-                    let subscription = match channel.to_lowercase().as_str() {
+                    let subscription = match channel.go_lower().as_str() {
                         "usage" => queue.subscribe_usage(),
                         "errors" => queue.subscribe_errors(),
                         _ => {
@@ -303,7 +304,7 @@ where
                 match count {
                     None => reply.error(&format!(
                         "ERR wrong number of arguments for '{}' command",
-                        cmd.to_lowercase()
+                        cmd.go_lower()
                     )),
                     Some((count, _)) if count <= 0 => reply.error("ERR value is not an integer or out of range"),
                     Some((count, has_count)) => {
@@ -324,7 +325,7 @@ where
                     }
                 }
             }
-            _ => reply.error(&format!("ERR unknown command '{}'", cmd.to_lowercase())),
+            _ => reply.error(&format!("ERR unknown command '{}'", cmd.go_lower())),
         }
         if !flush(&mut writer, &mut reply).await {
             return;
@@ -378,7 +379,7 @@ async fn stream<R, W>(
                         reply.error(&format!("ERR {message}"));
                         false
                     }
-                    Ok(args) => match args.first().map(|c| c.trim().to_uppercase()) {
+                    Ok(args) => match args.first().map(|c| c.trim().go_upper()) {
                         None => {
                             reply.error("ERR empty command");
                             true
@@ -398,7 +399,7 @@ async fn stream<R, W>(
                             false
                         }
                         Some(cmd) => {
-                            reply.error(&format!("ERR unknown command '{}'", cmd.to_lowercase()));
+                            reply.error(&format!("ERR unknown command '{}'", cmd.go_lower()));
                             true
                         }
                     },

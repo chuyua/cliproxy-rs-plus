@@ -133,7 +133,16 @@ fn insert(lines: &mut Vec<String>, path: &[&str], block: Vec<String>) -> Option<
                 (from, to, indent) = (e.key_line + 1, e.end, child);
             }
             None => {
-                let at = last_content(lines, from, to);
+                // A new root section goes before the document's foot comments, which
+                // Go keeps last.
+                let at = if indent == 0 {
+                    (from..to)
+                        .rev()
+                        .find(|&i| !is_blank(&lines[i]) && !(is_comment(&lines[i]) && indent_of(&lines[i]) == 0))
+                        .map_or(from, |i| i + 1)
+                } else {
+                    last_content(lines, from, to)
+                };
                 lines.insert(at, format!("{}{part}:", " ".repeat(indent)));
                 (from, to, indent) = (at + 1, at + 1, indent + 2);
             }
@@ -154,6 +163,75 @@ fn last_content(lines: &[String], from: usize, to: usize) -> usize {
 fn take_root(lines: &mut Vec<String>, key: &str) -> Option<Vec<String>> {
     let (_, e) = entries(lines, 0, 0, lines.len()).into_iter().find(|(k, _)| k == key)?;
     Some(lines.drain(e.start..e.end).collect())
+}
+
+/// A comment line moved to column 0.
+fn comment_at_root(line: &str) -> String {
+    line.trim_start().to_owned()
+}
+
+/// The inline comment of a key line (`key: # text`), as a comment line.
+fn inline_comment(line: &str) -> Option<String> {
+    let after = &line[line.find(':')? + 1..];
+    let t = after.trim_start();
+    t.starts_with('#').then(|| t.to_owned())
+}
+
+/// Removes the nested block entry at `path` and returns its lines at column 0, as Go's
+/// `copyYAMLPathValue` carries them: its head comments, value and inline comment, and,
+/// for each ancestor the removal leaves without entries (pruned with it), that
+/// ancestor's head and inline comments before the entry and its other comments after.
+/// `None` (nothing removed) when a step is not a block mapping entry.
+fn take_nested(lines: &mut Vec<String>, path: &[&str]) -> Option<Vec<String>> {
+    let mut chain: Vec<(Entry, usize)> = Vec::new();
+    let (mut from, mut to, mut indent) = (0, lines.len(), 0);
+    for (i, part) in path.iter().enumerate() {
+        let (_, e) = entries(lines, indent, from, to).into_iter().find(|(k, _)| k == part)?;
+        chain.push((e, indent));
+        if i + 1 < path.len() {
+            let child = child_indent(lines, &e, indent)?;
+            (from, to, indent) = (e.key_line + 1, e.end, child);
+        }
+    }
+    let (leaf, leaf_indent) = chain.pop()?;
+    let mut block: Vec<String> = lines[leaf.start..leaf.end]
+        .iter()
+        .map(|l| {
+            if is_blank(l) {
+                String::new()
+            } else {
+                l[leaf_indent.min(indent_of(l))..].to_owned()
+            }
+        })
+        .collect();
+    let mut removed = leaf.start..leaf.end;
+    while let Some(&(parent, parent_indent)) = chain.last() {
+        let child = child_indent(lines, &parent, parent_indent)?;
+        let others = entries(lines, child, parent.key_line + 1, parent.end)
+            .into_iter()
+            .filter(|(_, e)| e.start < removed.start || e.end > removed.end)
+            .count();
+        if others > 0 {
+            break;
+        }
+        let comments = |range: std::ops::Range<usize>| -> Vec<String> {
+            lines[range]
+                .iter()
+                .filter(|l| is_comment(l))
+                .map(|l| comment_at_root(l))
+                .collect()
+        };
+        let mut head = comments(parent.start..parent.key_line);
+        head.extend(inline_comment(&lines[parent.key_line]));
+        head.extend(comments(parent.key_line + 1..removed.start));
+        head.append(&mut block);
+        head.extend(comments(removed.end..parent.end));
+        block = head;
+        removed = parent.start..parent.end;
+        chain.pop();
+    }
+    lines.drain(removed);
+    Some(block)
 }
 
 /// Renames the key on the entry's key line, keeping the value and inline comment.
@@ -212,7 +290,8 @@ pub(super) fn migrate(original: &str, moves: &[Move<'_>], families: &[&str], mig
         return None;
     }
     for m in moves {
-        if !root_keys(&lines).iter().any(|k| k == m.old) {
+        let old: Vec<&str> = m.old.split('.').collect();
+        if !root_keys(&lines).iter().any(|k| k == old[0]) {
             continue;
         }
         let present = |lines: &[String], path: &[&str]| -> bool {
@@ -229,12 +308,22 @@ pub(super) fn migrate(original: &str, moves: &[Move<'_>], families: &[&str], mig
             true
         };
         let target: Vec<&str> = m.new.split('.').collect();
-        let block = take_root(&mut lines, m.old)?;
+        let block = if old.len() > 1 {
+            // A nested alias the text form cannot reach is left for the value writer.
+            let mut probe = lines.clone();
+            let Some(block) = take_nested(&mut probe, &old) else {
+                continue;
+            };
+            lines = probe;
+            block
+        } else {
+            take_root(&mut lines, m.old)?
+        };
         if present(&lines, &target) {
             continue; // v8 wins by presence; the legacy entry is dropped
         }
         let (parents, leaf) = target.split_at(target.len() - 1);
-        let mut block = rename(block, m.old, leaf[0]);
+        let mut block = rename(block, old[old.len() - 1], leaf[0]);
         // A null legacy struct migrates to an empty mapping.
         let null_struct = block_lines_after_key(&block).is_empty() && super::schema::is_struct(m.new);
         if let Some(line) = block.iter_mut().find(|l| key_at(l, 0) == Some(leaf[0]))

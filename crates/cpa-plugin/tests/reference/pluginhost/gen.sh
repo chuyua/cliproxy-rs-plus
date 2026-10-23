@@ -8,6 +8,7 @@ export GOTOOLCHAIN=local GOPROXY=off GONOPROXY=none GOPRIVATE= GOSUMDB=off
 reference=${1:?usage: gen.sh /path/to/CLIProxyAPI}
 here=$(cd "$(dirname "$0")" && pwd)
 crate=$(cd "$here/../../.." && pwd)
+output=${2:-"$crate/tests/fixtures/pluginhost_go.json"}
 built=$(mktemp -d)
 module=$(mktemp -d)
 trap 'rm -r "$built" "$module"' EXIT
@@ -25,5 +26,5 @@ cp "$here"/*.go "$module/"
   go mod edit -require=github.com/router-for-me/CLIProxyAPI/v8@v8.0.0
   go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v8="$reference"
   go mod tidy >/dev/null 2>&1
-  go run . "$built" "$crate/tests/fixtures/pluginhost_go.json"
+  go run . "$built" "$output"
 )

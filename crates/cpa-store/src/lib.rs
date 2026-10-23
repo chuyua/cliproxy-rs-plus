@@ -13,6 +13,7 @@ mod postgres;
 mod private_fs;
 mod sigv4;
 
+use cpa_core::gostr::GoStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,7 +101,7 @@ pub fn select(env: &dyn Fn(&str) -> Option<String>, wd: &Path, home: bool) -> Op
     if home {
         return None;
     }
-    let get = |upper: &str| lookup(env, &[upper, &upper.to_lowercase()]);
+    let get = |upper: &str| lookup(env, &[upper, &upper.go_lower()]);
     let local = |key: &str| {
         get(key)
             .map(PathBuf::from)
@@ -226,6 +227,16 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
                         .map_err(|e| format!("failed to find template config file: stat {}: {e}", example.display()))?;
                     object::seed_config(&example, &config_path)
                         .map_err(|e| format!("failed to bootstrap git-backed config: {e:#}"))?;
+                    // Go `persistSeededConfig`: a copy that cannot be prepared is removed,
+                    // so every start refuses the template instead of running unpersisted.
+                    if let Err(e) = cpa_core::config::prepare_for_upload(&config_path) {
+                        if let Err(remove) = std::fs::remove_file(&config_path) {
+                            tracing::warn!("failed to remove the config copied from the template: {remove}");
+                        }
+                        return Err(format!(
+                            "failed to commit initial git-backed config: prepare config for upload: {e:#}"
+                        ));
+                    }
                     let committing = store.clone();
                     git::blocking(move || committing.persist_config())
                         .await
@@ -254,6 +265,71 @@ mod tests {
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |key| map.get(key).cloned()
+    }
+
+    /// Go `TestPersistSeededConfig*` (f9437700): the template copy is prepared before
+    /// its first commit; a refused copy is removed and nothing is pushed.
+    #[tokio::test]
+    async fn the_git_seed_commits_the_prepared_config() {
+        const PLAIN: &str = "seed-plaintext-secret";
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        for (template, accepted) in [
+            (format!("port: 8317\nremote-management:\n  secret-key: {PLAIN}\n"), true),
+            (
+                format!("remote-management:\n  secret-key: {PLAIN}\nport: [8317\n"),
+                false,
+            ),
+            (
+                format!("defaults: &management\n  secret-key: {PLAIN}\nmanagement: *management\n"),
+                false,
+            ),
+        ] {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let wd = std::env::temp_dir().join(format!("cpa-store-git-seed-{}-{nanos}", std::process::id()));
+            let remote = wd.join("remote.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            git(&remote, &["init", "-q", "--bare"]).unwrap();
+            git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+            std::fs::write(wd.join("config.example.yaml"), &template).unwrap();
+            let root = wd.join("gitstore");
+            let selection = Selection::Git {
+                url: remote.to_string_lossy().into_owned(),
+                username: String::new(),
+                token: String::new(),
+                branch: "main".into(),
+                root: root.clone(),
+            };
+            let result = bootstrap(selection, &wd).await;
+            let committed = git(&remote, &["show", "main:config/config.yaml"]);
+            if accepted {
+                result.unwrap();
+                let committed = committed.unwrap();
+                assert!(!committed.contains(PLAIN), "{committed}");
+                let hash = cpa_core::config::Config::parse(&committed)
+                    .unwrap()
+                    .management
+                    .secret_key;
+                assert!(bcrypt::verify(PLAIN, &hash).unwrap());
+            } else {
+                let error = result.err().unwrap();
+                assert!(error.contains("prepare config for upload"), "{error}");
+                assert_eq!(committed, None, "{template}");
+                assert!(!root.join("config/config.yaml").exists(), "the refused copy is removed");
+            }
+            let _ = std::fs::remove_dir_all(&wd);
+        }
     }
 
     #[test]

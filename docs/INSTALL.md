@@ -212,7 +212,7 @@ If you installed the binary another way, set it up by hand:
 
    Keep a copy of the management key: on first start the server replaces it in `config.yaml` with a bcrypt hash. Every setting in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/main/config.example.yaml) is accepted, although settings for features listed as not yet supported have no effect; [CONFIGURATION.md](CONFIGURATION.md) explains the common ones.
 2. Start the server: `cliproxy --config config.yaml`. With no `--config`, it reads `config.yaml` in the current directory. Check it with `curl http://127.0.0.1:8317/healthz`, which answers `{"status":"ok"}`.
-3. Connect accounts with `--claude-login`, `--codex-login`, `--codex-device-login`, `--kimi-login`, `--kimi-ai-login`, `--meta-login`, `--xai-login` or `--devin-login`, import a Vertex AI service account with `--vertex-import key.json`, or connect accounts from the dashboard at `/management.html`. Add `--no-browser` on a machine without a browser.
+3. Connect accounts with `--claude-login`, `--codex-login`, `--codex-device-login`, `--antigravity-login`, `--kimi-login`, `--kimi-ai-login`, `--meta-login`, `--xai-login` or `--devin-login`, import a Vertex AI service account with `--vertex-import key.json`, or connect accounts from the dashboard at `/management.html`. Add `--no-browser` on a machine without a browser.
 
 Go-style single-dash flags such as `-config config.yaml` work too.
 

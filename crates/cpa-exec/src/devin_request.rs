@@ -10,6 +10,7 @@
 use cpa_common::gostr::trim_space;
 use cpa_common::json::{self as gj, Kind, Res};
 use cpa_common::signature::{Provider, detect_provider};
+use cpa_core::gostr::GoStr;
 
 use crate::devin_wire::{
     DEFAULT_MAX_TOKENS, Image, Prompt, Tool, ToolCall, contains, is_codex_app_automation_update,
@@ -34,7 +35,7 @@ pub(crate) struct Parsed {
 }
 
 fn lower(b: &[u8]) -> String {
-    String::from_utf8_lossy(trim_space(b)).to_lowercase()
+    String::from_utf8_lossy(trim_space(b)).go_lower()
 }
 
 fn s(r: &Res<'_>) -> Vec<u8> {

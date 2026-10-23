@@ -9,6 +9,7 @@ use crate::{
     thinking,
 };
 use cpa_common::json::{self as gj, Kind, Res};
+use cpa_core::gostr::GoStr;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -24,8 +25,16 @@ fn compatible_claude_signature(raw: &[u8]) -> Option<Vec<u8>> {
         .map(String::into_bytes)
 }
 
-pub(crate) fn convert(model: &str, input: &[u8], stream: bool, preserve_thinking: bool) -> Vec<u8> {
+/// Refuses a request whose user turn is left empty by file or audio parts Claude cannot
+/// receive (f51624aa).
+pub(crate) fn convert(
+    model: &str,
+    input: &[u8],
+    stream: bool,
+    preserve_thinking: bool,
+) -> Result<Vec<u8>, crate::Error> {
     let raw = normalize_codex_agent_messages(input);
+    let mut drops = common::UserTurnDrops::default();
     let user_id = common::derive_claude_user_id(&raw);
     let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", &user_id);
@@ -142,7 +151,13 @@ pub(crate) fn convert(model: &str, input: &[u8], stream: bool, preserve_thinking
         }
         match kind.as_slice() {
             b"message" => {
-                let (role, parts) = message_parts(item);
+                let (role, parts, dropped) = message_parts(item);
+                if role == b"user" {
+                    if let Some(dropped) = dropped {
+                        drops.drop_part(dropped);
+                    }
+                    drops.end_turn(parts.len());
+                }
                 if !parts.is_empty() {
                     pending.parts(&role, parts);
                 }
@@ -194,16 +209,19 @@ pub(crate) fn convert(model: &str, input: &[u8], stream: bool, preserve_thinking
                 if !raw_id.is_empty() && !emitted_results.insert(raw_id.clone()) {
                     continue;
                 }
-                let mut output = item.get("output");
-                if let Some(last) = last_result.get(&raw_id) {
-                    output = last.get("output");
-                }
+                let output_item = last_result.get(&raw_id).unwrap_or(item);
+                let output = output_item.get("output");
                 if raw_id.is_empty() || !emitted_uses.contains(&raw_id) {
                     pending.parts(b"user", standalone_tool_output(&output));
                     continue;
                 }
                 let mut result = br#"{"type":"tool_result","tool_use_id":"","content":""}"#.to_vec();
                 gj::set_str(&mut result, "tool_use_id", common::sanitize_claude_tool_id(&raw_id));
+                // Responses reports an unfinished tool output as status
+                // "incomplete"; is_error is Claude's only in-band equivalent.
+                if trim_space(&output_item.get("status").bytes()).eq_ignore_ascii_case(b"incomplete") {
+                    gj::set_bool(&mut result, "is_error", true);
+                }
                 pending.parts(b"user", vec![tool_result_content(result, &output)]);
             }
             _ => {}
@@ -286,7 +304,8 @@ pub(crate) fn convert(model: &str, input: &[u8], stream: bool, preserve_thinking
         }
         _ => {}
     }
-    thinking::apply_translated_summary_to_claude(out, &raw, "openai-response", model)
+    let out = thinking::apply_translated_summary_to_claude(out, &raw, "openai-response", model);
+    drops.result().map(|()| out)
 }
 
 fn model_info_int(model: &str, key: &str) -> i64 {
@@ -299,14 +318,15 @@ fn max_completion_tokens(model: &str) -> i64 {
     model_info_int(model, "max_completion_tokens")
 }
 
-fn default_max_tokens(model: &str) -> i64 {
-    let base = if model.trim().to_lowercase().contains("fable") {
-        64000
-    } else {
-        32000
-    };
-    let limit = max_completion_tokens(model);
-    if limit > 0 && limit < base { limit } else { base }
+/// The `max_tokens` an OpenAI Chat or Responses request without one gets: the
+/// registered model's output limit, except that Fable keeps its 64000 ceiling.
+pub(crate) fn default_max_tokens(model: &str) -> i64 {
+    let fable = model.trim().go_lower().contains("fable");
+    let base = if fable { 64000 } else { 32000 };
+    match max_completion_tokens(model) {
+        limit if limit <= 0 || (fable && limit >= base) => base,
+        limit => limit,
+    }
 }
 
 fn is_system_role(role: &Res<'_>) -> bool {
@@ -317,9 +337,30 @@ fn is_role(message: &[u8], role: &str) -> bool {
     common::norm(&gj::get(message, "role")) == role
 }
 
+/// claudeModelRejectsAssistantPrefill: Fable, Opus, Sonnet and Haiku 5+ (Haiku since
+/// 911f49cb) and Sonnet 4.6+, after any
+/// provider namespace and `claude-` prefix. Eight-digit snapshot dates are not versions.
 fn rejects_assistant_prefill(model: &str) -> bool {
-    let model = model.trim().to_lowercase();
-    ["fable", "opus-5", "sonnet-4-6"].iter().any(|f| model.contains(f))
+    let model = model.trim().go_lower();
+    let model = model.rsplit('/').next().unwrap_or_default();
+    let model = model.strip_prefix("claude-").unwrap_or(model).replace('.', "-");
+    let tokens: Vec<&str> = model.split('-').collect();
+    if tokens[0] == "fable" {
+        return true;
+    }
+    if tokens.len() < 2 || !matches!(tokens[0], "opus" | "sonnet" | "haiku") {
+        return false;
+    }
+    let version = |token: &str| -> Option<u32> {
+        (!token.is_empty() && token.len() < 8 && token.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| token.parse().ok())
+            .flatten()
+    };
+    match version(tokens[1]) {
+        Some(major) if major >= 5 => true,
+        Some(4) => tokens[0] == "sonnet" && tokens.get(2).and_then(|t| version(t)).is_some_and(|minor| minor >= 6),
+        _ => false,
+    }
 }
 
 /// Builds one Claude message, collapsing a lone plain text block to a string.
@@ -484,10 +525,12 @@ fn file_part(part: &Res<'_>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// One `message` item: its role and Claude content parts.
-fn message_parts(item: &Res<'_>) -> (Vec<u8>, Vec<Vec<u8>>) {
+/// One `message` item: its role, Claude content parts and the type of the first part
+/// Claude cannot receive (a file without data, audio).
+fn message_parts(item: &Res<'_>) -> (Vec<u8>, Vec<Vec<u8>>, Option<&'static str>) {
     let mut role: Vec<u8> = vec![];
     let mut parts = vec![];
+    let mut dropped = None;
     let content = item.get("content");
     if content.is_array() {
         content.each(|_, part| {
@@ -523,7 +566,13 @@ fn message_parts(item: &Res<'_>) -> (Vec<u8>, Vec<Vec<u8>>) {
                         if role.is_empty() {
                             role = b"user".to_vec();
                         }
+                    } else if kind == b"input_file" {
+                        dropped.get_or_insert("input_file");
                     }
+                }
+                // Claude has no audio block.
+                b"input_audio" => {
+                    dropped.get_or_insert("input_audio");
                 }
                 _ => {}
             }
@@ -543,7 +592,7 @@ fn message_parts(item: &Res<'_>) -> (Vec<u8>, Vec<Vec<u8>>) {
     {
         *last = common::attach_cache_control(std::mem::take(last), item);
     }
-    (role, parts)
+    (role, parts, dropped)
 }
 
 fn reasoning_to_thinking(item: &Res<'_>, preserve: bool) -> Option<Vec<u8>> {

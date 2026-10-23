@@ -118,11 +118,18 @@ pub fn peek(body: &[u8]) -> serde_json::Map<String, Value> {
 
 /// gin `GetRawData` failure: 400 `Invalid request: ...`.
 pub fn read_failed(rejection: &BytesRejection) -> Response {
-    respond::error_detail(
-        400,
-        &format!("Invalid request: {}", rejection.body_text()),
-        "invalid_request_error",
-    )
+    let (status, reason) = read_error(rejection);
+    respond::error_detail(status, &format!("Invalid request: {reason}"), "invalid_request_error")
+}
+
+/// The status and text for a failed body read: Go's `HTTPStatusFromErrorOr(err, 400)`
+/// and `err.Error()`, which is 413 for the configured body limit.
+pub(crate) fn read_error(rejection: &BytesRejection) -> (u16, String) {
+    if crate::body_limit::is_too_large(rejection) {
+        (413, crate::body_limit::MESSAGE.to_owned())
+    } else {
+        (400, rejection.body_text())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

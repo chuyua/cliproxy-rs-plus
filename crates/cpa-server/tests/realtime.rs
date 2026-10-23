@@ -1068,3 +1068,37 @@ async fn relay_end_close_codes_match_gorilla() {
     assert_eq!(cases.len(), 3);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Go `PrepareHttpRequest` refuses a Sign in with ChatGPT credential without its token
+/// with status 401 before dialling; the direct Realtime route keeps that status
+/// (`HTTPStatusFromErrorOr(errDial, 502)`) and nothing reaches the upstream.
+#[tokio::test]
+async fn direct_realtime_refuses_a_siwc_credential_without_its_token_with_401() {
+    let mock = Shared::default();
+    let siwc = credential(
+        "siwc",
+        serde_json::json!({"type":"codex","use_siwc":true,"access_token":"outer-token","siwc":{"refresh_token":"rt"}}),
+        &[],
+    );
+    let proxy = proxy(vec![siwc], mock.clone()).await;
+    let mut response = wreq::Client::new()
+        .websocket(format!(
+            "ws{}/v1/realtime?model=gpt-realtime",
+            proxy.trim_start_matches("http")
+        ))
+        .header("authorization", "Bearer good-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    let inner = std::mem::replace(
+        &mut *response,
+        wreq::Response::from(axum::http::Response::new(Vec::<u8>::new())),
+    );
+    assert_eq!(
+        inner.json::<Value>().await.unwrap(),
+        serde_json::json!({"error": {"message": "Codex Realtime WebSocket upstream unavailable",
+            "type": "authentication_error", "param": null, "code": "realtime_upstream_unauthorized"}})
+    );
+    assert!(mock.lock().unwrap().seen.is_empty());
+}

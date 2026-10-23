@@ -30,6 +30,9 @@ html = html
   .replace(styleTag, () => `<style>${css}</style>`)
   .replace(/<link rel="preload"[^>]*>\s*/, "")
   .replace(/href="\.\/favicon\.svg"/, () => `href="${icon}"`);
+// Windows core.autocrlf can change CRLF on checkout without changing the
+// committed HTML. Hash the canonical LF bytes which Git and Linux CI use.
+html = html.replace(/\r\n/g, "\n");
 // Only data: URLs and in-page fragments (#i-icon sprite references) may remain.
 const external = [...html.matchAll(/\b(?:src|href)="(?!data:|#)([^"]*)"/g)].map((m) => m[1]);
 if (external.length) throw new Error(`panel: external references remain: ${external.join(", ")}`);

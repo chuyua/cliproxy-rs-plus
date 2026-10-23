@@ -67,6 +67,8 @@ async fn upstream_requests_match_go_byte_for_byte() {
         "chat-stream-usage-then-model",
         "chat-payload-rules",
         "responses-payload-rules",
+        "chat-payload-override-after-normalize",
+        "responses-payload-override-after-normalize",
         "responses-compact-rejected",
         "transport-custom-headers",
         "transport-redirect-307",
@@ -574,6 +576,7 @@ async fn claude_replay_sequence_matches_go() {
             operation: Operation::Generate,
             source_format: Format::Claude,
             response_format: Format::Claude,
+            stream_payloads: false,
             requested_model: model.into(),
             model: model.into(),
             original_body: body.clone(),
@@ -590,6 +593,7 @@ async fn claude_replay_sequence_matches_go() {
             caller: cpa_core::exec::Caller {
                 principal: "client-key-1".into(),
                 source: "authorization",
+                provider: String::new(),
             },
         };
         let down = downstream(exec.execute(&claude, &cred, req, &cfg()).await).await;

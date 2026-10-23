@@ -1,5 +1,6 @@
 //! Go's logs tab (internal/tui/logs_tab.go): the embedded server's log hook in
 //! standalone mode, else `GET /logs` every two seconds.
+use cpa_core::gostr::GoStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -171,7 +172,7 @@ impl LogsTab {
         let filter = if self.filter.is_empty() {
             "ALL".to_owned()
         } else {
-            format!("{}+", self.filter.to_uppercase())
+            format!("{}+", self.filter.go_upper())
         };
         doc.line(vec![
             s::span(format!(" {}  ", t("logs_title")), s::title()),

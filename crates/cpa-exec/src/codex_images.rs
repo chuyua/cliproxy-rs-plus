@@ -8,6 +8,7 @@
 //! `response.completed` become an Images API response, or `<prefix>.partial_image` and
 //! `<prefix>.completed` SSE frames when streaming.
 
+use cpa_core::gostr::GoStr;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,11 +76,15 @@ impl CodexExecutor {
         request_path: &str,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
-        match (direct_model(&req), direct_endpoint(path)) {
-            (Some(model), Some(endpoint)) => self.direct(&view, &settings, req, path, endpoint, &model).await,
+        // A Sign in with ChatGPT credential has no direct Images endpoint.
+        match (direct_model(&req, &settings), direct_endpoint(path)) {
+            (Some(model), Some(endpoint)) if !view.siwc => {
+                self.direct(&view, &settings, req, path, endpoint, &model).await
+            }
             _ => self.tool(&view, &settings, req, path).await,
         }
     }
@@ -107,6 +112,35 @@ impl CodexExecutor {
         }
         let cache = request::session_uuid(&req, None);
         let body = json_body(body, cache.as_deref());
+        // The payload rules run last (868e137), on the body's JSON view.
+        let original = if req.original_body.is_empty() {
+            &req.body
+        } else {
+            &req.original_body
+        };
+        let requested = if req.requested_model.trim().is_empty() {
+            req.model.trim()
+        } else {
+            req.requested_model.trim()
+        };
+        let client_content_type = request::header(&req.headers, "content-type");
+        let (body, content_type) =
+            crate::payload_media::apply(&body, &content_type, original, client_content_type, |view, original| {
+                let rules = cpa_common::payload::Request {
+                    target_executor: "codex",
+                    model,
+                    requested_model: requested,
+                    protocol: "openai",
+                    from_protocol: SOURCE,
+                    root: "",
+                    original,
+                    request_path: path,
+                    headers: Some(&req.headers),
+                };
+                cpa_common::payload::apply(&settings.payload, &rules, view)
+            })
+            .map_err(plain_err)?;
+        let body = Bytes::from(body);
         // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
         let mut client = req.headers.clone();
         client.remove(http::header::USER_AGENT);
@@ -204,14 +238,34 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let prepared = prepare(&req, path)?;
         let main_model = main_model(&settings.image_base_model);
-        let body = tool_body(&prepared.body, &req, settings, path, main_model)?;
-        report_request(&req, Format::Codex, &body);
+        let body = tool_body(&prepared.body, main_model, view.siwc)?;
         let cache = request::session_uuid(&req, None);
         let body = match &cache {
             Some(id) => set_str_if_different(body, "prompt_cache_key", id),
             None => body,
         };
         let body = request::sanitize_input_ids(body);
+        // The payload rules run last (868e137), as the codex executor, on the
+        // prepared image request.
+        let requested = if req.requested_model.trim().is_empty() {
+            req.model.trim()
+        } else {
+            req.requested_model.trim()
+        };
+        let rules = cpa_common::payload::Request {
+            target_executor: "codex",
+            model: main_model,
+            requested_model: requested,
+            protocol: "codex",
+            from_protocol: SOURCE,
+            root: "",
+            original: prepared.body.as_bytes(),
+            request_path: path,
+            headers: Some(&req.headers),
+        };
+        let body = cpa_common::payload::apply(&settings.payload, &rules, body.into_bytes());
+        let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        report_request(&req, Format::Codex, &body);
         let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
@@ -377,16 +431,48 @@ fn data_lines(event: &[u8]) -> Vec<&str> {
         .collect()
 }
 
-/// `codexDirectOpenAIImageModel`: the payload's model, then the route's, when it is a
-/// gpt-image-* model.
-fn direct_model(req: &ExecRequest) -> Option<String> {
-    let payload_model = gjson::get(&String::from_utf8_lossy(&req.body), "model")
-        .str()
-        .to_owned();
-    [payload_model.as_str(), req.model.as_str()]
+/// `codexDirectOpenAIImageRouteModel`: the client's model (multipart handlers pass it
+/// beside the raw form), the JSON payload's model, then the execution model, when one
+/// is a gpt-image-* model.
+fn direct_route_model(req: &ExecRequest) -> Option<String> {
+    let payload_model = if cpa_common::json::std_valid(&req.body) {
+        gjson::get(&String::from_utf8_lossy(&req.body), "model")
+            .str()
+            .to_owned()
+    } else {
+        String::new()
+    };
+    [req.requested_model.trim(), payload_model.as_str(), req.model.as_str()]
         .into_iter()
         .map(image_base_model)
         .find(|m| DIRECT_MODELS.contains(&m.as_str()))
+}
+
+/// `directOpenAIImageModel`: for a direct route, the resolved upstream model. A name
+/// the credential's config lists is sent as it is; otherwise a gpt-image-* model loses
+/// its routing prefix and case (51bde0ff).
+fn direct_model(req: &ExecRequest, settings: &Settings) -> Option<String> {
+    let route = direct_route_model(req)?;
+    let model = request::base_model(&req.model).trim().to_owned();
+    if model.is_empty() {
+        return Some(route);
+    }
+    let configured = settings.key_models.iter().any(|m| {
+        let field = |k: &str| m.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().trim();
+        let name = Some(field("name"))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| field("alias"));
+        request::base_model(name).trim().go_eq_fold(&model)
+    });
+    if configured {
+        return Some(model);
+    }
+    let base = image_base_model(&model);
+    Some(if DIRECT_MODELS.contains(&base.as_str()) {
+        base
+    } else {
+        model
+    })
 }
 
 /// `codexOpenAIImageBaseModel`: no thinking suffix, no `provider/` prefix, lower case.
@@ -398,7 +484,7 @@ fn image_base_model(model: &str) -> String {
     {
         base = base[i + 1..].trim();
     }
-    base.trim().to_lowercase()
+    base.trim().go_lower()
 }
 
 /// `codexDirectOpenAIImageEndpoint`.
@@ -414,7 +500,7 @@ fn direct_endpoint(path: &str) -> Option<&'static str> {
 
 /// `resolveGPTImage2BaseModel`.
 fn main_model(configured: &str) -> &str {
-    if !configured.is_empty() && configured.to_lowercase().starts_with("gpt-") {
+    if !configured.is_empty() && configured.go_lower().starts_with("gpt-") {
         configured
     } else {
         MAIN_MODEL
@@ -517,7 +603,7 @@ fn form_json_value(key: &str, value: &[u8]) -> String {
     let text = String::from_utf8_lossy(value);
     let text = text.trim();
     if matches!(
-        key.trim().to_lowercase().as_str(),
+        key.trim().go_lower().as_str(),
         "n" | "output_compression" | "partial_images"
     ) && let Ok(n) = go_parse_int(text)
     {
@@ -541,9 +627,10 @@ fn image_files(form: &Form) -> &[Part] {
 
 /// `codexMultipartFileToDataURL`: the part's Content-Type, else the sniffed type.
 fn data_url(part: &Part) -> String {
-    let media = part
-        .header("Content-Type")
-        .map(str::trim)
+    // ponytail: a Content-Type that is not UTF-8 reaches the data URL lossily (image
+    // clients send ASCII media types); building the URL as bytes would keep it.
+    let header = String::from_utf8_lossy(part.header("Content-Type").unwrap_or_default());
+    let media = Some(header.trim())
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| detect_content_type(&part.body));
     format!(
@@ -597,7 +684,7 @@ fn prepare(req: &ExecRequest, path: &str) -> Result<Prepared, ExecError> {
     let content_type = request::header(&req.headers, "content-type").trim();
     let media = match multipart::parse_media_type(content_type) {
         MediaType::Ok(media, _) | MediaType::BadParams(media) => media,
-        MediaType::Invalid => String::new(),
+        MediaType::Invalid(_) => String::new(),
     };
     if media.starts_with("multipart/") {
         return edit_multipart(&req.body, &req.model, content_type);
@@ -766,14 +853,8 @@ fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
     set_raw(&req, "input", &input)
 }
 
-/// `prepareCodexOpenAIImageBody`: thinking, payload rules, then the Codex request rules.
-fn tool_body(
-    body: &str,
-    req: &ExecRequest,
-    settings: &Settings,
-    path: &str,
-    main_model: &str,
-) -> Result<String, ExecError> {
+/// `prepareCodexOpenAIImageBody`: thinking, then the Codex request rules.
+fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecError> {
     let thought = cpa_common::thinking::apply_thinking_with_source_payload(
         body.as_bytes(),
         body.as_bytes(),
@@ -785,24 +866,7 @@ fn tool_body(
         false,
     )
     .map_err(|e| ExecError::local(e.status(), cpa_core::exec::FailureScope::Request, e.message))?;
-    let requested = if req.requested_model.trim().is_empty() {
-        req.model.trim()
-    } else {
-        req.requested_model.trim()
-    };
-    let rules = cpa_common::payload::Request {
-        target_executor: "",
-        model: main_model,
-        requested_model: requested,
-        protocol: "codex",
-        from_protocol: SOURCE,
-        root: "",
-        original: body.as_bytes(),
-        request_path: path,
-        headers: Some(&req.headers),
-    };
-    let out = cpa_common::payload::apply(&settings.payload, &rules, thought);
-    let mut out = String::from_utf8_lossy(&out).into_owned();
+    let mut out = String::from_utf8_lossy(&thought).into_owned();
     out = set_str_if_different(out, "model", main_model);
     out = set_bool_if_different(out, "stream", true);
     for key in [
@@ -812,6 +876,9 @@ fn tool_body(
         "stream_options",
     ] {
         out = delete(&out, key);
+    }
+    if siwc {
+        return Ok(request::siwc_body(out, request::Call::Stream, false, false));
     }
     let mut bytes = out.into_bytes();
     cpa_common::codex_client::normalize_codex_instructions(&mut bytes);
@@ -931,9 +998,119 @@ fn sse_frame(event: &str, data: &str) -> String {
 
 /// `codexMimeTypeFromOutputFormat`.
 fn mime_type(output_format: &str) -> &'static str {
-    match output_format.trim().to_lowercase().as_str() {
+    match output_format.trim().go_lower().as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         _ => "image/png",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(requested: &str, resolved: &str, body: &'static [u8]) -> ExecRequest {
+        ExecRequest {
+            operation: cpa_core::exec::Operation::Generate,
+            source_format: Format::OpenAI,
+            response_format: Format::OpenAI,
+            stream_payloads: false,
+            requested_model: requested.into(),
+            model: resolved.into(),
+            original_body: Bytes::from_static(body),
+            body: Bytes::from_static(body),
+            stream: false,
+            alt: None,
+            session: None,
+            headers: Default::default(),
+            execution_session: None,
+            derived_session: None,
+            resolved_model: None,
+            usage: Default::default(),
+            request_path: String::new(),
+            caller: cpa_core::exec::Caller {
+                principal: String::new(),
+                source: "",
+                provider: String::new(),
+            },
+        }
+    }
+
+    /// Go `TestCodexImagePayloadPreservesResolvedAlias` and the model column of
+    /// `TestCodexImageResolvedModelOnWire` (its payload-rule rows need the media payload
+    /// finalizer, 868e137): a configured upstream name is sent as it is, and only an
+    /// unconfigured gpt-image-* route loses its prefix and case.
+    #[test]
+    fn direct_images_keep_the_resolved_upstream_model() {
+        let plain = Settings::default();
+        let json: &[u8] = br#"{"model":"gpt-image-2","prompt":"diagnostic"}"#;
+        let form: &[u8] = b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--b--\r\n";
+        assert_eq!(
+            direct_model(&request("", "openai/gpt-image-2-cpr", json), &plain).as_deref(),
+            Some("openai/gpt-image-2-cpr")
+        );
+        for (requested, resolved, configured, want) in [
+            (
+                "gpt-image-2",
+                "openai/gpt-image-2-cpr",
+                "openai/gpt-image-2-cpr",
+                "openai/gpt-image-2-cpr",
+            ),
+            (
+                "gpt-image-2",
+                "openai/gpt-image-2",
+                "openai/gpt-image-2",
+                "openai/gpt-image-2",
+            ),
+            (
+                "gpt-image-2",
+                "OpenAI/GPT-Image-2",
+                "OpenAI/GPT-Image-2",
+                "OpenAI/GPT-Image-2",
+            ),
+            ("gpt-image-2", "gpt-image-1.5", "gpt-image-1.5", "gpt-image-1.5"),
+            (
+                "gpt-image-2",
+                "codex/gpt-image-2",
+                "codex/gpt-image-2",
+                "codex/gpt-image-2",
+            ),
+            (
+                "openai/gpt-image-2",
+                "openai/gpt-image-2",
+                "openai/gpt-image-2",
+                "openai/gpt-image-2",
+            ),
+            (
+                "tenant/gpt-image-2(high)",
+                "OpenAI/GPT-Image-2(high)",
+                "OpenAI/GPT-Image-2",
+                "OpenAI/GPT-Image-2",
+            ),
+            (
+                "codex/gpt-image-1.5(high)",
+                "codex/gpt-image-1.5(high)",
+                "",
+                "gpt-image-1.5",
+            ),
+            ("CODEX/GPT-Image-2(high)", "CODEX/GPT-Image-2(high)", "", "gpt-image-2"),
+        ] {
+            let settings = Settings {
+                key_models: if configured.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![serde_json::json!({"name": configured, "alias": "gpt-image-2"})]
+                },
+                ..Settings::default()
+            };
+            // A multipart edit has no JSON model; the client's model carries the route.
+            for body in [json, form] {
+                assert_eq!(
+                    direct_model(&request(requested, resolved, body), &settings).as_deref(),
+                    Some(want),
+                    "{requested} -> {resolved}"
+                );
+            }
+        }
     }
 }

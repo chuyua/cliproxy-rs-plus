@@ -7,13 +7,14 @@
 //! write shows what Go keeps in memory.
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use serde_json::{Map, Value, json};
 
 use super::decode;
 use super::view::{self, Shape};
-use super::{Management, go_json, go_trim, keys, query_first, remove, sscanf_int, touch, write};
+use super::{Change, Management, go_json, go_trim, keys, query_first, sscanf_int, target};
 
 const META_BASE_URL: &str = "https://api.meta.ai/v1";
 
@@ -144,16 +145,17 @@ fn groups(family: &str, list: &[Value]) -> Value {
 
 /// Go's sanitizer, then the save. An unchanged family keeps its groups but is still
 /// saved, so a failing disk fails the request as Go's `persistLocked` does.
-async fn persist_list(state: Arc<Management>, family: &str, old: &Value, new: Value) -> Response {
+fn persist_list(family: &str, old: &Value, new: Value) -> Change {
     let new = keys::sanitize(family, &new);
     let shape = view::field(family);
-    let path = format!("api-keys/{}", v8_family(family));
-    if yaml(shape, &new) == yaml(shape, old) {
-        return touch(state, path).await;
+    let t = target(format!("api-keys/{}", v8_family(family)), family);
+    let legacy = yaml(shape, &new);
+    if legacy == yaml(shape, old) {
+        return Change::Touch(t);
     }
     match &new {
-        Value::Array(list) => write(state, path, groups(family, list)).await,
-        _ => remove(state, path).await,
+        Value::Array(list) => Change::Write(t, groups(family, list), legacy),
+        _ => Change::Remove(t),
     }
 }
 
@@ -895,36 +897,43 @@ fn map_change(route: &str, old: &Value, method: &Method, query: Option<&str>, bo
 /// PUT, PATCH and DELETE of a v0 key list or OAuth map route.
 pub(super) async fn change(
     state: Arc<Management>,
-    route: &str,
+    route: String,
     method: Method,
-    query: Option<&str>,
-    body: &[u8],
+    query: Option<String>,
+    body: Bytes,
 ) -> Response {
-    let _serial = super::WRITES.lock().await;
-    let old = super::current(&state).get(route).cloned().unwrap_or_default();
-    if route.starts_with("oauth-") {
-        let new = match map_change(route, &old, &method, query, body) {
-            Ok(v) => v,
-            Err(fail) => return fail.response(),
-        };
-        let shape = view::field(route);
-        if yaml(shape, &new) == yaml(shape, &old) {
-            return touch(state, map_path(route).into()).await;
+    super::locked(state, move |cfg| {
+        let old = cfg.get(&route).cloned().unwrap_or_default();
+        let query = query.as_deref();
+        if route.starts_with("oauth-") {
+            let new = match map_change(&route, &old, &method, query, &body) {
+                Ok(new) => new,
+                Err(fail) => return Change::Answer(fail.response()),
+            };
+            let shape = view::field(&route);
+            let t = target(map_path(&route), &route);
+            if yaml(shape, &new) == yaml(shape, &old) {
+                return Change::Touch(t);
+            }
+            return match new {
+                Value::Object(_) => {
+                    let value = yaml(shape, &new);
+                    Change::Write(t, value.clone(), value)
+                }
+                _ => Change::Remove(t),
+            };
         }
-        return match new {
-            Value::Object(_) => write(state, map_path(route).into(), yaml(shape, &new)).await,
-            _ => remove(state, map_path(route).into()).await,
+        let new = match method {
+            Method::PUT => put(&route, &old, &body),
+            Method::PATCH => patch(&route, &old, query, &body),
+            _ => delete(&route, &old, query),
         };
-    }
-    let new = match method {
-        Method::PUT => put(route, &old, body),
-        Method::PATCH => patch(route, &old, query, body),
-        _ => delete(route, &old, query),
-    };
-    match new {
-        Ok(new) => persist_list(state, route, &old, new).await,
-        Err(fail) => fail.response(),
-    }
+        match new {
+            Ok(new) => persist_list(&route, &old, new),
+            Err(fail) => Change::Answer(fail.response()),
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

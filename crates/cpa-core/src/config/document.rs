@@ -10,7 +10,9 @@ use super::{lookup, validate_shape};
 const PATHS: &[(&str, &str)] = &[
     ("host", "server.host"),
     ("port", "server.port"),
+    ("max-request-body-bytes", "server.max-request-body-bytes"),
     ("trusted-proxies", "server.trusted-proxies"),
+    ("github-token", "server.github-token"),
     ("tls", "server.tls"),
     ("commercial-mode", "server.commercial-mode"),
     ("discovery", "server.discovery"),
@@ -28,6 +30,10 @@ const PATHS: &[(&str, &str)] = &[
         "routing.cooldown.transient-error-cooldown-seconds",
     ),
     ("proxy-url", "requests.proxy-url"),
+    (
+        "tls-handshake-timeout-seconds",
+        "requests.tls-handshake-timeout-seconds",
+    ),
     ("passthrough-headers", "requests.passthrough-headers"),
     ("nonstream-keepalive-interval", "requests.nonstream-keepalive-interval"),
     ("streaming", "requests.streaming"),
@@ -39,15 +45,31 @@ const PATHS: &[(&str, &str)] = &[
     ("oauth-request-scoped-errors", "oauth.request-scoped-errors"),
     ("oauth-settings", "oauth.settings"),
     ("ws-auth", "oauth.providers.aistudio.ws-auth"),
+    ("codex.disable-codex-cloaking", "upstream.codex.disable-codex-cloaking"),
+    (
+        "codex.stream-bootstrap-buffering",
+        "upstream.codex.stream-bootstrap-buffering",
+    ),
+    (
+        "codex.stream-bootstrap-timeout",
+        "upstream.codex.stream-bootstrap-timeout",
+    ),
+    (
+        "codex.orphan-delegation-compatibility",
+        "upstream.codex.orphan-delegation-compatibility",
+    ),
+    ("codex.model-level-cooling", "upstream.codex.model-level-cooling"),
+    ("codex.response-steering", "upstream.codex.response-steering"),
     ("codex", "oauth.providers.codex"),
     ("codex-header-defaults", "oauth.providers.codex.header-defaults"),
-    ("claude", "oauth.providers.claude"),
-    ("claude-code", "oauth.providers.claude.claude-code"),
+    // Go walks the declared fields: ClaudeConfig and ClaudeCode have one each.
+    ("claude.model-level-cooling", "upstream.claude.model-level-cooling"),
     (
-        "disable-claude-cloak-mode",
-        "oauth.providers.claude.disable-claude-cloak-mode",
+        "claude-code.disable-cloaking-model-list",
+        "upstream.claude.disable-cloaking-model-list",
     ),
-    ("claude-header-defaults", "oauth.providers.claude.header-defaults"),
+    ("disable-claude-cloak-mode", "upstream.claude.disable-claude-cloak-mode"),
+    ("claude-header-defaults", "upstream.claude.header-defaults"),
     ("antigravity", "oauth.providers.antigravity"),
     (
         "antigravity-signature-cache-enabled",
@@ -61,7 +83,7 @@ const PATHS: &[(&str, &str)] = &[
         "quota-exceeded.antigravity-credits",
         "oauth.providers.antigravity.antigravity-credits",
     ),
-    ("xai", "oauth.providers.xai"),
+    ("xai", "upstream.xai"),
     ("devin", "oauth.providers.devin"),
     ("disable-image-generation", "multimedia.disable-image-generation"),
     ("gpt-image-2-base-model", "multimedia.gpt-image-2-base-model"),
@@ -80,6 +102,102 @@ const PATHS: &[(&str, &str)] = &[
         "observability.usage.redis-usage-queue-retention-seconds",
     ),
     ("pprof", "observability.pprof"),
+];
+// Go `v8ClientPaths`: the first historical spelling present wins.
+const CLIENT_PATHS: &[(&str, &str)] = &[
+    (
+        "oauth.providers.codex.optimize-multi-agent-v2",
+        "client.codex.optimize-multi-agent-v2",
+    ),
+    (
+        "providers.codex.optimize-multi-agent-v2",
+        "client.codex.optimize-multi-agent-v2",
+    ),
+    ("codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"),
+];
+// Go `v8SharedPaths` (52d5507d): historical v8 spellings of the shared `upstream`
+// settings. A canonical path wins by presence; these precede the legacy roots.
+pub(super) const SHARED_PATHS: &[(&str, &str)] = &[
+    (
+        "oauth.providers.codex.disable-codex-cloaking",
+        "upstream.codex.disable-codex-cloaking",
+    ),
+    (
+        "oauth.providers.codex.stream-bootstrap-buffering",
+        "upstream.codex.stream-bootstrap-buffering",
+    ),
+    (
+        "oauth.providers.codex.stream-bootstrap-timeout",
+        "upstream.codex.stream-bootstrap-timeout",
+    ),
+    (
+        "oauth.providers.codex.orphan-delegation-compatibility",
+        "upstream.codex.orphan-delegation-compatibility",
+    ),
+    (
+        "oauth.providers.codex.model-level-cooling",
+        "upstream.codex.model-level-cooling",
+    ),
+    (
+        "oauth.providers.codex.response-steering",
+        "upstream.codex.response-steering",
+    ),
+    (
+        "oauth.providers.claude.model-level-cooling",
+        "upstream.claude.model-level-cooling",
+    ),
+    (
+        "oauth.providers.claude.claude-code.disable-cloaking-model-list",
+        "upstream.claude.disable-cloaking-model-list",
+    ),
+    (
+        "oauth.providers.claude.disable-claude-cloak-mode",
+        "upstream.claude.disable-claude-cloak-mode",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.user-agent",
+        "upstream.claude.header-defaults.user-agent",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.package-version",
+        "upstream.claude.header-defaults.package-version",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.runtime-version",
+        "upstream.claude.header-defaults.runtime-version",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.os",
+        "upstream.claude.header-defaults.os",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.arch",
+        "upstream.claude.header-defaults.arch",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.timeout",
+        "upstream.claude.header-defaults.timeout",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.timezone",
+        "upstream.claude.header-defaults.timezone",
+    ),
+    (
+        "oauth.providers.claude.header-defaults.stabilize-device-profile",
+        "upstream.claude.header-defaults.stabilize-device-profile",
+    ),
+    ("oauth.providers.xai.inject-x-search", "upstream.xai.inject-x-search"),
+];
+// Go `v8SharedStructPaths`: an empty or null historical container is an empty
+// `upstream` one; populated ones move through their fields.
+pub(super) const SHARED_STRUCTS: &[(&str, &str)] = &[
+    (
+        "oauth.providers.claude.header-defaults",
+        "upstream.claude.header-defaults",
+    ),
+    ("oauth.providers.claude.claude-code", "upstream.claude"),
+    ("oauth.providers.claude", "upstream.claude"),
+    ("oauth.providers.xai", "upstream.xai"),
 ];
 const FAMILIES: &[(&str, &str)] = &[
     ("gemini-api-key", "gemini"),
@@ -108,7 +226,7 @@ pub struct ConfigDocument(Value);
 
 impl ConfigDocument {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let mut root = serde_yaml_ng::from_str::<Value>(text)?;
+        let mut root = super::yaml_value(text)?;
         // Go migrates the alias-expanded tree (`expandConfigAliases`): an edit next to
         // an inherited setting must keep it rather than shadow the whole mapping.
         super::expand_merges(&mut root)?;
@@ -123,17 +241,22 @@ impl ConfigDocument {
 
     pub(super) fn from_mapping(mut root: Mapping) -> anyhow::Result<Self> {
         validate_shape(&root)?;
-        // Historical client spelling precedence is ordered, before provider moves.
-        for old in ["oauth.providers.codex", "providers.codex", "codex"] {
-            let old = format!("{old}.optimize-multi-agent-v2");
-            if let Some(value) = lookup(&root, &old).cloned() {
-                remove(&mut root, &old);
-                insert_missing(&mut root, "client.codex.optimize-multi-agent-v2", value)?;
-            }
-        }
+        move_aliases(&mut root)?;
         if let Some(keys) = root.get("api-keys").filter(|v| !v.is_mapping()).cloned() {
             root.remove("api-keys");
             insert_missing(&mut root, "access.api-keys", keys)?;
+        }
+        // The legacy Claude structs move by their leaves (PATHS); an empty or null one is
+        // an empty `upstream.claude`, and other children stay as unknown fields.
+        for old in ["claude", "claude-code"] {
+            match root.get(old) {
+                Some(Value::Null) => {}
+                Some(Value::Mapping(m)) if m.is_empty() => {}
+                Some(Value::Mapping(_)) | None => continue,
+                Some(_) => bail!("{old} must be a mapping"),
+            }
+            root.remove(old);
+            insert_missing(&mut root, "upstream.claude", Value::Mapping(Mapping::new()))?;
         }
         for (old, current) in PATHS {
             if let Some(mut value) = lookup(&root, old).cloned() {
@@ -154,8 +277,19 @@ impl ConfigDocument {
         Ok(Self(Value::Mapping(root)))
     }
 
+    /// A document kept in the layout it was written in, for a save that must not
+    /// migrate it (Go's v0 save of a file without v8 sections).
+    pub fn unmigrated(value: Value) -> Self {
+        Self(value)
+    }
+
     pub fn value(&self) -> &Value {
         &self.0
+    }
+    /// The document for edits a path update cannot express, such as removing a field
+    /// from every list entry.
+    pub fn value_mut(&mut self) -> &mut Value {
+        &mut self.0
     }
     /// yaml.v3's decoding of typed scalars (see [`super::coerce_typed_scalars`]).
     pub(super) fn coerce_typed_scalars(&mut self) {
@@ -169,8 +303,11 @@ impl ConfigDocument {
     }
 
     /// Comment-preserving v8 text of `original`: legacy root entries move under their
-    /// v8 parents with their own lines. `None` when the text form is unsupported or
-    /// would not parse to the migrated value; callers then render from `original`.
+    /// v8 parents with their own lines. Moves the text form cannot make (a dotted
+    /// legacy leaf such as `codex.response-steering`) are left for
+    /// [`ConfigDocument::render_preserving`], so the result only has to normalize to
+    /// this document. `None` when the text form is unsupported or normalizes to
+    /// something else; callers then render from `original`.
     pub fn migrated_text(&self, original: &str) -> Option<String> {
         let mut moves = vec![super::text::Move {
             old: "api-keys",
@@ -183,23 +320,121 @@ impl ConfigDocument {
         if !legacy_client_keys {
             moves.clear();
         }
-        moves.extend(
-            PATHS
-                .iter()
-                .filter(|(old, _)| !old.contains('.'))
-                .map(|(old, new)| super::text::Move { old, new }),
-        );
+        // Text moves in `from_mapping`'s order; aliases go first.
+        let aliases = CLIENT_PATHS.iter().chain(SHARED_PATHS);
+        let mut moves: Vec<_> = aliases
+            .map(|(old, new)| super::text::Move { old, new })
+            .chain(moves)
+            .collect();
+        moves.extend(PATHS.iter().map(|(old, new)| super::text::Move { old, new }));
         let families: Vec<&str> = FAMILIES.iter().map(|(old, _)| *old).collect();
         let text = super::text::migrate(original, &moves, &families, &self.0)?;
-        let parsed: Value = serde_yaml_ng::from_str(&text).ok()?;
-        (parsed == self.0).then_some(text)
+        (Self::parse(&text).ok()?.0 == self.0).then_some(text)
+    }
+
+    /// Go `ProjectV8ConfigAliases`: moves canonical values into the historical subtree
+    /// a request names, so a read sees them there and a write there replaces or
+    /// deletes them. Populated canonical containers stay; their fields move one by one.
+    pub fn project_aliases(&mut self, parts: &[&str]) {
+        if parts.is_empty() {
+            return;
+        }
+        let path = parts.join(".");
+        let Some(root) = self.0.as_mapping_mut() else {
+            return;
+        };
+        for (old, current) in CLIENT_PATHS.iter().chain(SHARED_PATHS).chain(SHARED_STRUCTS) {
+            if path != *old && !old.starts_with(&format!("{path}.")) && !path.starts_with(&format!("{old}.")) {
+                continue;
+            }
+            let Some(value) = lookup(root, current).cloned() else {
+                continue;
+            };
+            if value.as_mapping().is_some_and(|m| !m.is_empty()) {
+                continue;
+            }
+            set_path(root, old, value);
+            remove(root, current);
+        }
+    }
+
+    /// Go `NormalizeV8ConfigAliases` for a request body or the edited document: the
+    /// historical v8 spellings move to their canonical paths. A null historical
+    /// container resets its fields, as null canonical leaves, so a PATCH merge cannot
+    /// turn it into a no-op. Unlike the loader's [`move_aliases`], nothing is rejected
+    /// here: a missing canonical field replaces a non-mapping ancestor, as Go's
+    /// `setYAMLPath` does, and a malformed historical container stays for the config
+    /// parse to report (422).
+    pub fn normalize_aliases(value: &mut Value) {
+        let Some(root) = value.as_mapping_mut() else {
+            return;
+        };
+        for (container, _) in SHARED_STRUCTS {
+            if !matches!(lookup(root, container), Some(Value::Null)) {
+                continue;
+            }
+            let prefix = format!("{container}.");
+            for (old, current) in CLIENT_PATHS.iter().chain(SHARED_PATHS) {
+                if old.starts_with(&prefix) && lookup(root, current).is_none() {
+                    set_path(root, current, Value::Null);
+                }
+            }
+            remove(root, container);
+        }
+        for (old, current) in CLIENT_PATHS.iter().chain(SHARED_PATHS) {
+            if let Some(value) = lookup(root, old).cloned() {
+                if lookup(root, current).is_none() {
+                    set_path(root, current, value);
+                }
+                remove(root, old);
+            }
+        }
+        for (old, current) in SHARED_STRUCTS {
+            match lookup(root, old) {
+                Some(Value::Null) => {}
+                Some(Value::Mapping(m)) if m.is_empty() => {}
+                _ => continue,
+            }
+            if lookup(root, current).is_none() {
+                set_path(root, current, Value::Mapping(Mapping::new()));
+            }
+            remove(root, old);
+        }
     }
 
     /// Go's read-time migration archives unrecognised sections as comments. Returns
     /// the removed `(path, value)` pairs; [`ConfigDocument::render_preserving`] callers
     /// append [`archive_comments`] for them.
     pub fn archive_unknown(&mut self) -> Vec<(String, Value)> {
-        super::schema::archive_unknown(&mut self.0)
+        let archived = super::schema::archive_unknown(&mut self.0);
+        for (section, _) in &archived {
+            // Go `warnUnrecognizedV8Section`.
+            tracing::warn!("unrecognized configuration section {section:?} commented out during v8 migration");
+        }
+        archived
+    }
+
+    /// Go `NormalizeConfigLayout(data, false)`, as the startup load runs it: `text`
+    /// without the legacy fields that a v8 field overrides (presence wins), or `None`
+    /// when it has none. A legacy-only document is not migrated.
+    pub fn without_conflicts(text: &str) -> anyhow::Result<Option<String>> {
+        let mut raw = super::yaml_value(text)?;
+        super::expand_merges(&mut raw)?;
+        let Some(root) = raw.as_mapping_mut() else {
+            return Ok(None);
+        };
+        let mut changed = false;
+        // Go checks each pair against the document as earlier deletions left it.
+        for (old, new) in conflict_candidates(root) {
+            let legacy = lookup(root, &old).is_some_and(|v| !(old == "api-keys" && v.is_mapping()));
+            if legacy && lookup(root, &new).is_some() {
+                changed |= delete_pruning(root, &old.split('.').collect::<Vec<_>>());
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        Ok(Some(ConfigDocument(raw).render_preserving(text)?))
     }
 
     /// Preserve unaffected comments, key order and scalar styles. Changes are applied
@@ -209,7 +444,7 @@ impl ConfigDocument {
     /// to a full block re-emit that keeps the head comment only.
     pub fn render_preserving(&self, original: &str) -> anyhow::Result<String> {
         if let Some(text) = self.try_render(original)
-            && serde_yaml_ng::from_str::<Value>(&text).ok().as_ref() == Some(&self.0)
+            && super::yaml_value(&text).ok().as_ref() == Some(&self.0)
         {
             return Ok(text);
         }
@@ -221,7 +456,7 @@ impl ConfigDocument {
         for (key, value) in self.0.as_mapping().context("config must be a mapping")? {
             text = super::text::append_root(&text, key.as_str().context("config keys must be strings")?, value);
         }
-        if serde_yaml_ng::from_str::<Value>(&text)? != self.0 {
+        if super::yaml_value(&text)? != self.0 {
             bail!("edited YAML did not round-trip");
         }
         Ok(text)
@@ -235,7 +470,7 @@ impl ConfigDocument {
         };
         let doc = file.document()?;
         let root = doc.as_mapping()?;
-        let before: Value = match serde_yaml_ng::from_str(original).ok()? {
+        let before = match super::yaml_value(original).ok()? {
             Value::Null => Value::Mapping(Mapping::new()),
             v => v,
         };
@@ -421,6 +656,70 @@ impl ConfigDocument {
     }
 }
 
+/// Go's `buildV8Paths` output for v8.0.35, in its order: the declared legacy leaves
+/// and structs, each with its v8 path. Regenerate with
+/// `tests/reference/legacy_paths/main.go`.
+#[derive(serde::Deserialize)]
+struct LegacyPaths {
+    leaves: Vec<(String, String)>,
+    structs: Vec<(String, String)>,
+}
+
+static LEGACY: std::sync::LazyLock<LegacyPaths> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("legacy_paths.json")).expect("legacy_paths.json is valid")
+});
+
+/// The (legacy, v8) pairs Go's non-migrating `NormalizeConfigLayout` checks, in its
+/// order: the private-IP alias, the historical v8 aliases, Go's declared legacy
+/// leaves, the empty or null legacy structs whose v8 struct is present, then the key
+/// families. A same-spelled field Go does not declare is not an override.
+fn conflict_candidates(root: &Mapping) -> Vec<(String, String)> {
+    let pair = |old: &str, new: &str| (old.to_owned(), new.to_owned());
+    let mut out = vec![pair(
+        "codex.live-media-relay.allow-private-remote-ips",
+        "oauth.providers.codex.live-media-relay.disable-private-remote-ips",
+    )];
+    out.extend(CLIENT_PATHS.iter().chain(SHARED_PATHS).map(|(old, new)| pair(old, new)));
+    out.extend(LEGACY.leaves.iter().cloned());
+    let structs = LEGACY.structs.iter().map(|(old, new)| (old.as_str(), new.as_str()));
+    for (old, new) in structs.chain(SHARED_STRUCTS.iter().copied()) {
+        let empty = match lookup(root, old) {
+            Some(Value::Null) => true,
+            Some(Value::Mapping(m)) => m.is_empty(),
+            _ => false,
+        };
+        if empty && lookup(root, new).is_some() {
+            out.push(pair(old, new));
+        }
+    }
+    out.extend(
+        FAMILIES
+            .iter()
+            .map(|(old, family)| ((*old).to_owned(), format!("api-keys.{family}"))),
+    );
+    out
+}
+
+/// Go `deleteYAMLPath`: removes `parts` and every parent mapping the removal empties.
+fn delete_pruning(map: &mut Mapping, parts: &[&str]) -> bool {
+    let Some((first, rest)) = parts.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return map.shift_remove(*first).is_some();
+    }
+    let Some(child) = map.get_mut(*first).and_then(Value::as_mapping_mut) else {
+        return false;
+    };
+    if !delete_pruning(child, rest) {
+        return false;
+    }
+    if child.is_empty() {
+        map.shift_remove(*first);
+    }
+    true
+}
+
 fn sync_mapping(dst: &yaml_edit::Mapping, src: &Mapping, before: &Mapping) -> anyhow::Result<()> {
     for (key, _) in before {
         if !src.contains_key(key) {
@@ -501,6 +800,90 @@ fn merge(dst: &mut Value, src: Value) {
     } else {
         *dst = src;
     }
+}
+
+/// Go `NormalizeV8ConfigAliases`' moves: historical client and shared spellings go
+/// to their canonical paths, where a present value wins; an empty or null historical
+/// container becomes an empty canonical one.
+fn move_aliases(root: &mut Mapping) -> anyhow::Result<()> {
+    for (old, current) in CLIENT_PATHS.iter().chain(SHARED_PATHS) {
+        if let Some(value) = lookup(root, old).cloned() {
+            remove(root, old);
+            insert_missing(root, current, value)?;
+        }
+    }
+    for (old, current) in SHARED_STRUCTS {
+        match lookup(root, old) {
+            None => continue,
+            Some(Value::Null) => {}
+            Some(Value::Mapping(m)) if m.is_empty() => {}
+            // Fields the schema does not know stay for validation to report.
+            Some(Value::Mapping(_)) => continue,
+            Some(_) => bail!("{old} must be a mapping"),
+        }
+        remove(root, old);
+        insert_missing(root, current, Value::Mapping(Mapping::new()))?;
+    }
+    Ok(())
+}
+
+/// Sets `path`, replacing any value there and creating missing parent mappings.
+fn set_path(root: &mut Mapping, path: &str, value: Value) {
+    let parts: Vec<_> = path.split('.').collect();
+    let mut map = root;
+    for part in &parts[..parts.len() - 1] {
+        let next = map
+            .entry(Value::from(*part))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !next.is_mapping() {
+            *next = Value::Mapping(Mapping::new());
+        }
+        map = next.as_mapping_mut().expect("just made a mapping");
+    }
+    map.insert(Value::from(parts[parts.len() - 1]), value);
+}
+
+/// Go `IsV8ConfigLayout`: a document is v8 by its version, a v8-only section, grouped
+/// `api-keys`, or a v8 path; roots shared with the legacy layout do not count alone.
+pub fn is_v8_layout(root: &Value) -> bool {
+    let mut root = root.clone();
+    if super::expand_merges(&mut root).is_err() {
+        return false;
+    }
+    let Some(map) = root.as_mapping() else {
+        return false;
+    };
+    const SECTIONS: &[&str] = &[
+        "models",
+        "config-version",
+        "server",
+        "management",
+        "access",
+        "credentials",
+        "requests",
+        "oauth",
+        "upstream",
+        "multimedia",
+        "observability",
+    ];
+    if map.keys().any(|k| k.as_str().is_some_and(|k| SECTIONS.contains(&k)))
+        || map.get("api-keys").is_some_and(Value::is_mapping)
+    {
+        return true;
+    }
+    CLIENT_PATHS
+        .iter()
+        .chain(SHARED_PATHS)
+        .chain(SHARED_STRUCTS)
+        .chain(PATHS)
+        .any(|(old, current)| {
+            (old != current && lookup(map, current).is_some())
+                || (old.starts_with("providers.") && lookup(map, old).is_some())
+                || current.strip_prefix("routing.").is_some_and(|rest| {
+                    let child = rest.split('.').next().unwrap_or(rest);
+                    old != current && lookup(map, &format!("routing.{child}")).is_some()
+                })
+        })
 }
 
 fn insert_missing(root: &mut Mapping, path: &str, value: Value) -> anyhow::Result<()> {
@@ -612,6 +995,20 @@ mod tests {
         assert!(doc.migrated_text(anchored).is_none());
     }
 
+    /// Go `TestV8MigrationCarriesProviderKeyFootComments` (3be5fa44).
+    #[test]
+    fn migration_keeps_provider_and_field_key_foot_comments_once() {
+        let original = "oauth:\n    providers:\n        xai:\n            inject-x-search: true\n            \
+                        # FIELD KEY FOOT\n        # PROVIDER KEY FOOT\n";
+        let text = ConfigDocument::parse(original)
+            .unwrap()
+            .migrated_text(original)
+            .unwrap();
+        for marker in ["PROVIDER KEY FOOT", "FIELD KEY FOOT"] {
+            assert_eq!(text.matches(marker).count(), 1, "{marker}: {text}");
+        }
+    }
+
     #[test]
     fn syntax_edits_create_nested_sections_and_empty_lists() {
         let original = "config-version: 8\nrouting:\n  retry:\n    request-retry: 0 # attempts\naccess:\n  api-keys: [fake-client]\n";
@@ -657,16 +1054,24 @@ mod tests {
 
     #[test]
     fn mixed_layout_merges_leaves_and_keeps_presence() {
-        let d = ConfigDocument::parse("request-retry: 4\ndisable-cooling: true\nrouting: {retry: {request-retry: null}, cooldown: {disable-cooling: false}}\ncodex: {disable-codex-cloaking: true, optimize-multi-agent-v2: true}\nclient: {codex: {optimize-multi-agent-v2: false}}\noauth: {providers: {codex: {response-steering: true}}}\n").unwrap();
+        let d = ConfigDocument::parse("request-retry: 4\ndisable-cooling: true\nrouting: {retry: {request-retry: null}, cooldown: {disable-cooling: false}}\ncodex: {disable-codex-cloaking: true, response-steering: false, optimize-multi-agent-v2: true}\nclient: {codex: {optimize-multi-agent-v2: false}}\noauth: {providers: {codex: {response-steering: true}, xai: {}}}\n").unwrap();
         assert!(d.get(&["routing", "retry", "request-retry"]).unwrap().is_null());
         assert_eq!(
             d.get(&["routing", "cooldown", "disable-cooling"]),
             Some(&Value::Bool(false))
         );
+        // v8.0.35: shared settings move to `upstream`; a historical v8 spelling wins
+        // over the legacy root one.
         assert_eq!(
-            d.get(&["oauth", "providers", "codex", "disable-codex-cloaking"]),
+            d.get(&["upstream", "codex", "disable-codex-cloaking"]),
             Some(&Value::Bool(true))
         );
+        assert_eq!(
+            d.get(&["upstream", "codex", "response-steering"]),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(d.get(&["upstream", "xai"]), Some(&Value::Mapping(Mapping::new())));
+        assert!(d.get(&["oauth", "providers"]).is_none(), "{:?}", d.value());
         assert_eq!(
             d.get(&["client", "codex", "optimize-multi-agent-v2"]),
             Some(&Value::Bool(false))

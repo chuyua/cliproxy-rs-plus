@@ -3,12 +3,13 @@
 
 use cpa_common::gostr::trim_space;
 use cpa_common::json::{self as gj, Kind, Res};
+use cpa_core::gostr::GoStr;
 
 use crate::tokenizer::{Encoding, encoder};
 
 /// `tokenizerForCodexModel`: o200k for GPT-5, GPT-4.1 and GPT-4o, cl100k otherwise.
 pub(crate) fn encoding_for_model(model: &str) -> Encoding {
-    let model = model.trim().to_lowercase();
+    let model = model.trim().go_lower();
     if ["gpt-5", "gpt-4.1", "gpt-4o"].iter().any(|p| model.starts_with(p)) {
         Encoding::O200kBase
     } else {

@@ -44,6 +44,8 @@ go_struct! {
         "Max" => max: i64,
         "ZeroAllowed" => zero_allowed: bool,
         "DynamicAllowed" => dynamic_allowed: bool,
+        /// The Claude `thinking.type` that turns thinking off; empty means `disabled`.
+        "DisableType" => disable_type: String,
         "Levels" => levels: Vec<String>,
     }
 }
@@ -904,6 +906,8 @@ go_struct! {
         "Model" => model: String,
         "Alias" => alias: String,
         "APIKey" => api_key: String,
+        "IsNativeKey" => is_native_key: bool,
+        "AccessProvider" => access_provider: String,
         "SessionID" => session_id: String,
         "ParentSessionID" => parent_session_id: String,
         "AuthID" => auth_id: String,
@@ -1130,5 +1134,25 @@ mod tests {
         let raw = to_vec(&m);
         assert!(raw.starts_with(br#"{"ID":"m","Object":"","Created":0,"#));
         assert_eq!(from_slice::<ModelInfo>(&raw).unwrap(), m);
+    }
+
+    /// Go TestPluginThinkingSupportDisableTypeJSONCompatibility: `DisableType` sits
+    /// between `DynamicAllowed` and `Levels`, and an older plugin's payload without it
+    /// still decodes.
+    #[test]
+    fn thinking_support_carries_disable_type() {
+        let t = ThinkingSupport {
+            levels: vec!["low".into()],
+            disable_type: "between_tools".into(),
+            ..Default::default()
+        };
+        let raw = to_vec(&t);
+        assert_eq!(
+            raw,
+            br#"{"Min":0,"Max":0,"ZeroAllowed":false,"DynamicAllowed":false,"DisableType":"between_tools","Levels":["low"]}"#
+        );
+        assert_eq!(from_slice::<ThinkingSupport>(&raw).unwrap(), t);
+        let old = from_slice::<ThinkingSupport>(br#"{"Levels":["low"],"ZeroAllowed":true}"#).unwrap();
+        assert_eq!((old.disable_type.as_str(), old.zero_allowed), ("", true));
     }
 }

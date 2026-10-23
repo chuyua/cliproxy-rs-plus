@@ -75,6 +75,12 @@ pub async fn call_raw<T: GoJson>(client: &Arc<GuardedClient>, method: &str, requ
     decode_response(method, &raw)
 }
 
+/// [`call_raw`] for synchronous callers ([`GuardedClient::call_blocking`]).
+pub fn call_raw_blocking<T: GoJson>(client: &Arc<GuardedClient>, method: &str, request: &[u8]) -> Result<T, CallError> {
+    let raw = client.call_blocking(method, request)?;
+    decode_response(method, &raw)
+}
+
 /// `rpc<X>Request`: a request struct's fields followed by `host_callback_id`
 /// (omitted when empty), as Go's embedding wrappers encode.
 pub fn encode_with_callback<R: gojson::GoStruct>(request: &R, callback_id: &str) -> Vec<u8> {

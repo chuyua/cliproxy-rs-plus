@@ -1,30 +1,28 @@
 //! Management-started logins (Go auth_files_provider_oauth.go, oauth_sessions.go,
 //! oauth_callback.go, auth_files_oauth_callback.go, auth_files_v8.go):
 //! `GET /oauth/auth-url`, `GET /oauth/status`, `DELETE /oauth/session`,
-//! `GET|POST /oauth/callback` and `POST /oauth/import`.
+//! `GET|POST /oauth/callback` and `POST /oauth/import` (vertex_import.go).
 //!
 //! Go hands callbacks to the waiting login through `.oauth-<provider>-<state>.oauth`
 //! files in auth-dir; cliproxy-rs keeps the callback with the pending session in
 //! memory, so nothing extra appears in the watched directory.
-//!
-//! ponytail: the antigravity login and Vertex import answer `provider_not_found` (no
-//! executor or auth module for them yet); no plugin logins.
 
+use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use cpa_core::exec::ExecError;
 use cpa_exec::proxy::Proxy;
 use serde_json::{Value, json};
 
 use super::auth_files::{Query, fail, reply};
 use super::{Management, json as respond};
+use crate::runtime::OAuthDelivery as Delivery;
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const COMPLETED_TTL: Duration = Duration::from_secs(60);
@@ -43,6 +41,12 @@ struct Session {
     plugin: bool,
     /// The plugin's polling context (Go `Session.Metadata`).
     metadata: cpa_plugin::gojson::Metadata,
+    /// A v8 Sign in with ChatGPT binding (Go `oauthSession.SIWC`).
+    siwc: Option<Arc<super::siwc::Flow>>,
+    /// The binding's callback was accepted and its exchange started.
+    siwc_exchanging: bool,
+    /// Go `SIWCCommitting`: a started disk commit keeps the session past its expiry.
+    siwc_committing: bool,
 }
 
 #[derive(Clone)]
@@ -60,12 +64,18 @@ impl Sessions {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
         let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        map.retain(|_, s| s.expires > now);
+        map.retain(|_, s| {
+            let keep = s.expires > now || s.siwc_committing;
+            if let Some(flow) = s.siwc.as_ref().filter(|_| !keep) {
+                flow.cancel();
+            }
+            keep
+        });
         map
     }
 
     fn register(&self, state: &str, provider: &str) {
-        let (state, provider) = (state.trim(), provider.trim().to_lowercase());
+        let (state, provider) = (state.trim(), provider.trim().go_lower());
         if state.is_empty() || provider.is_empty() {
             return;
         }
@@ -79,13 +89,16 @@ impl Sessions {
                 callback: None,
                 plugin: false,
                 metadata: Default::default(),
+                siwc: None,
+                siwc_exchanging: false,
+                siwc_committing: false,
             },
         );
     }
 
     /// Go `RegisterPlugin`: `false` when the state is unusable or already registered.
     pub(super) fn register_plugin(&self, state: &str, provider: &str, metadata: cpa_plugin::gojson::Metadata) -> bool {
-        let (state, provider) = (state.trim(), provider.trim().to_lowercase());
+        let (state, provider) = (state.trim(), provider.trim().go_lower());
         if state.is_empty() || provider.is_empty() || !valid_state(state) {
             return false;
         }
@@ -103,6 +116,9 @@ impl Sessions {
                 callback: None,
                 plugin: true,
                 metadata,
+                siwc: None,
+                siwc_exchanging: false,
+                siwc_committing: false,
             },
         );
         true
@@ -128,6 +144,7 @@ impl Sessions {
         };
         if let Some(s) = self.lock().get_mut(state.trim()).filter(|s| !s.completed) {
             s.status = message.to_owned();
+            s.siwc_committing = false;
             s.expires = Instant::now() + SESSION_TTL;
         }
     }
@@ -137,6 +154,7 @@ impl Sessions {
             s.status.clear();
             s.callback = None;
             s.metadata.clear();
+            s.siwc_committing = false;
             s.completed = true;
             s.expires = Instant::now() + COMPLETED_TTL;
         }
@@ -150,39 +168,138 @@ impl Sessions {
     }
 
     fn is_pending(&self, state: &str, provider: &str) -> bool {
-        let provider = provider.trim().to_lowercase();
+        let provider = provider.trim().go_lower();
         self.lock().get(state.trim()).is_some_and(|s| {
-            !s.completed && s.status.is_empty() && (provider.is_empty() || s.provider.eq_ignore_ascii_case(&provider))
+            !s.completed && s.status.is_empty() && (provider.is_empty() || s.provider.go_eq_fold(&provider))
         })
     }
 
+    /// Go `Cancel`. A binding whose disk commit has started is past cancelling: Go
+    /// waits on the session gate for that commit, which then leaves the session
+    /// completed or failed, so the answer is `false` either way.
     fn cancel(&self, state: &str) -> bool {
         let mut map = self.lock();
         let state = state.trim();
-        if map.get(state).is_some_and(|s| !s.completed && s.status.is_empty()) {
-            map.remove(state);
+        if map
+            .get(state)
+            .is_some_and(|s| !s.completed && s.status.is_empty() && !s.siwc_committing)
+        {
+            if let Some(flow) = map.remove(state).and_then(|s| s.siwc) {
+                flow.cancel();
+            }
             return true;
         }
         false
     }
 
     /// Go `WriteOAuthCallbackFileForPendingSession`: keeps the callback for the waiter.
-    /// `false` when the provider or state is unusable or the login is not pending.
-    fn deliver(&self, provider: &str, state: &str, code: &str, error: &str) -> bool {
+    /// A binding's state is refused: its code may only reach the v8 callback.
+    fn deliver(&self, provider: &str, state: &str, code: &str, error: &str) -> Delivery {
         let Some(provider) = normalize_callback_provider(provider) else {
-            return false;
+            return Delivery::NotPending;
         };
-        if !valid_state(state) || !self.is_pending(state, &provider) {
+        if !valid_state(state) {
+            return Delivery::NotPending;
+        }
+        let mut map = self.lock();
+        let Some(s) = map.get_mut(state.trim()) else {
+            return Delivery::NotPending;
+        };
+        if s.siwc.is_some() {
+            return Delivery::RequiresV8;
+        }
+        if s.completed || !s.status.is_empty() || !s.provider.go_eq_fold(&provider) {
+            return Delivery::NotPending;
+        }
+        s.callback = Some(Callback {
+            code: code.trim().to_owned(),
+            state: state.trim().to_owned(),
+            error: error.trim().to_owned(),
+        });
+        Delivery::Delivered
+    }
+
+    /// Go `registerSIWC`: `false` when the state exists or the credential already has
+    /// a pending binding.
+    pub(super) fn register_siwc(&self, state: &str, flow: Arc<super::siwc::Flow>, ttl: Duration) -> bool {
+        let mut map = self.lock();
+        let busy = map.values().any(|s| {
+            !s.completed && s.status.is_empty() && s.siwc.as_ref().is_some_and(|f| f.target_id == flow.target_id)
+        });
+        if busy || map.contains_key(state) {
             return false;
         }
-        if let Some(s) = self.lock().get_mut(state.trim()) {
-            s.callback = Some(Callback {
-                code: code.trim().to_owned(),
-                state: state.trim().to_owned(),
-                error: error.trim().to_owned(),
-            });
-        }
+        map.insert(
+            state.to_owned(),
+            Session {
+                provider: "codex".into(),
+                status: String::new(),
+                completed: false,
+                expires: Instant::now() + ttl,
+                callback: None,
+                plugin: false,
+                metadata: Default::default(),
+                siwc: Some(flow),
+                siwc_exchanging: false,
+                siwc_committing: false,
+            },
+        );
         true
+    }
+
+    /// The binding a state belongs to, whatever its status.
+    pub(super) fn siwc(&self, state: &str) -> Option<Arc<super::siwc::Flow>> {
+        self.lock().get(state.trim()).and_then(|s| s.siwc.clone())
+    }
+
+    /// Accepts the binding's one callback while it is pending.
+    pub(super) fn begin_siwc(&self, state: &str, flow: &Arc<super::siwc::Flow>) -> bool {
+        let mut map = self.lock();
+        match map.get_mut(state) {
+            Some(s) if Self::siwc_pending(s, flow) && !s.siwc_exchanging => {
+                s.siwc_exchanging = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The binding is still pending (not cancelled, expired, failed or completed).
+    pub(super) fn siwc_is_pending(&self, state: &str, flow: &Arc<super::siwc::Flow>) -> bool {
+        self.lock().get(state).is_some_and(|s| Self::siwc_pending(s, flow))
+    }
+
+    /// Go `claimSIWCCommit`; callers hold `disk`, so file mutations are fenced.
+    pub(super) fn claim_siwc_commit(&self, state: &str, flow: &Arc<super::siwc::Flow>) -> bool {
+        let mut map = self.lock();
+        match map.get_mut(state) {
+            Some(s) if Self::siwc_pending(s, flow) && !s.siwc_committing => {
+                s.siwc_committing = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn siwc_pending(s: &Session, flow: &Arc<super::siwc::Flow>) -> bool {
+        !s.completed && s.status.is_empty() && s.siwc.as_ref().is_some_and(|f| Arc::ptr_eq(f, flow))
+    }
+
+    /// Go `beginSIWCFileMutation` (callers hold `disk`): a v8 upload or delete of a
+    /// binding's file, even an identical one, fails that binding.
+    pub(super) fn invalidate_siwc(&self, path: &std::path::Path) {
+        let mut map = self.lock();
+        for s in map.values_mut() {
+            if let Some(flow) = s.siwc.as_ref()
+                && !s.completed
+                && s.status.is_empty()
+                && super::siwc::same_path(path, &flow.path)
+            {
+                flow.cancel();
+                s.status = "SIWC binding target changed; start a new binding".into();
+                s.expires = Instant::now() + COMPLETED_TTL;
+            }
+        }
     }
 
     fn take_callback(&self, state: &str) -> Option<Callback> {
@@ -201,8 +318,8 @@ pub(super) fn valid_state(state: &str) -> bool {
 }
 
 /// Go `NormalizeOAuthCallbackProvider`: the built-in aliases, else a plugin-style name.
-fn normalize_callback_provider(provider: &str) -> Option<String> {
-    let p = provider.trim().to_lowercase();
+pub(super) fn normalize_callback_provider(provider: &str) -> Option<String> {
+    let p = provider.trim().go_lower();
     let builtin = match p.as_str() {
         "anthropic" | "claude" => Some("anthropic"),
         "codex" | "openai" => Some("codex"),
@@ -285,8 +402,9 @@ pub(super) fn install_callback_sink(state: &Arc<Management>) {
     state
         .rt
         .set_oauth_callback_sink(Some(Arc::new(move |cb: &crate::runtime::OAuthCallback| {
-            weak.upgrade()
-                .is_some_and(|m| m.oauth.deliver(cb.provider, &cb.state, &cb.code, &cb.error))
+            weak.upgrade().map_or(Delivery::NotPending, |m| {
+                m.oauth.deliver(cb.provider, &cb.state, &cb.code, &cb.error)
+            })
         })));
 }
 
@@ -321,7 +439,7 @@ fn global_proxy(state: &Management) -> Proxy {
 
 /// The client for login traffic: the global proxy (else the environment's proxies);
 /// local endpoints in tests.
-fn login_client(state: &Management) -> wreq::Client {
+pub(super) fn login_client(state: &Management) -> wreq::Client {
     if state.login_base.is_some() {
         return state.clients.get(&Proxy::Direct);
     }
@@ -333,13 +451,14 @@ pub(crate) async fn auth_url(State(state): State<Arc<Management>>, RawQuery(raw)
     let raw_query = raw.clone();
     let q = Query::parse(raw);
     let webui = matches!(
-        q.first("is_webui").trim().to_lowercase().as_str(),
+        q.first("is_webui").trim().go_lower().as_str(),
         "1" | "true" | "yes" | "on"
     );
-    match q.first("provider").trim().to_lowercase().as_str() {
+    match q.first("provider").trim().go_lower().as_str() {
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
         "claude" => start_claude(state, webui).await,
         "codex" => start_codex(state, webui).await,
+        "antigravity" => start_antigravity(state, webui).await,
         "kimi" => {
             // Go `RequestKimiToken`: `domain`, else `channel`, else kimi.com.
             let domain = [q.first("domain"), q.first("channel")]
@@ -366,10 +485,104 @@ pub(crate) async fn auth_url(State(state): State<Arc<Management>>, RawQuery(raw)
 }
 
 /// Go `ImportOAuthV8`.
-pub(crate) async fn import(RawQuery(raw): RawQuery) -> Response {
-    match Query::parse(raw).first("provider").trim() {
+pub(crate) async fn import(
+    State(state): State<Arc<Management>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    read: crate::body_limit::Read,
+) -> Response {
+    let query = Query::parse(raw);
+    match query.first("provider").trim().go_lower().as_str() {
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
+        "vertex" => import_vertex(state, &query, &headers, read).await,
         _ => fail(StatusCode::NOT_FOUND, "provider_not_found"),
+    }
+}
+
+/// Go `ImportVertexCredential`: a service-account key uploaded as the `file` form field;
+/// `location` from the form, else the query.
+async fn import_vertex(
+    state: Arc<Management>,
+    query: &Query,
+    headers: &HeaderMap,
+    read: crate::body_limit::Read,
+) -> Response {
+    use super::multipart::Failed;
+    use cpa_exec::vertex_auth::{UploadError, import_upload};
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // Go `FormFile("file")`: any form error reads as a missing file, with the limit's
+    // status for the limit error.
+    let body = match super::multipart::body(read, content_type) {
+        Ok(body) => body,
+        Err(Failed::Read(rejection)) => return rejection.into_response(),
+        Err(Failed::Form(status, _)) => {
+            return fail(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                "file required",
+            );
+        }
+    };
+    let Ok((mut files, values)) = super::multipart::form(content_type, &body) else {
+        return fail(StatusCode::BAD_REQUEST, "file required");
+    };
+    let Some(file) = files.remove("file").and_then(|parts| parts.into_iter().next()) else {
+        return fail(StatusCode::BAD_REQUEST, "file required");
+    };
+    let mut location = values
+        .get("location")
+        .and_then(|v| v.first())
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default();
+    if location.is_empty() {
+        location = query.first("location").trim().to_owned();
+    }
+    let auth_dir = state.rt.config().auth_dir.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        // Under `disk` from the read of an existing file to the write, so a concurrent
+        // management edit (for example `disabled`) is neither lost nor overwritten.
+        let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        let upload = import_upload(&auth_dir, &file.data, &location)?;
+        // Go `saveTokenRecord`: success only once the token store has the file.
+        let mut written = Ok(());
+        let stored = state.store_write(Box::new(|| {
+            written = upload.write();
+            written.as_ref().map_err(|_| anyhow::anyhow!("write failed"))?;
+            Ok(Some(upload.path.clone()))
+        }));
+        written?;
+        stored.map_err(UploadError::Save)?;
+        state.publish((*state.rt.config()).clone(), None);
+        Ok(upload)
+    })
+    .await;
+    let message = |error: &str, message: String| {
+        reply(
+            StatusCode::BAD_REQUEST,
+            [("error", Value::from(error)), ("message", Value::from(message))],
+        )
+    };
+    match saved {
+        Ok(Ok(upload)) => reply(
+            StatusCode::OK,
+            [
+                ("status", "ok".into()),
+                ("auth-file", upload.path.to_string_lossy().into_owned().into()),
+                ("project_id", upload.project.into()),
+                ("email", upload.email.into()),
+                ("location", upload.location.into()),
+            ],
+        ),
+        Ok(Err(UploadError::InvalidJson(e))) => message("invalid json", e),
+        Ok(Err(UploadError::InvalidServiceAccount(e))) => message("invalid service account", e),
+        Ok(Err(UploadError::ProjectMissing)) => fail(StatusCode::BAD_REQUEST, "project_id missing"),
+        Ok(Err(UploadError::Save(e))) => reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("error", Value::from("save_failed")), ("message", Value::from(e))],
+        ),
+        Err(_) => fail(StatusCode::INTERNAL_SERVER_ERROR, "save_failed"),
     }
 }
 
@@ -392,33 +605,59 @@ async fn save_if_pending<T: Send + 'static>(
     save_error: &str,
 ) -> Outcome {
     let auth_dir = state.rt.config().auth_dir.clone();
-    let (guard, sid, provider) = (state.clone(), sid.to_owned(), provider.to_owned());
+    let (worker, sid, owner) = (state.clone(), sid.to_owned(), provider.to_owned());
     let saved = tokio::task::spawn_blocking(move || {
-        // Checked on the blocking thread itself, right before the write.
-        if !guard.oauth.is_pending(&sid, &provider) {
-            return Ok(None);
-        }
-        write(auth_dir, value).map(Some)
+        let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        // Go `saveTokenRecord`: saved only once the token store has the file. The
+        // session is checked right before the write, after any store sync.
+        worker.store_write(Box::new(|| {
+            if !worker.oauth.is_pending(&sid, &owner) {
+                return Ok(None);
+            }
+            write(auth_dir, value).map(Some).map_err(anyhow::Error::msg)
+        }))
     })
     .await;
     match saved {
         Ok(Ok(Some(_))) => Outcome::Saved,
         Ok(Ok(None)) => Outcome::Cancelled,
-        _ => Outcome::Failed(save_error.to_owned()),
+        Ok(Err(e)) => {
+            tracing::error!("failed to save {provider} token: {e}");
+            Outcome::Failed(save_error.to_owned())
+        }
+        Err(_) => Outcome::Failed(save_error.to_owned()),
     }
 }
 
-fn settle(state: &Management, sid: &str, outcome: Outcome) {
+async fn settle(state: &Arc<Management>, sid: &str, outcome: Outcome) {
     match outcome {
         Outcome::Saved => {
-            {
-                let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-                state.publish((*state.rt.config()).clone(), None);
+            // `disk` can be held by a save that waits on the store's async I/O, so it is
+            // never taken on a runtime worker.
+            let worker = state.clone();
+            let published = tokio::task::spawn_blocking(move || {
+                let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
+                worker.publish((*worker.rt.config()).clone(), None);
+            })
+            .await;
+            if published.is_err() {
+                return fail_session(state, sid, "Failed to save authentication tokens");
             }
             state.oauth.complete(sid);
         }
         Outcome::Cancelled => {}
-        Outcome::Failed(message) => state.oauth.set_error(sid, &message),
+        Outcome::Failed(message) => return fail_session(state, sid, &message),
+    }
+    if let Some(settled) = &state.login_settled {
+        let _ = settled.send(sid.to_owned());
+    }
+}
+
+/// [`settle`] for a failed login, which publishes nothing.
+fn fail_session(state: &Management, sid: &str, message: &str) {
+    state.oauth.set_error(sid, message);
+    if let Some(settled) = &state.login_settled {
+        let _ = settled.send(sid.to_owned());
     }
 }
 
@@ -463,8 +702,14 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
             };
             let outcome = match exchanged {
                 Ok(patch) => {
-                    let write = |dir: PathBuf, patch| ManagedLogin::save(&dir, patch).map_err(|e| exec_text(&e));
-                    save_if_pending(
+                    let legacy = Arc::new(Mutex::new(None));
+                    let slot = legacy.clone();
+                    let write = move |dir: PathBuf, patch| {
+                        let (path, old) = ManagedLogin::save(&dir, patch).map_err(|e| exec_text(&e))?;
+                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
+                        Ok(path)
+                    };
+                    let saved = save_if_pending(
                         &worker,
                         &login.state,
                         "anthropic",
@@ -472,15 +717,46 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                         write,
                         "Failed to save authentication tokens",
                     )
-                    .await
+                    .await;
+                    let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
+                    match (saved, old) {
+                        (Outcome::Saved, Some(old)) => remove_legacy_claude(&worker, old).await,
+                        (saved, _) => saved,
+                    }
                 }
                 Err(_) => Outcome::Failed("Failed to exchange authorization code for tokens".into()),
             };
-            settle(&worker, &login.state, outcome);
+            settle(&worker, &login.state, outcome).await;
         }
         stop_forwarder(&worker, ANTHROPIC_CALLBACK_PORT, forwarder);
     });
     started(url, sid)
+}
+
+/// Go `saveTokenRecord` after the canonical Claude credential is stored: the matching
+/// legacy file is deleted through the token store (`store.Delete`), so a git store
+/// commits the removal its watcher guard would refuse.
+async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outcome {
+    let worker = state.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        if worker.store.is_some() {
+            return worker.store_delete(&legacy);
+        }
+        match std::fs::remove_file(&legacy) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    })
+    .await;
+    match removed {
+        Ok(Ok(())) => Outcome::Saved,
+        Ok(Err(e)) => {
+            tracing::error!("canonical Claude credential saved but legacy credential cleanup failed: {e}");
+            Outcome::Failed("Failed to save authentication tokens".into())
+        }
+        Err(_) => Outcome::Failed("Failed to save authentication tokens".into()),
+    }
 }
 
 /// Go `RequestCodexToken`.
@@ -537,9 +813,88 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
                     &exec_text(&e),
                 )),
             };
-            settle(&worker, &flow, outcome);
+            settle(&worker, &flow, outcome).await;
         }
         stop_forwarder(&worker, CODEX_CALLBACK_PORT, forwarder);
+    });
+    started(url, sid)
+}
+
+/// Go `RequestAntigravityToken`: reuse the CLI exchange and storage, but unlike
+/// `CompleteAntigravityOAuth`, a project discovery failure does not fail the login.
+async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
+    use cpa_exec::antigravity_auth::{DEFAULT_CALLBACK_PORT, OAuth, auth_url, build_auth, redirect_uri, write_login};
+    let Some(sid) = random_state() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
+    };
+    let redirect = redirect_uri(DEFAULT_CALLBACK_PORT);
+    let url = auth_url(&sid, &redirect);
+    state.oauth.register(&sid, "antigravity");
+    let forwarder = if webui {
+        match start_forwarder(&state, DEFAULT_CALLBACK_PORT, "/antigravity/callback").await {
+            Ok(id) => Some(id),
+            Err(message) => return fail(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    } else {
+        None
+    };
+    let worker = state.clone();
+    let flow = sid.clone();
+    tokio::spawn(async move {
+        if let Some(cb) = next_callback(&worker, &flow, "antigravity").await {
+            let outcome = async {
+                if !cb.error.is_empty() {
+                    return Outcome::Failed("Authentication failed".into());
+                }
+                if !cb.state.is_empty() && cb.state != flow {
+                    return Outcome::Failed("Authentication failed: state mismatch".into());
+                }
+                if cb.code.is_empty() {
+                    return Outcome::Failed("Authentication failed: code not found".into());
+                }
+                let client = login_client(&worker);
+                let oauth = match &worker.login_base {
+                    Some(base) => OAuth::with_endpoints(
+                        client,
+                        &format!("{base}/token"),
+                        &format!("{base}/oauth2/v2/userinfo?alt=json"),
+                        base,
+                        base,
+                    ),
+                    None => OAuth::new(client),
+                };
+                let tokens = match oauth.exchange_code(&cb.code, &redirect).await {
+                    Ok(tokens) if !tokens.access_token.trim().is_empty() => tokens,
+                    _ => return Outcome::Failed("Failed to exchange token".into()),
+                };
+                let access = tokens.access_token.trim();
+                let email = match oauth.user_info(access).await {
+                    Ok(email) if !email.trim().is_empty() => email,
+                    _ => return Outcome::Failed("Failed to fetch user info".into()),
+                };
+                let project = oauth.project_id(access).await.unwrap_or_else(|_| {
+                    // Upstream bodies can contain credentials; do not log the cause.
+                    tracing::warn!("antigravity: failed to fetch project ID during management login");
+                    String::new()
+                });
+                let record = build_auth(&tokens, &email, &project, chrono::Utc::now());
+                let write = |dir: PathBuf, (name, metadata): (String, serde_json::Map<String, Value>)| {
+                    write_login(&dir, &name, &metadata)
+                };
+                save_if_pending(
+                    &worker,
+                    &flow,
+                    "antigravity",
+                    record,
+                    write,
+                    "Failed to save token to file",
+                )
+                .await
+            }
+            .await;
+            settle(&worker, &flow, outcome).await;
+        }
+        stop_forwarder(&worker, DEFAULT_CALLBACK_PORT, forwarder);
     });
     started(url, sid)
 }
@@ -554,7 +909,12 @@ async fn next_callback(state: &Management, sid: &str, provider: &str) -> Option<
             return None;
         }
         if Instant::now() > deadline {
-            state.oauth.set_error(sid, "Timeout waiting for OAuth callback");
+            let message = if provider == "antigravity" {
+                "OAuth flow timed out"
+            } else {
+                "Timeout waiting for OAuth callback"
+            };
+            state.oauth.set_error(sid, message);
             return None;
         }
         if let Some(cb) = state.oauth.take_callback(sid) {
@@ -610,7 +970,7 @@ async fn start_devin(state: Arc<Management>) -> Response {
         };
         let fail = |message: &str| {
             if worker.oauth.is_pending(&flow, "devin") {
-                settle(&worker, &flow, Outcome::Failed(message.into()));
+                fail_session(&worker, &flow, message);
             }
         };
         if cb.state != flow {
@@ -653,7 +1013,7 @@ async fn start_devin(state: Arc<Management>) -> Response {
             "Failed to save authentication tokens",
         )
         .await;
-        settle(&worker, &flow, outcome);
+        settle(&worker, &flow, outcome).await;
     });
     started(url, sid)
 }
@@ -746,7 +1106,7 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
             Err(_) if !worker.oauth.is_pending(&sid, provider) => Outcome::Cancelled,
             Err(e) => Outcome::Failed(with_cause("Authentication failed", &exec_text(&e))),
         };
-        settle(&worker, &sid, outcome);
+        settle(&worker, &sid, outcome).await;
     });
     response
 }
@@ -798,7 +1158,7 @@ async fn start_meta(state: Arc<Management>) -> Response {
                 save_if_pending(&worker, &sid, "meta", bundle, write, "Failed to save token to file").await
             }
         };
-        settle(&worker, &sid, outcome);
+        settle(&worker, &sid, outcome).await;
     });
     response
 }
@@ -860,7 +1220,7 @@ async fn start_xai(state: Arc<Management>) -> Response {
                 save_if_pending(&worker, &sid, "xai", record, write, "Failed to save token to file").await
             }
         };
-        settle(&worker, &sid, outcome);
+        settle(&worker, &sid, outcome).await;
     });
     response
 }
@@ -1036,16 +1396,22 @@ pub(crate) async fn cancel(State(state): State<Arc<Management>>, RawQuery(raw): 
 }
 
 #[derive(Default)]
-struct CallbackRequest {
-    provider: String,
-    redirect_url: String,
-    code: String,
-    state: String,
-    error: String,
+pub(super) struct CallbackRequest {
+    pub(super) provider: String,
+    pub(super) redirect_url: String,
+    pub(super) code: String,
+    pub(super) state: String,
+    pub(super) error: String,
+    /// v8 only: the client ID a Sign in with ChatGPT authorization issued.
+    pub(super) client_id: String,
 }
 
-/// Go `GetOAuthCallback`.
-pub(crate) async fn callback_get(State(state): State<Arc<Management>>, RawQuery(raw): RawQuery) -> Response {
+/// Go `GetOAuthCallback`, and under v8 `GetOAuthCallbackV8`.
+pub(crate) async fn callback_get(
+    State(state): State<Arc<Management>>,
+    uri: axum::http::Uri,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let q = Query::parse(raw);
     let error = [q.first("error"), q.first("error_description")]
         .into_iter()
@@ -1058,43 +1424,54 @@ pub(crate) async fn callback_get(State(state): State<Arc<Management>>, RawQuery(
         code: q.first("code").trim().to_owned(),
         state: q.first("state").trim().to_owned(),
         error,
+        client_id: q.first("client_id").trim().to_owned(),
         ..CallbackRequest::default()
     };
+    if uri.path().starts_with("/v8/")
+        && let Some(response) = super::siwc::callback(&state, &req, Some(&q))
+    {
+        return response;
+    }
     handle_callback(&state, req)
 }
 
 /// Go `PostOAuthCallback`: gin's `ShouldBindJSON` into `oauthCallbackRequest`
-/// (first JSON value, exact-then-case-insensitive names, type mismatches rejected).
-pub(crate) async fn callback_post(State(state): State<Arc<Management>>, body: Bytes) -> Response {
-    const FIELDS: [&str; 5] = ["provider", "redirect_url", "code", "state", "error"];
+/// (first JSON value, exact-then-folded names, type mismatches rejected).
+/// Under v8, `PostOAuthCallbackV8`, whose request also has `client_id`.
+pub(crate) async fn callback_post(
+    State(state): State<Arc<Management>>,
+    uri: axum::http::Uri,
+    body: Result<crate::body_limit::FirstJson, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(crate::body_limit::FirstJson(body)) => body,
+        Err(rejection) => return status_error(super::read_status(&rejection), "invalid body"),
+    };
+    let v8 = uri.path().starts_with("/v8/");
+    const FIELDS: [&str; 6] = ["provider", "redirect_url", "code", "state", "error", "client_id"];
+    let fields = if v8 { &FIELDS[..] } else { &FIELDS[..5] };
     let invalid = || status_error(StatusCode::BAD_REQUEST, "invalid body");
-    let members = serde_json::Deserializer::from_slice(&body)
-        .into_iter::<super::api_call::Members>()
-        .next();
-    let Some(Ok(super::api_call::Members(members))) = members else {
+    let Some(members) = super::api_call::bind_struct(&body, fields) else {
         return invalid();
     };
     let mut req = CallbackRequest::default();
-    for (key, v) in members.unwrap_or_default() {
-        let Some(i) = FIELDS
-            .iter()
-            .position(|f| *f == key)
-            .or_else(|| FIELDS.iter().position(|f| f.eq_ignore_ascii_case(&key)))
-        else {
-            continue;
-        };
+    for (i, v) in members {
         let slot = match i {
             0 => &mut req.provider,
             1 => &mut req.redirect_url,
             2 => &mut req.code,
             3 => &mut req.state,
-            _ => &mut req.error,
+            4 => &mut req.error,
+            _ => &mut req.client_id,
         };
         match v {
             Value::String(s) => *slot = s,
             Value::Null => {}
             _ => return invalid(),
         }
+    }
+    if v8 && let Some(response) = super::siwc::callback(&state, &req, None) {
+        return response;
     }
     handle_callback(&state, req)
 }
@@ -1155,7 +1532,7 @@ fn handle_callback(state: &Management, req: CallbackRequest) -> Response {
     if !status.is_empty() {
         return status_error(StatusCode::CONFLICT, &status);
     }
-    if !session_provider.eq_ignore_ascii_case(&canonical) {
+    if !session_provider.go_eq_fold(&canonical) {
         return status_error(StatusCode::BAD_REQUEST, "provider does not match state");
     }
     // A plugin reads its callback from the auth directory, where Go writes every one.
@@ -1169,7 +1546,12 @@ fn handle_callback(state: &Management, req: CallbackRequest) -> Response {
             }
         };
     }
-    if !plugin && state.oauth.deliver(&canonical, &sid, &code, &error) {
+    if !plugin
+        && matches!(
+            state.oauth.deliver(&canonical, &sid, &code, &error),
+            Delivery::Delivered
+        )
+    {
         return reply(StatusCode::OK, [("status", "ok".into())]);
     }
     match state.oauth.get(&sid) {
@@ -1268,7 +1650,7 @@ mod tests {
         let s = Sessions::default();
         s.register("st", "codex");
         assert!(s.is_pending("st", "CODEX"));
-        assert!(s.deliver("openai", "st", "c", ""));
+        assert_eq!(s.deliver("openai", "st", "c", ""), Delivery::Delivered);
         assert_eq!(s.take_callback("st").map(|c| c.code).as_deref(), Some("c"));
         s.set_error("st", " ");
         assert_eq!(
@@ -1276,7 +1658,7 @@ mod tests {
             Some(("codex".into(), "Authentication failed".into(), false))
         );
         assert!(!s.cancel("st"), "an errored session is not cancellable");
-        assert!(!s.deliver("codex", "st", "c", ""));
+        assert_eq!(s.deliver("codex", "st", "c", ""), Delivery::NotPending);
         s.register("done", "meta");
         s.complete("done");
         assert_eq!(s.get("done"), Some(("meta".into(), String::new(), true)));
@@ -1284,6 +1666,25 @@ mod tests {
         s.register("live", "kimi");
         assert!(s.cancel("live"));
         assert!(s.get("live").is_none());
+    }
+
+    /// Go `TestSIWCBindCommitSurvivesSessionExpiry`: a binding whose disk commit has
+    /// started outlives its session expiry so it can report the outcome, and completing
+    /// it releases that hold.
+    #[test]
+    fn a_claimed_siwc_commit_outlives_the_session_expiry() {
+        let s = Sessions::default();
+        let flow = super::super::siwc::Flow::idle("codex.json");
+        assert!(s.register_siwc("st", flow.clone(), Duration::from_secs(300)));
+        assert!(s.claim_siwc_commit("st", &flow));
+        let expire = || s.lock().get_mut("st").unwrap().expires = Instant::now();
+        expire();
+        assert_eq!(s.get("st"), Some(("codex".into(), String::new(), false)));
+        assert!(!s.cancel("st"), "a started commit is past cancelling");
+        s.complete("st");
+        assert_eq!(s.get("st"), Some(("codex".into(), String::new(), true)));
+        expire();
+        assert!(s.get("st").is_none(), "the completed session no longer holds on");
     }
 
     #[test]

@@ -167,6 +167,11 @@ func (r *runner) start(sc *scenario) {
 	for {
 		res, err := r.raw(httpArgs{Method: "GET", Path: "/healthz"})
 		if err == nil && res.Status == 200 {
+			// The plugin model sync (executor.identifier calls) runs after the
+			// listener is up; wait until the recorders go quiet, then drop startup
+			// calls so steps compare request-time calls only.
+			r.settle()
+			r.records(recordsArgs{})
 			return
 		}
 		if time.Now().After(deadline) {
@@ -175,6 +180,30 @@ func (r *runner) start(sc *scenario) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// settle waits until no recorder file has grown for 300ms. A recorder still busy
+// after 5s fails the generation rather than recording a truncated golden.
+func (r *runner) settle() {
+	size := func() int64 {
+		var total int64
+		for _, entry := range must(os.ReadDir(r.dirs["RECDIR"])) {
+			if info, err := entry.Info(); err == nil && !entry.IsDir() {
+				total += info.Size()
+			}
+		}
+		return total
+	}
+	last, quiet := size(), time.Now()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(25 * time.Millisecond)
+		if now := size(); now != last {
+			last, quiet = now, time.Now()
+		} else if time.Since(quiet) >= 300*time.Millisecond {
+			return
+		}
+	}
+	panic(fmt.Sprintf("plugin recorders in %s still busy after 5s", r.dirs["RECDIR"]))
 }
 
 func (r *runner) stop() {

@@ -7,12 +7,12 @@ use cpa_common::json::{self as gj, GoValue, Kind, Res};
 use cpa_common::signature::{self as sig, BlockKind, Provider};
 use sha2::{Digest, Sha256};
 
-use crate::common::{self, go_lower, trim_space};
+use crate::common::{self, UserTurnDrops, go_lower, trim_space};
 use crate::{Error, Registered, RequestCtx, codex_claude_response as response, openai_claude};
 
 pub static PAIR: Registered = registered!(
     Claude -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body, false)),
+    request: |ctx, body| convert(ctx.model, body, false),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: Some(openai_claude::claude_input_tokens),
@@ -21,7 +21,7 @@ pub static PAIR: Registered = registered!(
 /// ConvertClaudeRequestToCodexWithCompat: assistant thinking blocks with empty or
 /// unknown-format signatures are kept for compatibility endpoints.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(convert(ctx.model, body, true))
+    convert(ctx.model, body, true)
 }
 
 const NAME_LIMIT: usize = 64;
@@ -305,6 +305,43 @@ fn image_data_url(source: &Res<'_>) -> Option<Vec<u8>> {
     Some(data_url(&media, &data))
 }
 
+/// claudeImageInputPart: inline bytes as a data URL, an http(s) url source, or a file id.
+fn image_input_part(source: &Res<'_>) -> Option<Vec<u8>> {
+    if let Some(url) = image_data_url(source) {
+        return Some(input_image(&url));
+    }
+    let kind = source.get("type").bytes();
+    let url = source.get("url").bytes();
+    if &*kind == b"url" && common::is_http_url(&url) {
+        return Some(input_image(trim_space(&url)));
+    }
+    let file_id = source.get("file_id").bytes();
+    if &*kind == b"file" && !file_id.is_empty() {
+        let mut part = br#"{"type":"input_image"}"#.to_vec();
+        gj::set_str(&mut part, "file_id", &file_id);
+        return Some(part);
+    }
+    None
+}
+
+/// claudeDocumentDataURL: an inline PDF as a Codex input_file URL. Anything else, a
+/// file id included, cannot be represented.
+fn document_data_url(part: &Res<'_>) -> Option<Vec<u8>> {
+    let source = part.get("source");
+    if source.get("type").bytes().as_ref() != b"base64" {
+        return None;
+    }
+    let media = trim_space(&source.get("media_type").bytes()).to_vec();
+    if !eq_fold(&media, "application/pdf") {
+        return None;
+    }
+    let mut data = source.get("data").bytes().into_owned();
+    if data.is_empty() {
+        data = source.get("base64").bytes().into_owned();
+    }
+    (!data.is_empty()).then(|| data_url(&media, &data))
+}
+
 fn input_image(url: &[u8]) -> Vec<u8> {
     let mut part = br#"{"type":"input_image","image_url":""}"#.to_vec();
     gj::set_str(&mut part, "image_url", url);
@@ -319,6 +356,7 @@ struct Messages<'m> {
     items: Vec<Vec<u8>>,
     pending_tool_uses: Vec<Vec<u8>>,
     pending_reminders: Vec<Vec<u8>>,
+    drops: UserTurnDrops,
 }
 
 impl Messages<'_> {
@@ -368,12 +406,19 @@ impl Messages<'_> {
             gj::set_str(&mut part, "text", text);
             part
         };
+        // Counts only what this turn itself sends, not reminders flushed beside it. Empty
+        // text is forwarded but does not count: it can hide an emptied attachment.
+        let mut sendable = 0;
+        let user = role == b"user";
         if content.is_array() {
             for part in &parts {
-                match part.get("type").bytes().as_ref() {
+                let kind = part.get("type").bytes();
+                match kind.as_ref() {
                     b"text" => {
                         self.flush_reminders();
-                        current.push(text_part(&part.get("text").bytes()));
+                        let text = part.get("text").bytes();
+                        sendable += usize::from(!text.is_empty());
+                        current.push(text_part(&text));
                     }
                     b"thinking" => {
                         if role != b"assistant" {
@@ -389,29 +434,27 @@ impl Messages<'_> {
                     }
                     b"image" => {
                         self.flush_reminders();
-                        if let Some(url) = image_data_url(&part.get("source")) {
-                            current.push(input_image(&url));
+                        match image_input_part(&part.get("source")) {
+                            Some(image) => {
+                                current.push(image);
+                                sendable += 1;
+                            }
+                            None if user => self.drops.drop_part("image"),
+                            None => {}
                         }
                     }
-                    b"document" => {
+                    b"document" | b"container_upload" => {
                         self.flush_reminders();
-                        let source = part.get("source");
-                        if source.get("type").bytes().as_ref() != b"base64" {
-                            continue;
-                        }
-                        let media = trim_space(&source.get("media_type").bytes()).to_vec();
-                        if !eq_fold(&media, "application/pdf") {
-                            continue;
-                        }
-                        let mut data = source.get("data").bytes().into_owned();
-                        if data.is_empty() {
-                            data = source.get("base64").bytes().into_owned();
-                        }
-                        if !data.is_empty() {
-                            let mut file =
-                                br#"{"type":"input_file","file_data":"","filename":"document.pdf"}"#.to_vec();
-                            gj::set_str(&mut file, "file_data", data_url(&media, &data));
-                            current.push(file);
+                        match document_data_url(part) {
+                            Some(url) => {
+                                let mut file =
+                                    br#"{"type":"input_file","file_data":"","filename":"document.pdf"}"#.to_vec();
+                                gj::set_str(&mut file, "file_data", url);
+                                current.push(file);
+                                sendable += 1;
+                            }
+                            None if user => self.drops.drop_part(&String::from_utf8_lossy(&kind)),
+                            None => {}
                         }
                     }
                     b"tool_use" => {
@@ -429,6 +472,7 @@ impl Messages<'_> {
                     b"tool_result" => {
                         flush(&mut self.items, &mut current);
                         self.items.push(tool_result(part));
+                        sendable += 1;
                     }
                     _ => {}
                 }
@@ -436,9 +480,13 @@ impl Messages<'_> {
             flush(&mut self.items, &mut current);
             self.flush_reminders();
         } else if content.kind == Kind::String {
+            sendable += usize::from(!content.s.is_empty());
             current.push(text_part(&content.s));
             flush(&mut self.items, &mut current);
             self.flush_reminders();
+        }
+        if user {
+            self.drops.end_turn(sendable);
         }
     }
 
@@ -507,8 +555,9 @@ fn eq_fold(value: &[u8], token: &str) -> bool {
     String::from_utf8_lossy(value).go_eq_fold(token)
 }
 
-/// convertClaudeRequestToCodex.
-fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
+/// convertClaudeRequestToCodex. A user turn left empty because its only attachment
+/// cannot be sent is refused.
+fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
     let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
     let root = gj::parse(raw);
     let names = original_to_short(raw);
@@ -520,6 +569,7 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
         items: vec![],
         pending_tool_uses: vec![],
         pending_reminders: vec![],
+        drops: UserTurnDrops::default(),
     };
 
     let system = root.get("system");
@@ -557,6 +607,7 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
     }
 
     let tools = root.get("tools");
+    let mut has_web_search = false;
     let mut tool_items: Vec<Vec<u8>> = vec![];
     if tools.is_array() {
         let web_search: HashSet<Vec<u8>> = tools
@@ -573,6 +624,7 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
         );
         for tool in tools.array() {
             if is_web_search_tool(&tool.get("type").bytes()) {
+                has_web_search = true;
                 tool_items.push(web_search_tool(&tool));
                 continue;
             }
@@ -661,7 +713,15 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
     }
     gj::set_bool(&mut out, "stream", true);
     gj::set_bool(&mut out, "store", false);
-    gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
+    if has_web_search {
+        gj::set_strs(
+            &mut out,
+            "include",
+            &["reasoning.encrypted_content", "web_search_call.action.sources"],
+        );
+    } else {
+        gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
+    }
 
     let format = root.get("output_config.format");
     if format.is_object() && format.get("type").bytes().as_ref() == b"json_schema" && format.get("schema").is_object() {
@@ -681,5 +741,6 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Vec<u8> {
         gj::set_raw(&mut out, "tools", gj::join(&tool_items));
     }
     gj::set_items(&mut out, "input", &state.items);
-    out
+    state.drops.result()?;
+    Ok(out)
 }

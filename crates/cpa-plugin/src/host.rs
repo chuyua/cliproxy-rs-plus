@@ -8,6 +8,7 @@
 //! empties the snapshot but keeps libraries loaded, as Go does. A plugin whose host-side
 //! adapter panicked is fused: skipped until its file changes.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -151,7 +152,6 @@ pub(crate) struct State {
     /// Go `modelProviders`: plugin ID to the provider its models registered under.
     pub model_providers: HashMap<String, String>,
     pub model_registrations: HashMap<String, crate::models::ModelRegistration>,
-    pub model_client_ids: HashSet<String>,
     pub executor_providers: HashSet<String>,
     pub executor_model_client_ids: HashSet<String>,
     pub provider_models: BTreeMap<String, Vec<api::ModelInfo>>,
@@ -166,6 +166,16 @@ pub(crate) struct Inner {
     snapshot: RwLock<Arc<Snapshot>>,
     loader: Arc<dyn Loader>,
     pub callbacks: Callbacks,
+    /// Set once this host's translator hooks are handed out (`translator_hooks`): from
+    /// then on its lifecycle keeps cpa-translate's hook flag current.
+    pub(crate) hooks_installed: std::sync::atomic::AtomicBool,
+    /// The same for the auth parser (`auth_parser`) and cpa-core's auth-parser flag.
+    pub(crate) auth_parser_installed: std::sync::atomic::AtomicBool,
+    /// What `auth_parser` hands out.
+    pub(crate) auth_parser: std::sync::OnceLock<Arc<dyn cpa_core::config::credentials::PluginAuthParser>>,
+    /// The `auth.parse` calls in flight: the plugin instance asked, the auth file's
+    /// cleaned absolute path, and whether a `host.auth.save` asked (`auth::Parsing`).
+    pub(crate) auth_parses: Mutex<Vec<(Arc<CallbackInstance>, PathBuf, bool)>>,
 }
 
 /// The plugin host. Cheap to clone.
@@ -189,7 +199,8 @@ fn clean_path(path: &Path) -> PathBuf {
 
 /// Go `normalizeProviderID`.
 pub fn normalize_provider(provider: &str) -> String {
-    provider.trim().to_lowercase()
+    use cpa_common::gostr::GoStr;
+    provider.trim().go_lower()
 }
 
 impl Default for Host {
@@ -213,6 +224,10 @@ impl Host {
             snapshot: RwLock::new(Arc::default()),
             loader,
             callbacks: Callbacks::new(me.clone()),
+            hooks_installed: Default::default(),
+            auth_parser_installed: Default::default(),
+            auth_parser: Default::default(),
+            auth_parses: Default::default(),
         });
         Self { inner }
     }
@@ -229,7 +244,11 @@ impl Host {
             .clone()
     }
 
-    fn store_snapshot(&self, snapshot: Snapshot) {
+    /// Publishes a snapshot. Takes the state guard so that publication and the active
+    /// maps change in one critical section (Go `h.mu`): a registration that compares
+    /// snapshots under the state lock then never commits against a half-applied change.
+    fn store_snapshot(&self, state: &mut State, snapshot: Snapshot) {
+        self.publish_hook_activity(state, &snapshot.records);
         *self
             .inner
             .snapshot
@@ -292,6 +311,8 @@ impl Host {
         state.fused.insert(id.to_owned(), format!("{what} panic: {panic}"));
         // Go `thinking.UnregisterPluginProviders`.
         state.thinking_providers.retain(|_, owner| owner != id);
+        cpa_common::thinking::unregister_plugin_providers(id);
+        self.publish_hook_activity(&state, &self.snapshot().records);
         drop(state);
         tracing::error!(plugin_id = %id, method = %what, "pluginhost: plugin panic recovered: {panic}");
     }
@@ -483,6 +504,9 @@ impl Host {
                         state.retired.entry(file.id.clone()).or_default().push(old);
                         state.fused.remove(&file.id);
                         remove_runtime_state(&mut state, &file.id);
+                        // The unfused plugin is eligible now, not once the remaining
+                        // plugins have registered and the snapshot is published.
+                        self.publish_hook_activity(&state, &self.snapshot().records);
                     }
                     state.loaded.insert(file.id.clone(), lp);
                 }
@@ -520,13 +544,16 @@ impl Host {
                 state.cleanup_files_pending = false;
             }
             rebuild_active_maps(&mut state, &records);
+            self.store_snapshot(
+                &mut state,
+                Snapshot {
+                    enabled: true,
+                    records,
+                    ..Default::default()
+                },
+            );
             cleanup
         };
-        self.store_snapshot(Snapshot {
-            enabled: true,
-            records,
-            ..Default::default()
-        });
         self.refresh_thinking_providers().await;
         for (id, version, path, old_version, old_path) in hot_reloads {
             tracing::info!(plugin_id = %id, active_version = %version, active_path = %path.display(), retired_version = %old_version, retired_path = %old_path.display(), "pluginhost: plugin hot reloaded");
@@ -541,8 +568,7 @@ impl Host {
         state.management_routes.clear();
         state.resource_routes.clear();
         rebuild_active_maps(&mut state, &[]);
-        drop(state);
-        self.store_snapshot(Snapshot::default());
+        self.store_snapshot(&mut state, Snapshot::default());
     }
 
     fn client_of(&self, id: &str) -> Option<Arc<GuardedClient>> {
@@ -703,7 +729,9 @@ impl Host {
         }
         let plugin = match self.call_register(id, &item).await {
             Some(plugin) => {
-                self.state().fused.remove(id);
+                let mut state = self.state();
+                state.fused.remove(id);
+                self.publish_hook_activity(&state, &self.snapshot().records);
                 plugin
             }
             None => previous?,
@@ -755,19 +783,53 @@ impl Host {
     /// Go `UnloadPluginContext`: detach `id` from the runtime, then close every loaded
     /// instance of it, waiting up to `wait` for running calls.
     pub async fn unload_plugin(&self, id: &str, wait: Option<Duration>) -> bool {
-        let host = self.clone();
-        let id = id.to_owned();
-        tokio::spawn(async move { host.unload_plugin_inner(&id, wait).await })
-            .await
-            .unwrap_or(false)
+        self.spawn_unload(id, wait, None).await.unwrap_or(false)
     }
 
-    async fn unload_plugin_inner(&self, id: &str, wait: Option<Duration>) -> bool {
+    /// Go `UnloadPluginContext` with a cancellable context: cancelling `cancel` stops
+    /// waiting for the apply lock (`false`) or for the plugin to shut down, and releases
+    /// the lock; the shutdown itself still completes on its own thread.
+    pub async fn unload_plugin_until(&self, id: &str, cancel: &tokio_util::sync::CancellationToken) -> bool {
+        self.spawn_unload(id, None, Some(cancel.clone())).await.unwrap_or(false)
+    }
+
+    /// Not inlined, so callers in other crates share one instance of the spawned unload
+    /// instead of compiling their own (about 25 KB each in the release binary).
+    #[inline(never)]
+    fn spawn_unload(
+        &self,
+        id: &str,
+        wait: Option<Duration>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> tokio::task::JoinHandle<bool> {
+        let host = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move { host.unload_plugin_inner(&id, wait, cancel).await })
+    }
+
+    async fn unload_plugin_inner(
+        &self,
+        id: &str,
+        wait: Option<Duration>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> bool {
         let id = id.trim();
         if id.is_empty() {
             return false;
         }
-        let _apply = self.inner.apply.lock().await;
+        // A fresh future for each wait: one that completed must not be polled again.
+        let cancelled = || async {
+            match &cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        // Go `lockApply`: an available lock is taken even when already cancelled.
+        let _apply = tokio::select! {
+            biased;
+            apply = self.inner.apply.lock() => apply,
+            () = cancelled() => return false,
+        };
         let targets = {
             let mut state = self.state();
             let mut targets: Vec<LoadedPlugin> = state.loaded.remove(id).into_iter().collect();
@@ -783,21 +845,32 @@ impl Host {
                 state.file_versions.remove(&clean_path(&target.path));
             }
             remove_runtime_state(&mut state, id);
+            #[cfg(test)]
+            tests::unload_hook(id);
+            let snapshot = self.snapshot();
+            let records = snapshot.records.iter().filter(|r| r.id != id).cloned().collect();
+            self.store_snapshot(
+                &mut state,
+                Snapshot {
+                    enabled: snapshot.enabled,
+                    records,
+                    ..Default::default()
+                },
+            );
             targets
         };
-        let snapshot = self.snapshot();
-        let records = snapshot.records.iter().filter(|r| r.id != id).cloned().collect();
-        self.store_snapshot(Snapshot {
-            enabled: snapshot.enabled,
-            records,
-            ..Default::default()
-        });
         self.inner.callbacks.close_plugin(id);
         self.refresh_thinking_providers().await;
         for target in targets {
             let (name, version, path) = (target.name.clone(), target.version.clone(), target.path.clone());
             self.inner.callbacks.close_instance(id, target.client.instance());
-            target.client.shutdown(wait).await;
+            // The first poll detaches the client and starts its shutdown thread, also
+            // once cancelled.
+            tokio::select! {
+                biased;
+                () = target.client.shutdown(wait) => {}
+                () = cancelled() => {}
+            }
             tracing::info!(plugin_id = %id, plugin_name = %name, version = %version, path = %path.display(), "pluginhost: plugin unloaded");
         }
         true
@@ -817,7 +890,6 @@ impl Host {
             targets.extend(state.retired.drain().flat_map(|(_, lps)| lps));
             state.management_routes.clear();
             state.resource_routes.clear();
-            state.model_client_ids.clear();
             state.executor_model_client_ids.clear();
             state.model_providers.clear();
             state.model_registrations.clear();
@@ -828,10 +900,11 @@ impl Host {
             state.file_versions.clear();
             state.active_versions.clear();
             state.active_paths.clear();
+            self.store_snapshot(&mut state, Snapshot::default());
             targets
         };
-        self.store_snapshot(Snapshot::default());
         self.state().thinking_providers.clear();
+        cpa_common::thinking::clear_plugin_providers();
         self.inner.callbacks.close_all();
         for target in targets {
             self.inner
@@ -872,6 +945,32 @@ impl Host {
         result
     }
 
+    /// [`Host::call`] for synchronous callers; see [`GuardedClient::call_blocking`].
+    pub fn call_blocking<T: GoJson, R: GoJson>(
+        &self,
+        record: &Record,
+        method: &str,
+        request: &R,
+    ) -> Result<T, CallError> {
+        let result = rpc::call_raw_blocking(&record.client, method, &crate::gojson::to_vec(request));
+        self.fuse_on_panic(&record.id, method, result)
+    }
+
+    /// [`Host::call_with_callback`] for synchronous callers.
+    pub fn call_with_callback_blocking<T: GoJson, R: crate::gojson::GoStruct>(
+        &self,
+        record: &Record,
+        method: &str,
+        request: &R,
+        scope: &crate::callbacks::RequestScope,
+    ) -> Result<T, CallError> {
+        let guard = self.open_callback(record, scope);
+        let raw = rpc::encode_with_callback(request, guard.id());
+        let result = rpc::call_raw_blocking(&record.client, method, &raw);
+        drop(guard);
+        self.fuse_on_panic(&record.id, method, result)
+    }
+
     /// Opens a callback context for `record`'s instance.
     pub fn open_callback(
         &self,
@@ -898,7 +997,7 @@ fn quiesce_unsupported(e: &CallError) -> bool {
     ) {
         return true;
     }
-    let message = e.to_string().trim().to_lowercase();
+    let message = e.to_string().trim().go_lower();
     [
         "unknown method",
         "method not found",
@@ -964,6 +1063,174 @@ pub fn bytes_of(v: &[u8]) -> Bytes {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type Hook = Box<dyn Fn() + Send + Sync>;
+    /// Keyed by plugin ID, so another test's unload never fires it.
+    static UNLOAD_HOOK: Mutex<Option<(&'static str, Hook)>> = Mutex::new(None);
+
+    /// Runs inside `unload_plugin` after its state change, before the snapshot is
+    /// published.
+    pub(super) fn unload_hook(id: &str) {
+        if let Some((_, hook)) = lock(&UNLOAD_HOOK).as_ref().filter(|(target, _)| *target == id) {
+            hook();
+        }
+    }
+
+    struct OneLoader(Arc<dyn PluginClient>);
+
+    impl Loader for OneLoader {
+        fn open(
+            &self,
+            _: &PluginFile,
+            _: Arc<dyn CallbackHandler>,
+            _: Arc<CallbackInstance>,
+        ) -> Result<Arc<dyn PluginClient>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Go publishes the active maps and the snapshot under one lock. Registrations
+    /// compare snapshots and commit under the state lock, so while an unload has
+    /// changed the state but not yet published its snapshot, that lock must be held:
+    /// otherwise a registration that took the old snapshot commits stale results.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unload_publishes_its_snapshot_inside_the_state_lock() {
+        let dir = std::env::temp_dir().join(format!("cpa-plugin-fence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("fence{}", platform::extension(platform::goos()))), b"").unwrap();
+        let host = Host::with_loader(Arc::new(OneLoader(Arc::new(FakeClient))));
+        let yaml = format!(
+            "plugins:\n  enabled: true\n  dir: {}\n  configs:\n    fence:\n      enabled: true\n",
+            dir.display()
+        );
+        host.apply_config(Arc::new(Config::parse(&yaml).unwrap())).await;
+        assert!(host.plugin_registered("fence"));
+        // (snapshot still lists the plugin, state lock free) observed inside the window.
+        let seen = Arc::new(Mutex::new(None));
+        *lock(&UNLOAD_HOOK) = Some({
+            let (host, seen) = (host.clone(), seen.clone());
+            (
+                "fence",
+                Box::new(move || {
+                    let stale = host.snapshot().records.iter().any(|r| r.id == "fence");
+                    let lock_free = host.inner.state.try_lock().is_ok();
+                    *lock(&seen) = Some((stale, lock_free));
+                }),
+            )
+        });
+        assert!(host.unload_plugin("fence", None).await);
+        *lock(&UNLOAD_HOOK) = None;
+        assert_eq!(
+            *lock(&seen),
+            Some((true, false)),
+            "the old snapshot is visible only while the state lock is held"
+        );
+        assert!(host.snapshot().records.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`FakeClient`] whose shutdown counts its start, then blocks while `held` is set.
+    struct HeldClient {
+        held: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl PluginClient for HeldClient {
+        fn call(&self, method: &str, request: &[u8]) -> Result<Bytes, String> {
+            FakeClient.call(method, request)
+        }
+        fn shutdown(&self) {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let (held, cv) = &*self.held;
+            let mut held = lock(held);
+            while *held {
+                held = cv.wait(held).unwrap();
+            }
+        }
+    }
+
+    async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    /// Go `UnloadPluginContext` from a Home delete (`deletePluginArtifact`): cancelling
+    /// the delete while the plugin's shutdown hangs ends the unload and releases the
+    /// apply lock, so a later config apply proceeds. Every instance, the loaded one and
+    /// a retired one still draining, is detached and has its shutdown started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_home_unload_releases_the_host() {
+        let dir = std::env::temp_dir().join(format!("cpa-plugin-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("held{}", platform::extension(platform::goos()))), b"").unwrap();
+        let held = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let client = || {
+            Arc::new(HeldClient {
+                held: held.clone(),
+                started: started.clone(),
+            })
+        };
+        let host = Host::with_loader(Arc::new(OneLoader(client())));
+        let config = |enabled: bool| {
+            let yaml = format!(
+                "plugins:\n  enabled: {enabled}\n  dir: {}\n  configs:\n    held:\n      enabled: true\n",
+                dir.display()
+            );
+            Arc::new(Config::parse(&yaml).unwrap())
+        };
+        host.apply_config(config(true)).await;
+        assert!(host.plugin_registered("held"));
+        let retired = LoadedPlugin {
+            id: "held".into(),
+            path: dir.join("held-old"),
+            version: "0".into(),
+            name: "n".into(),
+            config_yaml: Vec::new(),
+            plugin: None,
+            registered: true,
+            client: GuardedClient::new(client(), Arc::new(CallbackInstance::default())),
+        };
+        host.state().retired.entry("held".into()).or_default().push(retired);
+        *lock(&held.0) = true;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let unload = tokio::spawn({
+            let (host, cancel) = (host.clone(), cancel.clone());
+            async move { crate::homeplugins::PluginRuntime::unload_plugin(&host, "held", &cancel).await }
+        });
+        within("the first shutdown", async {
+            while started.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(!host.plugin_registered("held"));
+        assert!(
+            host.inner.apply.try_lock().is_err(),
+            "the hanging unload holds the host"
+        );
+        cancel.cancel();
+        assert!(
+            within("the cancelled unload", unload).await.unwrap(),
+            "the cancelled unload panicked or reported nothing unloaded"
+        );
+        // The retired instance's shutdown runs on its own thread.
+        within("the retired instance's shutdown", async {
+            while started.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        within(
+            "a config apply after the cancelled unload",
+            host.apply_config(config(false)),
+        )
+        .await;
+        *lock(&held.0) = false;
+        held.1.notify_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A plugin that registers with one capability.
     struct FakeClient;
@@ -1031,6 +1298,116 @@ mod tests {
             loader.opens.load(Ordering::SeqCst),
             1,
             "the abandoned load was reused, not repeated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Registers with `caps`; while `gate` is closed, registration blocks.
+    struct CapsClient {
+        caps: &'static str,
+        gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+    }
+
+    impl PluginClient for CapsClient {
+        fn call(&self, method: &str, _: &[u8]) -> Result<Bytes, String> {
+            if method != method::PLUGIN_REGISTER && method != method::PLUGIN_RECONFIGURE {
+                return Ok(Bytes::from_static(br#"{"ok":true,"result":{}}"#));
+            }
+            if let Some((open, cv)) = self.gate.as_deref() {
+                let mut open = lock(open);
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }
+            Ok(Bytes::from(format!(
+                r#"{{"ok":true,"result":{{"schema_version":6,"metadata":{{"Name":"n","Version":"1","Author":"a","GitHubRepository":"r"}},"capabilities":{{{}}}}}}}"#,
+                self.caps
+            )))
+        }
+        fn shutdown(&self) {}
+    }
+
+    /// Plugin `a` offers a request normalizer; `b` registers behind `gate`.
+    struct HookLoader(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Loader for HookLoader {
+        fn open(
+            &self,
+            file: &PluginFile,
+            _: Arc<dyn CallbackHandler>,
+            _: Arc<CallbackInstance>,
+        ) -> Result<Arc<dyn PluginClient>, String> {
+            Ok(Arc::new(match file.id.as_str() {
+                "a" => CapsClient {
+                    caps: r#""request_normalizer":true"#,
+                    gate: None,
+                },
+                _ => CapsClient {
+                    caps: r#""usage_plugin":true"#,
+                    gate: Some(self.0.clone()),
+                },
+            }))
+        }
+    }
+
+    /// A hot reload that unfuses a translator plugin turns cpa-translate's hook flag
+    /// on at once, while later plugins are still registering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hot_reload_unfusing_a_hook_plugin_activates_the_hooks_at_once() {
+        let dir = std::env::temp_dir().join(format!("cpa-plugin-unfuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = platform::extension(platform::goos());
+        std::fs::write(dir.join(format!("a-v1{ext}")), b"").unwrap();
+        std::fs::write(dir.join(format!("b{ext}")), b"").unwrap();
+        let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        let host = Host::with_loader(Arc::new(HookLoader(gate.clone())));
+        let yaml = format!(
+            "plugins:\n  enabled: true\n  dir: {}\n  configs:\n    a:\n      enabled: true\n    b:\n      enabled: true\n",
+            dir.display()
+        );
+        let cfg = Arc::new(Config::parse(&yaml).unwrap());
+        host.apply_config(cfg.clone()).await;
+        cpa_translate::hooks::set_plugin_hooks(Some(host.translator_hooks()));
+        assert!(cpa_translate::hooks::plugin_hooks_active());
+        host.fuse("a", "RequestNormalizer.NormalizeRequest", "test");
+        assert!(!cpa_translate::hooks::plugin_hooks_active());
+
+        *lock(&gate.0) = false;
+        // Reopens the gate even when an assertion fails, so the runtime can shut down.
+        struct Reopen(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                *lock(&self.0.0) = true;
+                self.0.1.notify_all();
+            }
+        }
+        let reopen = Reopen(gate.clone());
+        std::fs::write(dir.join(format!("a-v2{ext}")), b"").unwrap();
+        let apply = tokio::spawn({
+            let host = host.clone();
+            async move { host.apply_config(cfg).await }
+        });
+        let unfused = async {
+            while host.is_fused("a") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), unfused)
+            .await
+            .expect("a reloads");
+        assert!(!apply.is_finished(), "b's registration is still blocked");
+        assert!(
+            cpa_translate::hooks::plugin_hooks_active(),
+            "a is eligible before b registers"
+        );
+
+        drop(reopen);
+        apply.await.unwrap();
+        assert!(cpa_translate::hooks::plugin_hooks_active());
+        cpa_translate::hooks::set_plugin_hooks(None);
+        assert!(
+            !cpa_translate::hooks::plugin_hooks_active(),
+            "an empty slot clears the flag"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -93,6 +93,7 @@ fn pasted_callbacks_parse_like_go() {
                     state: s("state"),
                     error: s("error"),
                     description: s("desc"),
+                    client_id: String::new(),
                 },
                 "{input}"
             ),
@@ -262,6 +263,15 @@ fn legacy_matching_follows_go_identity_rules() {
     )
     .unwrap();
     assert_eq!(legacy_credential(&dir, &account_name, &account_target), None);
+    // File names compare with Go's EqualFold, which folds non-ASCII letters too.
+    let greek_target: BTreeMap<String, Value> = [("email", "δ@example.invalid"), ("account_uuid", "acct-1")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), json!(v)))
+        .collect();
+    let greek_file = dir.join("claude-Δ@example.invalid.json");
+    std::fs::write(&greek_file, r#"{"type":"claude","account_uuid":"acct-1"}"#).unwrap();
+    let greek_name = credential_file_name("δ@example.invalid", "", "acct-1");
+    assert_eq!(legacy_credential(&dir, &greek_name, &greek_target), Some(greek_file));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -326,8 +336,24 @@ async fn an_empty_paste_keeps_waiting_for_the_browser() {
 
 #[tokio::test]
 async fn a_busy_port_is_go_port_in_use() {
-    let holder = tokio::net::TcpListener::bind(("::", 0)).await.unwrap();
+    // The realistic holder: another Go or cliproxy login's dual-stack listener.
+    let holder = listen_any(0).unwrap();
     let port = holder.local_addr().unwrap().port();
     let error = bind(port).await.unwrap_err();
     assert!(String::from_utf8_lossy(&error.body).starts_with(PORT_IN_USE));
+    // A holder on one family: on Unix the dual-stack socket conflicts with it. Windows
+    // CI binds next to an IPv6-only `[::]` or a 127.0.0.1 holder (Go's listener is the
+    // same socket, so Go binds too).
+    for host in ["::", "127.0.0.1"] {
+        let holder = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let result = bind(port).await;
+        #[cfg(not(windows))]
+        assert!(
+            String::from_utf8_lossy(&result.unwrap_err().body).starts_with(PORT_IN_USE),
+            "{host}"
+        );
+        #[cfg(windows)]
+        assert!(result.is_ok(), "{host}");
+    }
 }

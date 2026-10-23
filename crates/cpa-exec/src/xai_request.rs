@@ -45,6 +45,30 @@ pub(crate) struct Prepared {
     pub web_search_alias: String,
     /// `helps.ApplyPatchResponsesState`.
     pub apply_patch: apply_patch::State,
+    /// Go `finalizePayload`'s captured baseline and target protocol.
+    rule_original: Vec<u8>,
+    rule_protocol: Format,
+}
+
+impl Prepared {
+    /// Go `prepared.finalizePayload`: the payload rules, run on a fully prepared body
+    /// immediately before it is sent or framed.
+    pub(crate) fn finalize(&self, cfg: &Config, req: &ExecRequest, body: Vec<u8>) -> Vec<u8> {
+        crate::payload_barrier::Barrier {
+            executor: PROVIDER,
+            model: &self.base_model,
+            protocol: self.rule_protocol.as_str(),
+            root: "",
+            original: &self.rule_original,
+        }
+        .apply(cfg, req, body)
+    }
+
+    /// [`Self::finalize`] on the prepared body.
+    pub(crate) fn finalize_body(&mut self, cfg: &Config, req: &ExecRequest) {
+        let body = std::mem::take(&mut self.body);
+        self.body = self.finalize(cfg, req, body);
+    }
 }
 
 fn bad_request(message: impl Into<String>) -> ExecError {
@@ -61,7 +85,7 @@ pub(crate) fn original(req: &ExecRequest) -> &[u8] {
 }
 
 /// `helps.PayloadRequestedModel`.
-fn requested_model(req: &ExecRequest) -> &str {
+pub(crate) fn requested_model(req: &ExecRequest) -> &str {
     if req.requested_model.trim().is_empty() {
         req.model.trim()
     } else {
@@ -69,12 +93,10 @@ fn requested_model(req: &ExecRequest) -> &str {
     }
 }
 
-/// `oauth.providers.xai.inject-x-search` as this credential sees it (Go binds
-/// `cfg.ForAPIKey()` for API-key credentials).
+/// `upstream.xai.inject-x-search`, shared by OAuth and API-key credentials.
 pub(crate) fn inject_x_search(cfg: &Config) -> bool {
     cfg.document
-        .get("oauth")
-        .and_then(|o| o.get("providers"))
+        .get("upstream")
         .and_then(|p| p.get("xai"))
         .and_then(|x| x.get("inject-x-search"))
         .and_then(serde_yaml_ng::Value::as_bool)
@@ -83,8 +105,8 @@ pub(crate) fn inject_x_search(cfg: &Config) -> bool {
 
 /// `TranslateRequestWithAPIKeyModelCompatibility(AndUpdateIntent)ForExecutor` with
 /// target executor xai (Codex-client rewrites, then the pair or its compat variant).
-// ponytail: the configuration-update intent is not exposed by crate::codex_client
-// (owner: Codex), so thinking always sees `updates_changed: false`.
+// ponytail: the configuration-update intent crate::codex_client reports is not read
+// here yet, so thinking always sees `updates_changed: false`; xAI's port reads it.
 fn translate(
     req: &ExecRequest,
     client: &crate::codex_client::Client<'_>,
@@ -94,6 +116,7 @@ fn translate(
     body: &[u8],
 ) -> Result<Vec<u8>, ExecError> {
     crate::codex_client::translate_request(req.source_format, to, &RequestCtx { model, stream }, body, client)
+        .map(|t| t.body)
         .map_err(|e| bad_request(e.to_string()))
 }
 
@@ -158,22 +181,6 @@ pub(crate) async fn prepare(
         updates_changed: false,
     })
     .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    let rules = cpa_common::payload::Rules::of(cfg);
-    body = cpa_common::payload::apply(
-        &rules,
-        &cpa_common::payload::Request {
-            target_executor: PROVIDER,
-            model: &base_model,
-            requested_model: requested_model(req),
-            protocol: to.as_str(),
-            from_protocol: req.source_format.as_str(),
-            root: "",
-            original: &original_translated,
-            request_path: &req.request_path,
-            headers: Some(&req.headers),
-        },
-        body,
-    );
     set_str_if_different(&mut body, "model", &base_model);
     set_bool_if_different(&mut body, "stream", stream);
     for key in [
@@ -242,6 +249,8 @@ pub(crate) async fn prepare(
         replay_scope,
         web_search_alias,
         apply_patch,
+        rule_original: original_translated,
+        rule_protocol: to,
     })
 }
 

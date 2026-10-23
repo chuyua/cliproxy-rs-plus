@@ -3,7 +3,10 @@
 // server. Run it inside a loopback-only network namespace; it never contacts a provider
 // and every key is fake.
 //
-// Usage: media <go-server-binary> <output.json>
+// Usage: media <go-server-binary> <output.json> [speech|errors]
+//
+// With "speech" it runs the speech scenarios (speech.go, recorded at v8.0.35) instead,
+// with "errors" the passthrough error-header scenarios (errors.go, v8.0.35).
 package main
 
 import (
@@ -35,14 +38,17 @@ type upstream struct {
 }
 
 type scenario struct {
-	Name        string            `json:"name"`
-	Method      string            `json:"method"`
-	Path        string            `json:"path"`
-	ContentType string            `json:"content_type,omitempty"`
-	Body        string            `json:"body,omitempty"`
-	BodyB64     string            `json:"body_b64,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Upstreams   []upstream        `json:"upstreams,omitempty"`
+	Name        string `json:"name"`
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	ContentType string `json:"content_type,omitempty"`
+	Body        string `json:"body,omitempty"`
+	BodyB64     string `json:"body_b64,omitempty"`
+	// SkipPrefix puts a zstd skippable frame with this many zero bytes before the body
+	// when it is sent (kept out of the fixture to keep it small).
+	SkipPrefix int               `json:"skip_prefix,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	Upstreams  []upstream        `json:"upstreams,omitempty"`
 
 	Status         int               `json:"status"`
 	ResponseHeader map[string]string `json:"response_headers"`
@@ -210,6 +216,15 @@ func canonicalForm(s string) string {
 	return head + pieces[0] + sep + strings.Join(parts, sep) + sep + pieces[len(pieces)-1]
 }
 
+// skippable is a zstd skippable frame (magic 0x184D2A50) of n zero bytes, or "".
+func skippable(n int) string {
+	if n == 0 {
+		return ""
+	}
+	head := []byte{0x50, 0x2a, 0x4d, 0x18, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+	return string(head) + strings.Repeat("\x00", n)
+}
+
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -220,9 +235,15 @@ func freePort() int {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: media <go-server-binary> <output.json>")
+	if len(os.Args) != 3 && (len(os.Args) != 4 || (os.Args[3] != "speech" && os.Args[3] != "errors")) {
+		fmt.Fprintln(os.Stderr, "usage: media <go-server-binary> <output.json> [speech|errors]")
 		os.Exit(2)
+	}
+	config, all := Config, scenarios()
+	if len(os.Args) == 4 && os.Args[3] == "speech" {
+		config, all = SpeechConfig, speechScenarios()
+	} else if len(os.Args) == 4 {
+		config, all = ErrorsConfig, errorScenarios()
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -242,7 +263,7 @@ func main() {
 		panic(err)
 	}
 	port := freePort()
-	cfg := strings.NewReplacer("UPSTREAM", cap.addr, "PORT", strconv.Itoa(port), "AUTHDIR", authDir).Replace(Config)
+	cfg := strings.NewReplacer("UPSTREAM", cap.addr, "PORT", strconv.Itoa(port), "AUTHDIR", authDir).Replace(config)
 	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		panic(err)
@@ -271,14 +292,13 @@ func main() {
 		panic("go server did not start:\n" + logs.String())
 	}
 
-	all := scenarios()
 	for i := range all {
 		s := &all[i]
 		cap.mu.Lock()
 		cap.replies = append([]upstream(nil), s.Upstreams...)
 		cap.requests = nil
 		cap.mu.Unlock()
-		req, errReq := http.NewRequest(s.Method, base+s.Path, strings.NewReader(s.Body))
+		req, errReq := http.NewRequest(s.Method, base+s.Path, strings.NewReader(skippable(s.SkipPrefix)+s.Body))
 		if !utf8.ValidString(s.Body) {
 			s.BodyB64, s.Body = base64.StdEncoding.EncodeToString([]byte(s.Body)), ""
 		}
@@ -321,7 +341,7 @@ func main() {
 			s.Requests = []string{}
 		}
 	}
-	data, err := json.MarshalIndent(map[string]any{"config": Config, "scenarios": all}, "", "  ")
+	data, err := json.MarshalIndent(map[string]any{"config": config, "scenarios": all}, "", "  ")
 	if err != nil {
 		panic(err)
 	}

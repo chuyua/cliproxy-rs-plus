@@ -226,6 +226,7 @@ fn request(turn: &Value, session: &str, usage: cpa_core::exec::UsageSink) -> Exe
             .as_str()
             .and_then(Format::parse)
             .unwrap_or(Format::OpenAIResponse),
+        stream_payloads: false,
         requested_model: model.clone(),
         model,
         original_body: payload.clone(),
@@ -244,6 +245,7 @@ fn request(turn: &Value, session: &str, usage: cpa_core::exec::UsageSink) -> Exe
         caller: Caller {
             principal: String::new(),
             source: "authorization",
+            provider: String::new(),
         },
     }
 }
@@ -704,6 +706,100 @@ async fn terminal_error_survives_a_full_queue() {
     server.abort();
 }
 
+/// Go `EmitWebSocketResponseEvent` beside `AppendAPIWebsocketResponse`: every non-empty
+/// upstream frame, trimmed, goes to the attempt's observer with the executor identifier,
+/// the selected credential and the upstream model. The executor awaits each
+/// observation before it handles the frame, as Go calls the observer in its read loop.
+#[tokio::test]
+async fn upstream_frames_reach_the_websocket_observer() {
+    /// (provider, credential ID, model, payload).
+    type Frame = (String, String, String, Vec<u8>);
+    /// The frames observed, and the order observations and client chunks finished in.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<Frame>>, Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl cpa_core::exec::WebSocketObserver for Seen {
+        fn response<'a>(
+            &'a self,
+            provider: &'a str,
+            credential: &'a Credential,
+            model: &'a str,
+            payload: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                // A slow observer: the frame must not reach the client before it returns.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.0.lock().unwrap().push((
+                    provider.to_owned(),
+                    credential.id.clone(),
+                    model.to_owned(),
+                    payload.to_vec(),
+                ));
+                self.1.lock().unwrap().push("observed");
+            })
+        }
+    }
+    let shared: Shared = Arc::default();
+    let app = axum::Router::new().fallback(handler).with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let created = r#"{"type":"response.created","response":{"id":"r1","status":"in_progress","output":[]}}"#;
+    let done = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+    let turn = serde_json::json!({
+        "auth": "auth-a",
+        "payload": r#"{"model":"grok-4.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}"#,
+        "acts": [{"send": [format!("  {created}\n"), "   ".to_owned(), done.to_owned()]}],
+    });
+    shared.lock().unwrap().turn = Some(turn.clone());
+    let attrs = serde_json::json!({"api_key": "sk-fake", "base_url": "http://UPSTREAM/v1", "websockets": "true"});
+    let credential = credential("auth-a", &attrs, &addr);
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let session = ExecSession {
+        id: "sess-observe".into(),
+        continuation: false,
+        lease: None,
+    };
+    let seen = Arc::new(Seen::default());
+    let usage = cpa_core::exec::UsageSink::default().with_websocket(Some(seen.clone()));
+    let response = executor
+        .execute_in_session(
+            &credential,
+            request(&turn, "sess-observe", usage),
+            &Config::default(),
+            &session,
+        )
+        .await
+        .unwrap();
+    let ResponseBody::Stream(mut stream) = response.body else {
+        panic!("buffered response");
+    };
+    let order = seen.1.clone();
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+        order.lock().unwrap().push("chunk");
+    }
+    // Each frame's observation finishes before its client chunk.
+    let order = order.lock().unwrap().clone();
+    assert_eq!(order.first(), Some(&"observed"), "{order:?}");
+    assert_eq!(order.iter().filter(|o| **o == "observed").count(), 2, "{order:?}");
+    assert_eq!(order.last(), Some(&"chunk"), "{order:?}");
+    let seen = seen.0.lock().unwrap().clone();
+    let expected: Vec<Frame> = [created, done]
+        .into_iter()
+        .map(|frame| {
+            (
+                "xai".into(),
+                credential.id.clone(),
+                "grok-4.3".into(),
+                frame.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+    executor.close_session("sess-observe");
+    server.abort();
+}
+
 // --- unit-level ports of xai_websockets_executor_test.go -------------------------------
 
 /// The server's `classify::upstream_attempted` (Go `UpstreamAttempted`).
@@ -963,7 +1059,7 @@ fn validate_compaction_response_follows_go() {
 /// TestBuildXAIWebsocketRequestBodySetsStoreAndKeepsPromptCacheKey.
 #[test]
 fn request_frame_sets_store_and_keeps_prompt_cache_key() {
-    let frame = request_frame(br#"{"model":"grok-4.3","stream":true,"stream_options":{"include_usage":true},"background":true,"prompt_cache_key":"cache-1","previous_response_id":"resp-prev","instructions":"system prompt","input":[{"type":"message","role":"user","content":"hello"}]}"#);
+    let frame = request_frame(br#"{"model":"grok-4.3","stream":true,"stream_options":{"include_usage":true},"background":true,"prompt_cache_key":"cache-1","previous_response_id":"resp-prev","instructions":"system prompt","input":[{"type":"message","role":"user","content":"hello"}]}"#, |b| b);
     assert_eq!(gj::get(&frame, "type").str(), "response.create");
     for absent in ["stream", "stream_options", "background", "instructions"] {
         assert!(
@@ -1062,4 +1158,194 @@ async fn ping_is_answered_while_the_writer_is_held() {
     assert_eq!(pong.as_deref(), Some("xai-keepalive-ping"));
     executor.close_session("test-xai-keepalive");
     server.abort();
+}
+
+/// A loopback xAI upstream answering every frame with a completed `resp-1`, so a repeated
+/// ID gets a `-xai-N` downstream suffix.
+async fn repeating_upstream() -> (Shared, String, tokio::task::JoinHandle<()>) {
+    let completed = r#"{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+    let shared: Shared = Arc::default();
+    let acts: Vec<Value> = (0..8).map(|_| serde_json::json!({"send": [completed]})).collect();
+    shared.lock().unwrap().turn = Some(serde_json::json!({ "acts": acts }));
+    let app = axum::Router::new().fallback(handler).with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (shared, addr, server)
+}
+
+/// One turn on `session` with `previous_response_id` = `previous` (none when empty);
+/// returns the downstream chunks.
+async fn turn_with(
+    executor: &XaiExecutor,
+    credential: &Credential,
+    session: &str,
+    previous: &str,
+    cfg: &Config,
+    continuation: bool,
+) -> Result<Vec<String>, ExecError> {
+    let payload = if previous.is_empty() {
+        r#"{"model":"grok-4.3","input":[{"type":"message","role":"user","content":"hi"}]}"#.to_owned()
+    } else {
+        format!(
+            r#"{{"model":"grok-4.3","previous_response_id":"{previous}","input":[{{"type":"message","role":"user","content":"hi"}}]}}"#
+        )
+    };
+    let req = request(&serde_json::json!({ "payload": payload }), session, Default::default());
+    let exec_session = ExecSession {
+        id: session.to_owned(),
+        continuation,
+        lease: None,
+    };
+    let response = executor.execute_in_session(credential, req, cfg, &exec_session).await?;
+    let ResponseBody::Stream(stream) = response.body else {
+        panic!("buffered response");
+    };
+    let chunks = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect())
+}
+
+fn upstream_previous(shared: &Shared) -> Vec<String> {
+    let script = shared.lock().unwrap();
+    script
+        .recorded
+        .frames
+        .iter()
+        .map(|f| gjson::get(f, "previous_response_id").str().to_owned())
+        .collect()
+}
+
+/// Go 1e37b52b for xAI: after a reload that changes only `requests.proxy-url`, the open
+/// socket keeps serving its credential and the session's upstream response IDs (a
+/// downstream `resp-1-xai-1` still reaches upstream as `resp-1`), while a new session
+/// dials through the new proxy.
+#[tokio::test]
+async fn a_global_proxy_reload_keeps_the_open_socket() {
+    let (shared, addr, server) = repeating_upstream().await;
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let attrs = serde_json::json!({"api_key": "xai-key", "websockets": "true", "base_url": "http://UPSTREAM/v1"});
+    let credential = credential("xai-reload", &attrs, &addr);
+    // Nothing listens on port 1: a dial through this proxy fails.
+    let reloaded = Config::parse("requests:\n  proxy-url: http://127.0.0.1:1\n").unwrap();
+    let session = "xai-reload-session";
+    let default = Config::default();
+    turn_with(&executor, &credential, session, "", &default, false)
+        .await
+        .unwrap();
+    let second = turn_with(&executor, &credential, session, "resp-1", &default, true)
+        .await
+        .unwrap();
+    assert!(
+        second.iter().any(|c| c.contains(r#""id":"resp-1-xai-1""#)),
+        "{second:?}"
+    );
+    for continuation in [true, false] {
+        turn_with(&executor, &credential, session, "resp-1-xai-1", &reloaded, continuation)
+            .await
+            .unwrap_or_else(|e| panic!("continuation={continuation}: {e:?}"));
+    }
+    assert_eq!(
+        shared.lock().unwrap().recorded.upgrades.len(),
+        1,
+        "every turn kept the first socket"
+    );
+    assert_eq!(
+        upstream_previous(&shared),
+        ["", "resp-1", "resp-1", "resp-1"],
+        "the upstream ID mapping survived"
+    );
+    let error = turn_with(&executor, &credential, "xai-reload-new", "", &reloaded, false)
+        .await
+        .expect_err("a new socket dials through the reloaded proxy");
+    assert_eq!(error.scope, FailureScope::Transport, "{error}");
+    assert_eq!(shared.lock().unwrap().recorded.upgrades.len(), 1);
+    executor.close_session(session);
+    server.abort();
+}
+
+/// A credential removal drops a session and its ID state together, and a turn takes the
+/// ID state only after it holds its session (Go `closeXAIWebsocketSessionsInStoreForAuthID`
+/// and `ExecuteStream`). A turn that waits on its session while the removal runs keeps
+/// its mapping in the live state, so the next turn still sends upstream `resp-1` for
+/// the `resp-1-xai-1` that turn returned.
+#[tokio::test]
+async fn a_removal_during_a_turn_keeps_the_replacement_sessions_ids() {
+    let (shared, addr, server) = repeating_upstream().await;
+    let executor = Arc::new(XaiExecutor::with_client(wreq::Client::new()));
+    let attrs = serde_json::json!({"api_key": "xai-key", "websockets": "true", "base_url": "http://UPSTREAM/v1"});
+    let credential = credential("xai-removed", &attrs, &addr);
+    let (session, cfg) = ("xai-race-session", Config::default());
+    turn_with(&executor, &credential, session, "", &cfg, false)
+        .await
+        .unwrap();
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    *executor.ws.pause.lock().unwrap() = Some((reached_tx, resume_rx));
+    let racing = {
+        let (executor, credential, cfg) = (executor.clone(), credential.clone(), cfg.clone());
+        tokio::spawn(async move { turn_with(&executor, &credential, session, "resp-1", &cfg, false).await })
+    };
+    reached.await.expect("the turn holds its session");
+    executor.ws.close_credential("xai-removed");
+    resume.send(()).unwrap();
+    let chunks = racing.await.unwrap().unwrap();
+    assert!(
+        chunks.iter().any(|c| c.contains(r#""id":"resp-1-xai-1""#)),
+        "{chunks:?}"
+    );
+
+    turn_with(&executor, &credential, session, "resp-1-xai-1", &cfg, false)
+        .await
+        .unwrap();
+    assert_eq!(upstream_previous(&shared), ["", "resp-1", "resp-1"]);
+    executor.close_session(session);
+    server.abort();
+}
+
+/// TestPayloadBarrierXAIWebsocketRetry (868e137): the rules run on the WebSocket frame,
+/// after `store=true` and the instructions drop, and only the frame type is set after
+/// them; a retry builds the same frame.
+#[test]
+fn request_frame_runs_the_payload_rules_last() {
+    let cfg = Config::parse(
+        r#"
+payload:
+  override:
+    - models: [{name: "*"}]
+      params: {store: false, instructions: configured}
+  filter:
+    - models: [{name: "*"}]
+      params: ["input.0", "previous_response_id", "type"]
+"#,
+    )
+    .unwrap();
+    let body = br#"{"previous_response_id":"previous","input":[{"content":"first"},{"content":"second"}]}"#;
+    let req = request(
+        &serde_json::json!({"payload": std::str::from_utf8(body).unwrap()}),
+        "s",
+        Default::default(),
+    );
+    let finalize = |b| {
+        crate::payload_barrier::Barrier {
+            executor: crate::xai::PROVIDER,
+            model: "grok-4.3",
+            protocol: "codex",
+            root: "",
+            original: body,
+        }
+        .apply(&cfg, &req, b)
+    };
+    let first = request_frame(body, finalize);
+    assert_eq!(first, request_frame(body, finalize));
+    let text = String::from_utf8_lossy(&first);
+    assert!(!gj::get(&first, "store").bool(), "{text}");
+    assert_eq!(gj::get(&first, "instructions").str(), "configured", "{text}");
+    assert!(!gj::get(&first, "previous_response_id").exists(), "{text}");
+    assert_eq!(gj::get(&first, "input.#").int(), 1, "{text}");
+    assert_eq!(gj::get(&first, "type").str(), "response.create", "{text}");
 }

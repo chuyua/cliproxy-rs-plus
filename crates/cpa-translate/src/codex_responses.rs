@@ -9,6 +9,7 @@
 use crate::apply_patch_responses::Bridge;
 use crate::{Error, Registered, RequestCtx, ResponseCtx, StreamTranslator, common, stream};
 use cpa_common::json::{self as gj, Kind};
+use cpa_core::gostr::GoStr;
 
 pub static PAIR: Registered = registered!(
     OpenAIResponse -> Codex,
@@ -44,7 +45,7 @@ pub(crate) fn convert(body: &[u8]) -> Vec<u8> {
     if tier.exists() {
         if tier.kind == Kind::String {
             let value = tier.bytes().into_owned();
-            match tier.str().trim().to_lowercase().as_str() {
+            match tier.str().trim().go_lower().as_str() {
                 "priority" | "fast" => {
                     if value != b"priority" {
                         gj::set_str(&mut raw, "service_tier", "priority");
@@ -83,17 +84,29 @@ fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
     gj::set_bool(raw, path, value);
 }
 
+/// Go `setCodexRequiredInclude`: `reasoning.encrypted_content`, plus
+/// `web_search_call.action.sources` when the client asked for it.
 fn set_required_include(raw: &mut Vec<u8>) {
+    const REASONING: &[u8] = b"reasoning.encrypted_content";
+    const SOURCES: &[u8] = b"web_search_call.action.sources";
     let current = gj::get(raw, "include");
-    let values = current.array();
-    if current.is_array()
-        && values.len() == 1
-        && values[0].kind == Kind::String
-        && &*values[0].bytes() == b"reasoning.encrypted_content"
-    {
-        return;
+    let mut sources = false;
+    if current.is_array() {
+        let values = current.array();
+        let is = |i: usize, want: &[u8]| values[i].kind == Kind::String && &*values[i].bytes() == want;
+        sources = (0..values.len()).any(|i| is(i, SOURCES));
+        if (!sources && values.len() == 1 && is(0, REASONING))
+            || (sources && values.len() == 2 && is(0, REASONING) && is(1, SOURCES))
+        {
+            return;
+        }
     }
-    gj::set_raw(raw, "include", r#"["reasoning.encrypted_content"]"#);
+    let encoded = if sources {
+        r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#
+    } else {
+        r#"["reasoning.encrypted_content"]"#
+    };
+    gj::set_raw(raw, "include", encoded);
 }
 
 fn delete_fields(raw: &mut Vec<u8>, paths: &[&str]) {
@@ -355,4 +368,51 @@ fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
         return Ok(vec![]);
     }
     Ok(root.get("response").raw.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Go `TestConvertOpenAIResponsesRequestToCodex_PreservesWebSearchSourcesInclude`.
+    #[test]
+    fn web_search_sources_stay_in_include() {
+        let reasoning = r#"["reasoning.encrypted_content"]"#;
+        let both = r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#;
+        for (include, want) in [
+            ("", reasoning),
+            ("null", reasoning),
+            (r#""web_search_call.action.sources""#, reasoning),
+            (r#"{"web_search_call.action.sources":true}"#, reasoning),
+            ("[42,true]", reasoning),
+            ("[]", reasoning),
+            (r#"["web_search_call.action.sources"]"#, both),
+            (both, both),
+            (
+                r#"["web_search_call.action.sources","reasoning.encrypted_content"]"#,
+                both,
+            ),
+            (
+                r#"["web_search_call.action.sources","web_search_call.action.sources"]"#,
+                both,
+            ),
+            (
+                r#"["file_search_call.results","web_search_call.action.sources","code_interpreter_call.outputs"]"#,
+                both,
+            ),
+            (r#"[42,"web_search_call.action.sources",null]"#, both),
+        ] {
+            let body = if include.is_empty() {
+                r#"{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"hi"}]}"#.to_owned()
+            } else {
+                format!(
+                    r#"{{"model":"gpt-5.6","input":[{{"type":"message","role":"user","content":"hi"}}],"include":{include}}}"#
+                )
+            };
+            let out = super::convert(body.as_bytes());
+            assert_eq!(
+                crate::gj::get(&out, "include").raw.as_ref(),
+                want.as_bytes(),
+                "{include}"
+            );
+        }
+    }
 }

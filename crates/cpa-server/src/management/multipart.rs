@@ -2,9 +2,15 @@
 //! `mime.ParseMediaType`, `mime/multipart.Reader` and the `textproto` header rules,
 //! applied to a body that is already fully in memory.
 //!
-//! ponytail: no quoted-printable part decoding, no header count or size limits, and
-//! `%q` quoting is exact for ASCII only.
+//! ponytail: no quoted-printable part decoding and no header count or size limits.
 
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
+use cpa_common::gostr::quote;
+use cpa_core::gostr::GoStr;
+
+use crate::body_limit::Read;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 /// A file field of the form.
@@ -14,10 +20,14 @@ pub(super) struct FilePart {
     pub data: Vec<u8>,
 }
 
+pub(super) type Files = BTreeMap<String, Vec<FilePart>>;
+
 const NOT_MULTIPART: &str = "request Content-Type isn't multipart/form-data";
 const MISSING_BOUNDARY: &str = "no multipart boundary param in Content-Type";
 const TOO_LARGE: &str = "multipart: message too large";
 const MAX_PARTS: usize = 1000;
+/// Go `peekBufferSize`, the multipart reader's `bufio` size.
+const PEEK_BUFFER: usize = 4096;
 
 /// gin `Context.ContentType`: the header up to the first space or `;`, unchanged.
 pub(super) fn is_form(content_type: &str) -> bool {
@@ -27,6 +37,48 @@ pub(super) fn is_form(content_type: &str) -> bool {
 /// File parts grouped by sorted field name (gin's handler sorts `form.File` keys),
 /// in body order within a field. Errors carry Go's text.
 pub(super) fn form_files(content_type: &str, body: &[u8]) -> Result<Vec<FilePart>, String> {
+    Ok(form(content_type, body)?.0.into_values().flatten().collect())
+}
+
+/// `Request.ParseMultipartForm`: file parts and value parts by field name, each in body
+/// order.
+pub(super) fn form(content_type: &str, body: &[u8]) -> Result<(Files, HashMap<String, Vec<String>>), String> {
+    let mut hit_limit = false;
+    read_form(content_type, body, &mut hit_limit, false)
+}
+
+/// A multipart body that could not be used: the read failed before the limit, or Go's
+/// `ParseMultipartForm` error with its status (`413` for the limit error).
+pub(crate) enum Failed {
+    Read(BytesRejection),
+    Form(u16, String),
+}
+
+/// The body for `ParseMultipartForm`. When `server.max-request-body-bytes` stopped the
+/// read, Go has parsed the bytes before the limit: the form is those bytes when it ends
+/// within them, else the limit error inside file data and, inside a part's headers,
+/// usually the parse error of the truncated line.
+pub(crate) fn body(read: Read, content_type: &str) -> Result<Bytes, Failed> {
+    match read.body {
+        Err(rejection) if crate::body_limit::is_too_large(&rejection) => {
+            let mut hit_limit = false;
+            match read_form(content_type, &read.prefix, &mut hit_limit, true) {
+                Ok(_) => Ok(read.prefix),
+                Err(e) => Err(Failed::Form(if hit_limit { 413 } else { 400 }, e)),
+            }
+        }
+        body => body.map_err(Failed::Read),
+    }
+}
+
+/// `limited`: the body ends in `http.MaxBytesError` rather than EOF; `hit_limit` is set
+/// when the reader runs into it.
+fn read_form(
+    content_type: &str,
+    body: &[u8],
+    hit_limit: &mut bool,
+    limited: bool,
+) -> Result<(Files, HashMap<String, Vec<String>>), String> {
     let (media, params) = parse_media_type(content_type).map_err(|_| NOT_MULTIPART.to_owned())?;
     if media != "multipart/form-data" {
         return Err(NOT_MULTIPART.into());
@@ -38,8 +90,13 @@ pub(super) fn form_files(content_type: &str, body: &[u8]) -> Result<Vec<FilePart
         nl: b"\r\n",
         dash_boundary: format!("--{boundary}").into_bytes(),
         parts_read: 0,
+        limited,
+        hit_limit,
+        window: 0,
+        over: false,
     };
-    let mut files: BTreeMap<String, Vec<FilePart>> = BTreeMap::new();
+    let mut files: Files = BTreeMap::new();
+    let mut values: HashMap<String, Vec<String>> = HashMap::new();
     let mut parts = 0;
     while let Some(headers) = reader.next_part()? {
         parts += 1;
@@ -69,9 +126,14 @@ pub(super) fn form_files(content_type: &str, body: &[u8]) -> Result<Vec<FilePart
                 filename: go_base(filename).to_owned(),
                 data,
             });
+        } else {
+            values
+                .entry(name)
+                .or_default()
+                .push(String::from_utf8_lossy(&data).into_owned());
         }
     }
-    Ok(files.into_values().flatten().collect())
+    Ok((files, values))
 }
 
 /// Go `filepath.Base` on Unix.
@@ -86,12 +148,28 @@ pub(super) fn go_base(path: &str) -> &str {
     trimmed.rsplit('/').next().unwrap_or(trimmed)
 }
 
-struct Reader<'a> {
+struct Reader<'a, 'h> {
     buf: &'a [u8],
     pos: usize,
     nl: &'static [u8],
     dash_boundary: Vec<u8>,
     parts_read: usize,
+    limited: bool,
+    hit_limit: &'h mut bool,
+    /// Limited parse: the end of what Go's 4096-byte `bufio.Reader` has pulled from
+    /// the `MaxBytesReader`, and whether that reader has returned the limit error.
+    /// Modelled with an underlying reader that fills every read it is given.
+    window: usize,
+    over: bool,
+}
+
+/// `bufio.Reader.ReadSlice('\n')` in the limited parse.
+enum Slice<'a> {
+    Line(&'a [u8]),
+    /// `bufio.ErrBufferFull`: 4096 bytes without a newline.
+    Full(&'a [u8]),
+    /// The read error, with what was buffered before it.
+    Over(&'a [u8]),
 }
 
 enum Scan {
@@ -100,7 +178,7 @@ enum Scan {
     UnexpectedEof,
 }
 
-impl<'a> Reader<'a> {
+impl<'a> Reader<'a, '_> {
     /// `bufio.Reader.ReadSlice('\n')`: the line with its newline, and whether the
     /// body ended before one.
     fn read_slice(&mut self) -> (&'a [u8], bool) {
@@ -143,13 +221,22 @@ impl<'a> Reader<'a> {
         }
         let mut expect_new_part = false;
         loop {
-            let (line, eof) = self.read_slice();
-            if eof && self.is_final_boundary(line) {
-                return Ok(None);
-            }
-            if eof {
-                return Err("multipart: NextPart: EOF".into());
-            }
+            let line = if self.limited {
+                match self.slice_go() {
+                    Slice::Line(line) => line,
+                    Slice::Full(_) => return Err("multipart: NextPart: bufio: buffer full".into()),
+                    Slice::Over(_) => return Err(format!("multipart: NextPart: {}", self.end("EOF"))),
+                }
+            } else {
+                let (line, eof) = self.read_slice();
+                if eof && self.is_final_boundary(line) {
+                    return Ok(None);
+                }
+                if eof {
+                    return Err("multipart: NextPart: EOF".into());
+                }
+                line
+            };
             if self.is_boundary_delimiter_line(line) {
                 self.parts_read += 1;
                 return self.headers();
@@ -158,7 +245,7 @@ impl<'a> Reader<'a> {
                 return Ok(None);
             }
             if expect_new_part {
-                return Err(format!("multipart: expecting a new Part; got line {}", go_quote(line)));
+                return Err(format!("multipart: expecting a new Part; got line {}", quote(line)));
             }
             if self.parts_read == 0 {
                 continue;
@@ -167,8 +254,122 @@ impl<'a> Reader<'a> {
                 expect_new_part = true;
                 continue;
             }
-            return Err(format!("multipart: unexpected line in Next(): {}", go_quote(line)));
+            return Err(format!("multipart: unexpected line in Next(): {}", quote(line)));
         }
+    }
+
+    /// bufio `fill` over the `MaxBytesReader`: a read of the free buffer space gets
+    /// all of it, or the bytes left before the limit and the limit error.
+    fn fill(&mut self) {
+        let want = PEEK_BUFFER - (self.window - self.pos);
+        let left = self.buf.len() - self.window;
+        if want <= left {
+            self.window += want;
+        } else {
+            self.window = self.buf.len();
+            self.over = true;
+        }
+    }
+
+    /// `bufio.Reader.ReadSlice('\n')` (the order of its checks matters: a newline,
+    /// then the read error, then a full buffer).
+    fn slice_go(&mut self) -> Slice<'a> {
+        loop {
+            let buffered = &self.buf[self.pos..self.window];
+            if let Some(i) = buffered.iter().position(|&b| b == b'\n') {
+                self.pos += i + 1;
+                return Slice::Line(&buffered[..=i]);
+            }
+            if self.over {
+                self.pos = self.window;
+                return Slice::Over(buffered);
+            }
+            if buffered.len() >= PEEK_BUFFER {
+                self.pos += PEEK_BUFFER;
+                return Slice::Full(buffered);
+            }
+            self.fill();
+        }
+    }
+
+    /// `bufio.Reader.ReadLine`: a line without its newline and whether it continues
+    /// (a full buffer; a "\r" at its end is put back), or `None` for the read error.
+    /// Bytes before the error come back as a line, the error with the next call.
+    fn read_line_go(&mut self) -> Option<(&'a [u8], bool)> {
+        match self.slice_go() {
+            Slice::Full(line) => match line.strip_suffix(b"\r") {
+                Some(line) => {
+                    self.pos -= 1;
+                    Some((line, true))
+                }
+                None => Some((line, true)),
+            },
+            Slice::Over([]) => None,
+            Slice::Over(line) => Some((line, false)),
+            Slice::Line(line) => {
+                let line = &line[..line.len() - 1];
+                Some((line.strip_suffix(b"\r").unwrap_or(line), false))
+            }
+        }
+    }
+
+    /// `textproto.Reader.readLineSlice`: the fragments of one line joined; the read
+    /// error drops them. `Err` is `message too large` past `lim`.
+    fn read_line_slice_go(&mut self, lim: usize) -> Result<Option<Cow<'a, [u8]>>, String> {
+        let mut line: Option<Vec<u8>> = None;
+        loop {
+            let Some((part, more)) = self.read_line_go() else {
+                return Ok(None);
+            };
+            if line.as_ref().map_or(0, Vec::len) + part.len() > lim {
+                return Err(TOO_LARGE.into());
+            }
+            match (&mut line, more) {
+                (None, false) => return Ok(Some(Cow::Borrowed(part))),
+                (None, true) => line = Some(part.to_vec()),
+                (Some(line), _) => line.extend_from_slice(part),
+            }
+            if !more {
+                return Ok(line.map(Cow::Owned));
+            }
+        }
+    }
+
+    /// `textproto.Reader.skipSpace` (`ReadByte` fills an empty buffer).
+    fn skip_space_go(&mut self) -> usize {
+        let mut n = 0;
+        loop {
+            if self.pos == self.window {
+                if self.over {
+                    return n;
+                }
+                self.fill();
+                continue;
+            }
+            if !matches!(self.buf[self.pos], b' ' | b'\t') {
+                return n;
+            }
+            self.pos += 1;
+            n += 1;
+        }
+    }
+
+    /// One header line: the limited parse reads it as Go does, a whole body as one
+    /// line up to its newline. `None` is the end of the body.
+    fn header_line(&mut self, lim: usize) -> Result<Option<Cow<'a, [u8]>>, String> {
+        if self.limited {
+            return self.read_line_slice_go(lim);
+        }
+        Ok(self.read_line().map(Cow::Borrowed))
+    }
+
+    /// The read error at the end of the body: `eof`, or the limit error.
+    fn end(&mut self, eof: &str) -> String {
+        if !self.limited {
+            return eof.to_owned();
+        }
+        *self.hit_limit = true;
+        crate::body_limit::MESSAGE.to_owned()
     }
 
     /// `textproto.Reader.readLineSlice`: one line without its "\n" or "\r\n";
@@ -185,48 +386,63 @@ impl<'a> Reader<'a> {
     }
 
     /// Go `readMIMEHeader`, keyed by lowercased name; the first value wins for
-    /// `Header.Get`. EOF inside the headers ends the form cleanly, as in Go.
+    /// `Header.Get`. EOF inside the headers ends the form cleanly, as in Go; the limit
+    /// error fails it.
     fn headers(&mut self) -> Result<Option<HashMap<String, String>>, String> {
         let mut headers = HashMap::new();
-        if matches!(self.buf.get(self.pos), Some(b' ' | b'\t')) {
-            let Some(line) = self.read_line() else {
-                return Ok(None);
+        // `Peek(1)`.
+        if self.limited && self.pos == self.window && !self.over {
+            self.fill();
+        }
+        let limited = self.limited;
+        let visible = if limited { self.window } else { self.buf.len() };
+        if matches!(self.buf[..visible].get(self.pos), Some(b' ' | b'\t')) {
+            let Some(line) = self.header_line(80)? else {
+                return self.ended();
             };
             if line.len() > 80 {
                 return Err(TOO_LARGE.into());
             }
-            return Err(format!(
-                "malformed MIME header initial line: {}",
-                String::from_utf8_lossy(line)
-            ));
+            return Err(format!("malformed MIME header initial line: {}", quote(&line)));
         }
         loop {
-            let Some(first) = self.read_line() else {
-                return Ok(None);
+            let Some(first) = self.header_line(usize::MAX)? else {
+                return self.ended();
             };
+            let first = &*first;
             if first.is_empty() {
                 return Ok(Some(headers));
             }
             if !first.contains(&b':') {
-                return Err(format!("malformed MIME header: missing colon: {}", go_quote(first)));
+                return Err(format!("malformed MIME header: missing colon: {}", quote(first)));
             }
-            let mut kv = trim_ascii_space(first).to_vec();
+            // textproto trims spaces and tabs; a whole body keeps the wider trim.
+            // ponytail: the limited parse only, where a cut line can end in "\r".
+            let trim = if self.limited { go_trim } else { trim_ascii_space };
+            let mut kv = trim(first).to_vec();
             loop {
-                let spaces = self.buf[self.pos..]
-                    .iter()
-                    .take_while(|&&b| b == b' ' || b == b'\t')
-                    .count();
+                let spaces = if limited {
+                    self.skip_space_go()
+                } else {
+                    let spaces = self.buf[self.pos..]
+                        .iter()
+                        .take_while(|&&b| b == b' ' || b == b'\t')
+                        .count();
+                    self.pos += spaces;
+                    spaces
+                };
                 if spaces == 0 {
                     break;
                 }
-                self.pos += spaces;
                 kv.push(b' ');
-                match self.read_line() {
-                    Some(line) => kv.extend_from_slice(trim_ascii_space(line)),
+                // Go stops at a continuation line it cannot read; the next line's read
+                // reports the error.
+                match self.header_line(usize::MAX)? {
+                    Some(line) => kv.extend_from_slice(trim(&line)),
                     None => break,
                 }
             }
-            let malformed = || format!("malformed MIME header line: {}", String::from_utf8_lossy(&kv));
+            let malformed = || format!("malformed MIME header line: {}", quote(&kv));
             let colon = kv.iter().position(|&b| b == b':').unwrap_or(kv.len());
             let (key, value) = (&kv[..colon], &kv[(colon + 1).min(kv.len())..]);
             if !key.iter().all(|&b| is_header_field_byte(b) || b == b' ') {
@@ -245,8 +461,19 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// The headers ended with the body: a clean end of the form at EOF.
+    fn ended(&mut self) -> Result<Option<HashMap<String, String>>, String> {
+        match self.limited {
+            false => Ok(None),
+            true => Err(self.end("EOF")),
+        }
+    }
+
     /// The current part's body, up to its closing boundary (Go `partReader`).
     fn body(&mut self) -> Result<Vec<u8>, String> {
+        if self.limited {
+            return self.body_go();
+        }
         let mut nl_dash = self.nl.to_vec();
         nl_dash.extend_from_slice(&self.dash_boundary);
         let mut data = Vec::new();
@@ -260,9 +487,85 @@ impl<'a> Reader<'a> {
             match scan {
                 Scan::Data => {}
                 Scan::End => return Ok(data),
-                Scan::UnexpectedEof => return Err("unexpected EOF".into()),
+                Scan::UnexpectedEof => return Err(self.end("unexpected EOF")),
             }
         }
+    }
+}
+
+impl Reader<'_, '_> {
+    /// `partReader.Read` until the part ends, over the bufio window: it scans what is
+    /// buffered and fills only when the scan needs more (`Peek(len+1)`).
+    fn body_go(&mut self) -> Result<Vec<u8>, String> {
+        let mut nl_dash = self.nl.to_vec();
+        nl_dash.extend_from_slice(&self.dash_boundary);
+        let mut data = Vec::new();
+        let (mut total, mut read_err) = (0, false);
+        loop {
+            let buffered = &self.buf[self.pos..self.window];
+            let (n, end) = scan_go(buffered, &self.dash_boundary, &nl_dash, total, read_err);
+            data.extend_from_slice(&buffered[..n]);
+            self.pos += n;
+            total += n;
+            match end {
+                Some(true) => return Ok(data),
+                Some(false) => return Err(self.end("unexpected EOF")),
+                None if n > 0 => {}
+                None => {
+                    let want = buffered.len() + 1;
+                    while self.window - self.pos < want.min(PEEK_BUFFER) && !self.over {
+                        self.fill();
+                    }
+                    read_err = self.window - self.pos < want;
+                }
+            }
+        }
+    }
+}
+
+/// Go `scanUntilBoundary`: the bytes that are part data, and `Some(true)` at the
+/// boundary or `Some(false)` for the read error.
+fn scan_go(buf: &[u8], dash: &[u8], nl_dash: &[u8], total: usize, read_err: bool) -> (usize, Option<bool>) {
+    let err = read_err.then_some(false);
+    if total == 0 {
+        if buf.starts_with(dash) {
+            return match match_after_go(buf, dash.len(), read_err) {
+                -1 => (dash.len(), None),
+                0 => (0, None),
+                _ => (0, Some(true)),
+            };
+        }
+        if dash.starts_with(buf) {
+            return (0, err);
+        }
+    }
+    if let Some(i) = buf.windows(nl_dash.len()).position(|w| w == nl_dash) {
+        return match match_after_go(&buf[i..], nl_dash.len(), read_err) {
+            -1 => (i + nl_dash.len(), None),
+            0 => (i, None),
+            _ => (i, Some(true)),
+        };
+    }
+    if nl_dash.starts_with(buf) {
+        return (0, err);
+    }
+    if let Some(i) = buf.iter().rposition(|&b| b == nl_dash[0])
+        && nl_dash.starts_with(&buf[i..])
+    {
+        return (i, None);
+    }
+    (buf.len(), err)
+}
+
+/// Go `matchAfterPrefix`: +1 the boundary ends here, -1 it does not, 0 more input is
+/// needed to tell.
+fn match_after_go(buf: &[u8], prefix: usize, read_err: bool) -> i8 {
+    match (buf.get(prefix), buf.get(prefix + 1)) {
+        (None, _) => i8::from(read_err),
+        (Some(b' ' | b'\t' | b'\r' | b'\n'), _) => 1,
+        (Some(b'-'), None) => -i8::from(read_err),
+        (Some(b'-'), Some(b'-')) => 1,
+        _ => -1,
     }
 }
 
@@ -311,6 +614,14 @@ fn skip_lwsp(b: &[u8]) -> &[u8] {
     &b[n..]
 }
 
+/// textproto `trim`: spaces and tabs at both ends.
+fn go_trim(b: &[u8]) -> &[u8] {
+    let is_space = |c: &u8| matches!(c, b' ' | b'\t');
+    let start = b.iter().position(|c| !is_space(c)).unwrap_or(b.len());
+    let end = b.iter().rposition(|c| !is_space(c)).map_or(start, |i| i + 1);
+    &b[start..end]
+}
+
 fn trim_ascii_space(b: &[u8]) -> &[u8] {
     let is_space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
     let start = b.iter().position(|c| !is_space(c)).unwrap_or(b.len());
@@ -320,33 +631,6 @@ fn trim_ascii_space(b: &[u8]) -> &[u8] {
 
 fn is_header_field_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-}
-
-/// Go `strconv.Quote` for header and boundary lines.
-fn go_quote(b: &[u8]) -> String {
-    let mut out = String::from("\"");
-    for chunk in b.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\x07' => out.push_str("\\a"),
-                '\x08' => out.push_str("\\b"),
-                '\x0c' => out.push_str("\\f"),
-                '\x0b' => out.push_str("\\v"),
-                c if (c as u32) < 0x20 || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        for byte in chunk.invalid() {
-            out.push_str(&format!("\\x{byte:02x}"));
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn is_tspecial(c: u8) -> bool {
@@ -398,13 +682,13 @@ fn consume_media_param(v: &str) -> Option<(String, String, &str)> {
     if value.is_empty() && after.len() == rest.len() {
         return None;
     }
-    Some((param.to_lowercase(), value, after))
+    Some((param.go_lower(), value, after))
 }
 
 /// Go `mime.ParseMediaType`, including RFC 2231 continuations and charsets.
 pub(super) fn parse_media_type(v: &str) -> Result<(String, HashMap<String, String>), ()> {
     let base = v.split(';').next().unwrap_or_default();
-    let media = base.to_lowercase().trim().to_owned();
+    let media = base.go_lower().trim().to_owned();
     let (kind, rest) = consume_token(&media);
     if kind.is_empty() {
         return Err(());
@@ -474,7 +758,7 @@ pub(super) fn parse_media_type(v: &str) -> Result<(String, HashMap<String, Strin
 fn decode_2231(v: &str) -> Option<String> {
     let (charset, rest) = v.split_once('\'')?;
     let (_, value) = rest.split_once('\'')?;
-    match charset.to_lowercase().as_str() {
+    match charset.go_lower().as_str() {
         "us-ascii" | "utf-8" => percent_unescape(value),
         _ => None,
     }

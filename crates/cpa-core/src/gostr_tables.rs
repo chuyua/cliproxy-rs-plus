@@ -1,5 +1,5 @@
 // @generated from Go go1.26.0 unicode.CaseRanges, unicode caseOrbit and strconv.IsPrint
-// by tests/reference/unicode/main.go. Do not edit.
+// by crates/cpa-common/tests/reference/unicode/main.go. Do not edit.
 
 /// `unicode.CaseRanges`: (lo, hi, upper delta, lower delta, title delta); `UPPER_LOWER` marks alternating ranges.
 pub(crate) static CASE_RANGES: [(u32, u32, i32, i32, i32); 328] = [

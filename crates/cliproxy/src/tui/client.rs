@@ -1,6 +1,7 @@
 //! Go's management API client (internal/tui/client.go): the v0 routes, a 10 s
 //! timeout, the Bearer key, Go's environment proxy rules and redirect limit, and Go's
 //! error texts (`HTTP <code>: <body>`).
+use cpa_core::gostr::GoStr;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ pub fn normalize_base_url(raw: &str) -> String {
     if base.is_empty() {
         return "http://127.0.0.1:8317".into();
     }
-    let lower = base.to_lowercase();
+    let lower = base.go_lower();
     let base = if lower.starts_with("http://") || lower.starts_with("https://") {
         base.to_owned()
     } else {
@@ -52,8 +53,6 @@ pub fn marshal_map(pairs: Vec<(&str, Value)>) -> String {
 pub struct Client {
     base_url: String,
     secret: Mutex<String>,
-    /// The server's last `X-CPA-VERSION`.
-    version: Mutex<String>,
     http: wreq::Client,
 }
 
@@ -62,21 +61,12 @@ impl Client {
         Client {
             base_url: normalize_base_url(base_url),
             secret: Mutex::new(secret.trim().to_owned()),
-            version: Mutex::new(String::new()),
             http: cpa_exec::proxy::default_client(),
         }
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
-    }
-
-    /// The server answered as cliproxy-rs (its `X-CPA-VERSION`), not Go CLIProxyAPI.
-    pub fn is_cliproxy_rs(&self) -> bool {
-        self.version
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .starts_with("cliproxy-rs")
     }
 
     /// Go `SetSecretKey`.
@@ -93,7 +83,7 @@ impl Client {
     // 111)") where Go prints its dialer's ("dial tcp ...: connect: connection refused").
     async fn request(&self, method: wreq::Method, path: &str, body: Option<String>) -> Result<(u16, Vec<u8>), String> {
         let url = format!("{}{path}", self.base_url);
-        let mut op = method.as_str().to_lowercase();
+        let mut op = method.as_str().go_lower();
         op[..1].make_ascii_uppercase();
         // Go's url.Error names the request that failed (its password shown as ***).
         let fail_at = |at: &str, cause: &str| format!("{op} {}: {cause}", cpa_common::gostr::quote(at));
@@ -187,9 +177,6 @@ impl Client {
                 current = next;
             };
             headers_seen.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(version) = res.headers().get("x-cpa-version").and_then(|v| v.to_str().ok()) {
-                *self.version.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = version.to_owned();
-            }
             let status = res.status().as_u16();
             let data = res.bytes().await.map_err(|e| cause(&e))?;
             Ok((status, data.to_vec()))
@@ -608,7 +595,7 @@ mod tests {
         );
         assert!(
             request
-                .to_lowercase()
+                .go_lower()
                 .contains("authorization: bearer remote-secret-key\r\n"),
             "{request}"
         );
@@ -628,7 +615,7 @@ mod tests {
         let (port, seen) = record("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()).await;
         let client = Client::new(&format!("http://u:fake-url-password@127.0.0.1:{port}"), "fake-bearer");
         client.get_config().await.unwrap();
-        let request = seen.lock().unwrap()[0].to_lowercase();
+        let request = seen.lock().unwrap()[0].go_lower();
         assert_eq!(request.matches("authorization:").count(), 1, "{request}");
         assert!(request.contains("authorization: bearer fake-bearer"));
     }
@@ -709,12 +696,12 @@ mod tests {
         assert!(seen[1].starts_with("GET /moved "), "{}", seen[1]);
         assert!(!seen[1].contains("value"), "the body is dropped: {}", seen[1]);
         assert!(
-            seen[1].to_lowercase().contains("authorization: bearer fake-bearer"),
+            seen[1].go_lower().contains("authorization: bearer fake-bearer"),
             "same host keeps the key"
         );
         assert!(
             seen[1]
-                .to_lowercase()
+                .go_lower()
                 .contains(&format!("referer: http://127.0.0.1:{start}/v0/management/debug"))
         );
     }

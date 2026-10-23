@@ -22,6 +22,7 @@ on:
       - ui/dist/**
       - .github/workflows/docker.yml
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - Dockerfile
       - .dockerignore
@@ -44,6 +45,7 @@ jobs:
   # The build, smoke test and size gate of the docker job in release.yml, on the same
   # runner image and with the same (default) build arguments and platform.
   image:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: docker image (not pushed)
     runs-on: ubuntu-24.04
     timeout-minutes: 60

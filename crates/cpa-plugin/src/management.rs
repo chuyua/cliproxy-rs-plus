@@ -387,7 +387,7 @@ impl Host {
         path: &std::path::Path,
         version: &str,
         mut call: ManagementCall,
-        scope: RequestScope,
+        mut scope: RequestScope,
     ) -> Result<ManagementResponse, crate::rpc::CallError> {
         let Some(record) = self.record(plugin_id) else {
             return Ok(ManagementResponse::default());
@@ -395,6 +395,10 @@ impl Host {
         if record.path != path || record.version != version {
             return Ok(ManagementResponse::default());
         }
+        scope.headers = call.headers.clone();
+        scope.query = call.query.clone();
+        scope.cancel = scope.cancel.child_token();
+        let _cancel = scope.cancel.clone().drop_guard();
         let guard = self
             .inner
             .callbacks
@@ -426,17 +430,13 @@ pub fn escape_json_body_if_likely(body: &[u8], content_type: &str) -> Option<Byt
     if trimmed.is_empty() {
         return None;
     }
-    let value = GoValue::parse(trimmed)?;
-    Some(Bytes::from(escape_strings(value).marshal_no_html()))
-}
-
-fn escape_strings(v: GoValue) -> GoValue {
-    match v {
-        GoValue::String(s) => GoValue::String(html_escape(&s)),
-        GoValue::Array(items) => GoValue::Array(items.into_iter().map(escape_strings).collect()),
-        GoValue::Object(map) => GoValue::Object(map.into_iter().map(|(k, v)| (k, escape_strings(v))).collect()),
-        other => other,
-    }
+    let mut value = GoValue::parse(trimmed)?;
+    value.visit_mut(|v| {
+        if let GoValue::String(s) = v {
+            *s = html_escape(s);
+        }
+    });
+    Some(Bytes::from(value.marshal_no_html()))
 }
 
 /// Go `html.EscapeString`.
@@ -535,5 +535,20 @@ mod tests {
             escape_json_body_if_likely(br#""<b>""#, header_get(&lower, "Content-Type")),
             None
         );
+    }
+
+    /// A legacy response at encoding/json's depth limit escapes on a 2 MiB stack.
+    #[test]
+    fn legacy_json_escaping_handles_the_depth_limit() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let deep = |leaf: &str| format!("{}[\"{leaf}\"]{}", r#"[{"s":"#.repeat(4_999), "}]".repeat(4_999));
+                let got = escape_json_body_if_likely(deep("<b>").as_bytes(), "application/json").unwrap();
+                assert_eq!(&got[..], deep("&lt;b&gt;").as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

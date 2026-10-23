@@ -34,7 +34,10 @@ pub async fn action(
     if parts.len() != 2 {
         return respond::error_detail(404, &format!("{} not found.", uri.path()), "invalid_request_error");
     }
-    let body = body.unwrap_or_default();
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return crate::claude::read_failed(&rejection),
+    };
     let alt = alt(uri.query().unwrap_or_default());
     let (operation, stream) = match parts[1] {
         "generateContent" => (Operation::Generate, false),
@@ -82,9 +85,9 @@ struct GeminiSse {
 }
 
 impl Writer for GeminiSse {
-    /// The Gemini executor emits exact client bytes for the requested `alt`.
+    /// Internal execution and interceptors see bare Gemini chunks; only HTTP frames them.
     fn chunk(&mut self, event: Bytes) -> Vec<Bytes> {
-        vec![event]
+        vec![if self.raw { event } else { respond::ensure_frame(event) }]
     }
 
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
@@ -116,7 +119,10 @@ pub async fn interactions(
 ) -> Response {
     let mut body = match body {
         Ok(body) => body,
-        Err(rejection) => return respond::error_detail(400, &rejection.body_text(), "invalid_request_error"),
+        Err(rejection) => {
+            let (status, reason) = crate::claude::read_error(&rejection);
+            return respond::error_detail(status, &reason, "invalid_request_error");
+        }
     };
     let invalid = |m: &str| respond::error_detail(400, m, "invalid_request_error");
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&body) else {

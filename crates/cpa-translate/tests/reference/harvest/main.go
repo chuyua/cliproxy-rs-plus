@@ -6,7 +6,7 @@
 //
 // It renames every converter registered in internal/translator/**/init.go (request,
 // stream, non-stream), every exported `...WithCompat` request converter, and
-// sdk/translator's TranslateRequest/TranslateStream/TranslateNonStream to
+// sdk/translator's TranslateRequest/TranslateRequestEnvelope/TranslateStream/TranslateNonStream to
 // harvestOrig_<Name>, and adds a same-signature wrapper that logs the call before
 // forwarding it. Only calls made directly from a `_test.go` file are logged, with the
 // enclosing Test function's name and the call line, as JSON lines in $HARVEST_OUT. The
@@ -107,6 +107,15 @@ func encode(v any) any {
 	case reflect.Map:
 		if m, ok := v.(map[string]string); ok {
 			return map[string]any{"map": m}
+		}
+	case reflect.Struct:
+		// sdk/translator.RequestEnvelope: the fields a request fixture can carry.
+		if f, m, s, b := rv.FieldByName("Format"), rv.FieldByName("Model"), rv.FieldByName("Stream"), rv.FieldByName("Body"); f.IsValid() && m.IsValid() && s.IsValid() && b.IsValid() {
+			info := rv.FieldByName("ModelInfo")
+			return map[string]any{"envelope": map[string]any{
+				"format": f.String(), "model": m.String(), "stream": s.Bool(),
+				"body": base64.StdEncoding.EncodeToString(b.Bytes()), "model_info": info.IsValid() && !info.IsNil(),
+			}}
 		}
 	}
 	return map[string]any{"other": fmt.Sprintf("%T", v)}
@@ -229,7 +238,18 @@ func main() {
 			if sel, ok := call.Fun.(*ast.SelectorExpr); !ok || sel.Sel.Name != "Register" {
 				return true
 			}
-			add(dir, call.Args[2].(*ast.Ident).Name)
+			if name := call.Args[2].(*ast.Ident).Name; name != "nil" {
+				add(dir, name)
+			} else {
+				// The request is registered as an envelope; tests call its byte form.
+				for _, decl := range funcDecls(dir) {
+					n := decl.Name.Name
+					if decl.Name.IsExported() && strings.HasPrefix(n, "Convert") && strings.Contains(n, "RequestTo") &&
+						!strings.Contains(n, "Envelope") && !strings.HasSuffix(n, "WithCompat") && !strings.HasSuffix(n, "Context") {
+						add(dir, n)
+					}
+				}
+			}
 			for _, el := range call.Args[3].(*ast.CompositeLit).Elts {
 				kv := el.(*ast.KeyValueExpr)
 				if key := kv.Key.(*ast.Ident).Name; key == "Stream" || key == "NonStream" {
@@ -256,14 +276,14 @@ func main() {
 			"ObfuscateExecCommandDescription", "ObfuscateWriteStdinDescription", "IsDevinCodexAppAutomationUpdate",
 			"MergeAdjacentGeminiContents", "ContentHasGeminiFunctionResponse", "ReorderGeminiUserParts", "MergeAdjacentGeminiUserContents",
 			"SplitGeminiFunctionResponseTurns", "SetGeminiFunctionResponseResult", "AlignOpenAIToolCallMessages"},
-		"internal/util":                          {"NormalizeClaudeToolInputSchema", "HasUnsupportedUnicodePropertyEscape", "GeminiClaudeToolUseID", "IsClaudeCodeAttributionSystemText"},
-		"internal/translator/antigravity/gemini":                 {"fixCLIToolResponse", "removeEmptyGeminiFunctionTools", "rewriteGeminiFunctionNames", "restoreUsageMetadata"},
-		"internal/translator/antigravity/interactions":           {"rewriteInteractionsFunctionNames"},
+		"internal/util":                                           {"NormalizeClaudeToolInputSchema", "HasUnsupportedUnicodePropertyEscape", "GeminiClaudeToolUseID", "IsClaudeCodeAttributionSystemText", "CleanClaudeToolArgumentsWithTranslated"},
+		"internal/translator/antigravity/gemini":                  {"fixCLIToolResponse", "removeEmptyGeminiFunctionTools", "rewriteGeminiFunctionNames", "restoreUsageMetadata"},
+		"internal/translator/antigravity/interactions":            {"rewriteInteractionsFunctionNames"},
 		"internal/translator/antigravity/openai/chat-completions": {"normalizeAntigravityOpenAIThinkingConfig"},
-		"internal/translator/claude/gemini":                      {"normalizeClaudeToolSchema", "lowercaseClaudeToolSchemaTypes"},
-		"internal/translator/codex/claude":                       {"normalizeToolParameters"},
-		"internal/translator/codex/gemini":                       {"cleanGeminiCodexToolParameters"},
-		"internal/translator/codex/interactions":                 {"cleanedCodexToolParameters", "setInteractionsCodexRawIfDifferent"},
+		"internal/translator/claude/gemini":                       {"normalizeClaudeToolSchema", "lowercaseClaudeToolSchemaTypes"},
+		"internal/translator/codex/claude":                        {"normalizeToolParameters"},
+		"internal/translator/codex/gemini":                        {"cleanGeminiCodexToolParameters"},
+		"internal/translator/codex/interactions":                  {"cleanedCodexToolParameters", "setInteractionsCodexRawIfDifferent"},
 	}
 	valued := map[string]bool{}
 	for rel, names := range values {
@@ -273,7 +293,7 @@ func main() {
 		}
 	}
 	sdkDir := filepath.Join(root, "sdk/translator")
-	for _, name := range []string{"TranslateRequest", "TranslateStream", "TranslateNonStream"} {
+	for _, name := range []string{"TranslateRequest", "TranslateRequestEnvelope", "TranslateStream", "TranslateNonStream"} {
 		add(sdkDir, name)
 	}
 	dirs := make([]string, 0, len(targets))

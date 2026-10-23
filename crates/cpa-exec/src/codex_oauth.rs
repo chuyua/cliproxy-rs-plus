@@ -5,6 +5,7 @@
 //! Executors never persist: refresh returns a [`MetadataPatch`] that the runtime commits.
 //! Only the explicit login commands write a credential file.
 
+use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -32,8 +33,9 @@ pub const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/devicea
 pub const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEFAULT_PLAN: &str = "free";
-/// `CodexAuthenticator.RefreshLead`.
-pub const REFRESH_LEAD: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+/// Go `CodexOuterRefreshLead` (`CodexAuthenticator.RefreshLead`): well ahead of the
+/// nominal 10-day token expiry, since upstream can invalidate tokens early.
+pub const REFRESH_LEAD: chrono::TimeDelta = chrono::TimeDelta::hours(96);
 
 pub fn redirect_uri(port: u16) -> String {
     format!("http://localhost:{port}/auth/callback")
@@ -182,10 +184,64 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-type RefreshResult = Shared<BoxFuture<'static, Result<Tokens, ExecError>>>;
+type RefreshResult<T> = Shared<BoxFuture<'static, Result<T, ExecError>>>;
 /// Completed refresh results kept for deduplication and failure backoff.
 const MAX_RETAINED_REFRESHES: usize = 64;
-type Refreshes = Arc<Mutex<HashMap<[u8; 32], (Instant, RefreshResult)>>>;
+type Table<T> = Arc<Mutex<HashMap<[u8; 32], (Instant, RefreshResult<T>)>>>;
+
+/// The outer and Sign in with ChatGPT refresh tables, shared by clones.
+#[derive(Clone, Default)]
+struct Refreshes {
+    outer: Table<Tokens>,
+    siwc: Table<crate::codex_siwc::Tokens>,
+}
+
+/// Single-flights `run` per `key` on `table`, detached from the caller so a cancelled
+/// request cannot strand a rotated token. A success is retained for 5 minutes, so a stale
+/// snapshot cannot send the rotated refresh token again; a failure only when
+/// `retain_failures` (the outer tokens' backoff).
+fn single_flight<T: Clone + Send + Sync + 'static>(
+    table: &Table<T>,
+    key: [u8; 32],
+    run: BoxFuture<'static, Result<T, ExecError>>,
+    retain_failures: bool,
+) -> RefreshResult<T> {
+    let mut locked = table.lock().expect("refresh table");
+    locked.retain(|_, (until, _)| *until > Instant::now());
+    if let Some((_, result)) = locked.get(&key) {
+        return result.clone();
+    }
+    // Retained results are a cache, not an admission limit: evict the oldest completed
+    // ones. In-flight entries are bounded by the credential count.
+    while locked.len() >= MAX_RETAINED_REFRESHES {
+        let oldest = locked
+            .iter()
+            .filter(|(_, (_, result))| result.peek().is_some())
+            .min_by_key(|(_, (until, _))| *until)
+            .map(|(k, _)| *k);
+        match oldest {
+            Some(k) => locked.remove(&k),
+            None => break,
+        };
+    }
+    let retained = table.clone();
+    let task = tokio::spawn(async move {
+        let result = run.await;
+        let mut table = retained.lock().expect("refresh table");
+        if result.is_err() && !retain_failures {
+            table.remove(&key);
+        } else if let Some((until, _)) = table.get_mut(&key) {
+            *until = Instant::now() + Duration::from_secs(300);
+        }
+        drop(table);
+        result
+    });
+    let shared = async move { task.await.map_err(|_| oauth_error(500, "codex refresh task failed"))? }
+        .boxed()
+        .shared();
+    locked.insert(key, (Instant::now() + Duration::from_secs(300), shared.clone()));
+    shared
+}
 
 /// Codex OAuth endpoints and refresh coordination. Clones share the singleflight table.
 #[derive(Clone)]
@@ -194,6 +250,7 @@ pub struct CodexOAuth {
     token_url: String,
     device_usercode_url: String,
     device_token_url: String,
+    siwc_token_url: String,
     refreshes: Refreshes,
     retry_delay: Duration,
 }
@@ -210,9 +267,20 @@ impl CodexOAuth {
             token_url: token.into(),
             device_usercode_url: usercode.into(),
             device_token_url: device_token.into(),
-            refreshes: Arc::default(),
+            siwc_token_url: crate::codex_siwc::TOKEN_URL.into(),
+            refreshes: Refreshes::default(),
             retry_delay: Duration::from_secs(1),
         }
+    }
+
+    /// The Sign in with ChatGPT token endpoint, for local mocks.
+    pub fn with_siwc_token_url(mut self, url: &str) -> Self {
+        self.siwc_token_url = url.into();
+        self
+    }
+
+    pub(crate) fn siwc_token_url(&self) -> &str {
+        &self.siwc_token_url
     }
 
     /// Tests shorten Go's 1s-per-attempt refresh backoff.
@@ -230,7 +298,12 @@ impl CodexOAuth {
     /// Posts a form or JSON body as Go's `http.Client.Do` does (Go net/http headers,
     /// redirects followed, transparent gzip). Returns the status and a bounded body;
     /// transport faults never echo URLs or payloads.
-    async fn post(&self, url: &str, content_type: &str, body: Vec<u8>) -> Result<(u16, bytes::Bytes), ExecError> {
+    pub(crate) async fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(u16, bytes::Bytes), ExecError> {
         let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
@@ -312,44 +385,79 @@ impl CodexOAuth {
             return Err(oauth_error(400, "refresh token is required"));
         }
         let key: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
-        let shared = {
-            let mut table = self.refreshes.lock().expect("refresh table");
-            table.retain(|_, (until, _)| *until > Instant::now());
-            if let Some((_, result)) = table.get(&key) {
-                result.clone()
-            } else {
-                // Retained results are a cache, not an admission limit: evict the oldest
-                // completed ones. In-flight entries are bounded by the credential count.
-                while table.len() >= MAX_RETAINED_REFRESHES {
-                    let oldest = table
-                        .iter()
-                        .filter(|(_, (_, result))| result.peek().is_some())
-                        .min_by_key(|(_, (until, _))| *until)
-                        .map(|(k, _)| *k);
-                    match oldest {
-                        Some(k) => table.remove(&k),
-                        None => break,
-                    };
-                }
-                let oauth = self.clone();
-                let token = refresh_token.to_owned();
-                let task = tokio::spawn(async move {
-                    let result = oauth.refresh_with_retry(&token).await;
-                    // ponytail: results are retained for 5 minutes, matching Go's refresh
-                    // failure backoff; success retention absorbs stale duplicate snapshots.
-                    if let Some((until, _)) = oauth.refreshes.lock().expect("refresh table").get_mut(&key) {
-                        *until = Instant::now() + Duration::from_secs(300);
-                    }
-                    result
-                });
-                let shared = async move { task.await.map_err(|_| oauth_error(500, "codex refresh task failed"))? }
-                    .boxed()
-                    .shared();
-                table.insert(key, (Instant::now() + Duration::from_secs(300), shared.clone()));
-                shared
+        let oauth = self.clone();
+        let token = refresh_token.to_owned();
+        let run = async move { oauth.refresh_with_retry(&token).await }.boxed();
+        single_flight(&self.refreshes.outer, key, run, true).await
+    }
+
+    /// `RefreshSIWCTokensWithRetry(ctx, token, client, device, 3)`: the `siwc`
+    /// partition's refresh grant, single-flighted per client ID and refresh token.
+    pub async fn refresh_siwc(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+        let (refresh_token, client_id) = (refresh_token.trim(), client_id.trim());
+        if refresh_token.is_empty() {
+            return Err(oauth_error(400, "SIWC refresh token is required"));
+        }
+        if client_id.is_empty() {
+            return Err(oauth_error(
+                400,
+                "Stored OpenAI OAuth credential does not contain an issued client ID; reconnect ChatGPT",
+            ));
+        }
+        let key: [u8; 32] = Sha256::digest(format!("{client_id}:{refresh_token}").as_bytes()).into();
+        let oauth = self.clone();
+        let (token, client, device) = (refresh_token.to_owned(), client_id.to_owned(), device_id.to_owned());
+        let run = async move { oauth.refresh_siwc_with_retry(&token, &client, &device).await }.boxed();
+        single_flight(&self.refreshes.siwc, key, run, false).await
+    }
+
+    async fn refresh_siwc_with_retry(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+        let mut last = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_delay * attempt).await;
             }
-        };
-        shared.await
+            let once = tokio::time::timeout(
+                Duration::from_secs(30),
+                self.siwc_token_request(
+                    &[
+                        ("client_id", client_id),
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh_token),
+                        ("resource", crate::codex_siwc::RESOURCE),
+                    ],
+                    client_id,
+                    device_id,
+                    false,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out")));
+            match once {
+                Ok(tokens) => return Ok(tokens),
+                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
+                    return Err(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        let mut error = last.expect("three attempts ran");
+        error.body = format!(
+            "SIWC token refresh failed after 3 attempts: {}",
+            String::from_utf8_lossy(&error.body)
+        )
+        .into();
+        Err(error)
     }
 
     async fn refresh_with_retry(&self, refresh_token: &str) -> Result<Tokens, ExecError> {
@@ -532,7 +640,25 @@ fn oauth_error(status: u16, message: &str) -> ExecError {
 /// kept: token endpoints may echo request material, and refresh backoff keys on
 /// `invalid_grant` / `refresh_token_reused`.
 fn token_error(status: u16, body: &[u8]) -> ExecError {
-    let code = serde_json::from_slice::<Value>(body)
+    refresh_error(
+        status,
+        &format!("token refresh failed with status {status}: {}", oauth_code(body)),
+    )
+}
+
+/// A rejected grant makes the credential unusable (401, cooled and failed over); server
+/// and rate-limit faults are transport-like and must not poison the credential.
+pub(crate) fn refresh_error(status: u16, message: &str) -> ExecError {
+    let (status_out, scope) = match status {
+        400..=403 => (401, FailureScope::Credential),
+        _ => (502, FailureScope::Transport),
+    };
+    ExecError::local(status_out, scope, message)
+}
+
+/// The OAuth error code of a token endpoint's error body, or "".
+pub(crate) fn oauth_code(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| match &v["error"] {
             Value::String(s) => Some(s.clone()),
@@ -540,18 +666,7 @@ fn token_error(status: u16, body: &[u8]) -> ExecError {
             _ => None,
         })
         .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
-        .unwrap_or_default();
-    // A rejected grant makes the credential unusable (401, cooled and failed over); server
-    // and rate-limit faults are transport-like and must not poison the credential.
-    let (status_out, scope) = match status {
-        400..=403 => (401, FailureScope::Credential),
-        _ => (502, FailureScope::Transport),
-    };
-    ExecError::local(
-        status_out,
-        scope,
-        format!("token refresh failed with status {status}: {code}"),
-    )
+        .unwrap_or_default()
 }
 
 /// Refresh token from metadata (`Refresh` reads only `refresh_token`).
@@ -569,7 +684,7 @@ pub(crate) fn expiry(credential: &Credential) -> Option<DateTime<Utc>> {
         .find_map(|k| credential.metadata.get(*k).and_then(parse_time))
 }
 
-fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
     match value {
         Value::String(s) if s.trim().parse::<i64>().is_ok() => {
             parse_time(&Value::Number(s.trim().parse::<i64>().ok()?.into()))
@@ -594,7 +709,7 @@ fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-/// `Manager.shouldRefresh` with the Codex lead (24h). Without an expiry, `last_refresh`
+/// `Manager.shouldRefresh` with the Codex lead (96h). Without an expiry, `last_refresh`
 /// older than the lead (or missing) is due.
 // ponytail: refresh_interval_seconds overrides and unauthorized/invalid-grant lifecycle
 // gating live in the runtime scheduler (M4-0027).
@@ -623,7 +738,7 @@ pub fn credential_file_name(email: &str, plan: &str, account_hash: &str) -> Stri
         .trim()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
-        .map(str::to_lowercase)
+        .map(GoStr::go_lower)
         .collect();
     let plan = plan.join("-");
     let hash = account_hash.trim();
@@ -765,7 +880,7 @@ pub fn write_login(auth_dir: &Path, tokens: &Tokens) -> Result<PathBuf, ExecErro
     Ok(path)
 }
 
-fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -793,7 +908,10 @@ fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
-        std::fs::File::open(dir)?.sync_all()
+        // Go never syncs the folder, and Windows cannot open one as a file.
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -943,7 +1061,7 @@ pub async fn device_login(auth_dir: &Path, options: &LoginOptions) -> Result<Pat
         .map_err(|_| oauth_error(500, "credential publication failed"))?
 }
 
-fn plain_client() -> Result<wreq::Client, ExecError> {
+pub(crate) fn plain_client() -> Result<wreq::Client, ExecError> {
     wreq::Client::builder()
         .redirect(wreq::redirect::Policy::none())
         .build()
@@ -951,10 +1069,12 @@ fn plain_client() -> Result<wreq::Client, ExecError> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Callback {
-    code: String,
-    state: String,
-    error: Option<String>,
+pub(crate) struct Callback {
+    pub code: String,
+    pub state: String,
+    pub error: Option<String>,
+    /// The client ID Sign in with ChatGPT issued (Go `OAuthResult.ClientID`).
+    pub client_id: String,
 }
 
 /// `misc.ParseOAuthCallback` for a pasted URL or query string.
@@ -1007,6 +1127,7 @@ fn parse_manual_callback(input: &str) -> Result<Callback, ExecError> {
         code,
         state,
         error: (!error.is_empty()).then_some(error),
+        client_id: String::new(),
     })
 }
 
@@ -1016,7 +1137,7 @@ const SUCCESS_HTML: &str = "<!DOCTYPE html><html lang=\"en\"><head><meta charset
 /// connection; anything else gets 404.
 // ponytail: bounded HTTP/1 parser, not a general server; Go's styled success page with the
 // platform setup notice is reduced to a short page.
-async fn callback(listener: &tokio::net::TcpListener) -> Result<Callback, ExecError> {
+pub(crate) async fn callback(listener: &tokio::net::TcpListener) -> Result<Callback, ExecError> {
     loop {
         let (mut socket, _) = listener
             .accept()
@@ -1089,6 +1210,7 @@ fn route_callback(head: &[u8]) -> (String, Option<Callback>) {
                         code: String::new(),
                         state: String::new(),
                         error: Some(error.to_owned()),
+                        client_id: String::new(),
                     }),
                 )
             };
@@ -1108,6 +1230,7 @@ fn route_callback(head: &[u8]) -> (String, Option<Callback>) {
                     code: get("code"),
                     state: get("state"),
                     error: None,
+                    client_id: get("client_id").trim().to_owned(),
                 }),
             )
         }

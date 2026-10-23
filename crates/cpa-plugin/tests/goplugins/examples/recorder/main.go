@@ -11,10 +11,25 @@
 //	inputs: a,b            executor_input_formats (default chat-completions)
 //	outputs: a,b           executor_output_formats (default chat-completions)
 //	scope: <scope>         executor_model_scope (default both)
+//	serial: true           answer one call at a time (plugin.register and
+//	                       plugin.reconfigure excepted), holding the turn across the
+//	                       host callbacks a call makes
 //
 // Any other method is answered from <record>/respond/<label>/<method>.json when that
 // file exists: the file is the complete response envelope, written by the test before
 // the call.
+// <method>.once.json, when present, answers the next call instead and is then removed.
+// In an envelope's host_calls, the string "$seq" in a request becomes the number of
+// host_calls made so far, so a repeated call can send different content each time;
+// "$seq" elsewhere in the envelope then becomes the number of its last host call.
+// With "spawn": true the envelope's host_calls are made from a new goroutine, which the
+// call waits for, so they reach the host on another thread than the call's.
+// While <method>.hold exists, calls of that method wait (up to 10s) before answering, so a
+// test can change host state between the call's record and its answer.
+// executor.execute_stream.script.once.json, {"chunks":["..."],"error":"..."}, makes the
+// next asynchronous stream emit those chunks and close with that error, then is removed.
+// While executor.execute_stream.close.hold exists, that stream stays open (up to 10s)
+// after its chunks, so a test can drop it mid-stream.
 //
 // A management.handle request whose body is {"calls":[{"method":...,"request":{...}}]}
 // makes those host callbacks (with host_callback_id filled in when absent) and returns
@@ -83,6 +98,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -99,6 +115,11 @@ var (
 	inputs  = []string{"chat-completions"}
 	outputs = []string{"chat-completions"}
 	scope   = "both"
+	serial  = false
+	// turn serializes calls while serial is set.
+	turn sync.Mutex
+	// seq counts the canned host_calls made.
+	seq int
 )
 
 type envelope struct {
@@ -141,6 +162,14 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	name := C.GoString(method)
 	if name == pluginabi.MethodPluginRegister || name == pluginabi.MethodPluginReconfigure {
 		configure(requestBytes)
+	} else {
+		mu.Lock()
+		serialized := serial
+		mu.Unlock()
+		if serialized {
+			turn.Lock()
+			defer turn.Unlock()
+		}
 	}
 	record(name, requestBytes)
 	raw, rc := handle(name, requestBytes)
@@ -173,6 +202,7 @@ func configure(raw []byte) {
 	inputs = []string{"chat-completions"}
 	outputs = []string{"chat-completions"}
 	scope = "both"
+	serial = false
 	for _, line := range strings.Split(string(req.ConfigYAML), "\n") {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
 		if !ok {
@@ -202,6 +232,8 @@ func configure(raw []byte) {
 			outputs = splitList(value)
 		case "scope":
 			scope = value
+		case "serial":
+			serial = value == "true"
 		}
 	}
 }
@@ -224,8 +256,13 @@ func canned(label, method string) ([]byte, int, bool) {
 	if base == "" {
 		return nil, 0, false
 	}
-	raw, err := os.ReadFile(filepath.Join(base, "respond", label, method+".json"))
-	if err != nil {
+	waitWhile(label, method+".hold")
+	// <method>.once.json answers one call, then is removed.
+	once := filepath.Join(base, "respond", label, method+".once.json")
+	raw, err := os.ReadFile(once)
+	if err == nil {
+		_ = os.Remove(once)
+	} else if raw, err = os.ReadFile(filepath.Join(base, "respond", label, method+".json")); err != nil {
 		return nil, 0, false
 	}
 	var env envelope
@@ -269,6 +306,48 @@ func handle(method string, request []byte) ([]byte, int) {
 	mu.Unlock()
 	if method != pluginabi.MethodPluginRegister && method != pluginabi.MethodPluginReconfigure {
 		if raw, rc, found := canned(name, method); found {
+			// Optional nested callbacks let integration tests exercise context inheritance
+			// from an interceptor, rather than only from management.handle.
+			var callbacks struct {
+				Calls []hostCall `json:"host_calls"`
+				Spawn bool       `json:"spawn"`
+			}
+			_ = json.Unmarshal(raw, &callbacks)
+			var parent struct {
+				HostCallbackID string `json:"host_callback_id"`
+			}
+			_ = json.Unmarshal(request, &parent)
+			makeCalls := func() {
+				for _, call := range callbacks.Calls {
+					var fields map[string]any
+					_ = json.Unmarshal(call.Request, &fields)
+					fields["host_callback_id"] = parent.HostCallbackID
+					payload, _ := json.Marshal(fields)
+					mu.Lock()
+					seq++
+					n := seq
+					mu.Unlock()
+					payload = []byte(strings.ReplaceAll(string(payload), `"$seq"`, strconv.Itoa(n)))
+					response, _ := callHost(call.Method, payload)
+					record("host_callback", response)
+				}
+			}
+			if callbacks.Spawn {
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					makeCalls()
+				}()
+				<-done
+			} else {
+				makeCalls()
+			}
+			if len(callbacks.Calls) > 0 {
+				mu.Lock()
+				n := seq
+				mu.Unlock()
+				raw = []byte(strings.ReplaceAll(string(raw), "$seq", strconv.Itoa(n)))
+			}
 			return raw, rc
 		}
 	}
@@ -387,6 +466,21 @@ func executeStream(request []byte) ([]byte, int) {
 			"chunks":  []pluginapi.ExecutorStreamChunk{{Payload: []byte("a")}, {Payload: []byte("b")}},
 		})
 	}
+	if script, found := streamScript(); found {
+		mu.Lock()
+		name := label
+		mu.Unlock()
+		go func() {
+			for _, chunk := range script.Chunks {
+				raw, _ := json.Marshal(map[string]any{"stream_id": req.StreamID, "payload": []byte(chunk)})
+				callHost(pluginabi.MethodHostStreamEmit, raw)
+			}
+			waitWhile(name, pluginabi.MethodExecutorExecuteStream+".close.hold")
+			raw, _ := json.Marshal(map[string]any{"stream_id": req.StreamID, "error": script.Error})
+			callHost(pluginabi.MethodHostStreamClose, raw)
+		}()
+		return ok(map[string]any{"headers": map[string][]string{"X-Stream": {"script"}}})
+	}
 	go func() {
 		for _, chunk := range []string{"one", "two", "three"} {
 			raw, _ := json.Marshal(map[string]any{"stream_id": req.StreamID, "payload": []byte(chunk)})
@@ -400,6 +494,41 @@ func executeStream(request []byte) ([]byte, int) {
 		callHost(pluginabi.MethodHostStreamClose, raw)
 	}()
 	return ok(map[string]any{"headers": map[string][]string{"X-Stream": {"async"}}})
+}
+
+type streamScriptFile struct {
+	Chunks []string `json:"chunks"`
+	Error  string   `json:"error"`
+}
+
+// waitWhile waits (up to 10s) while respond/<name>/<file> exists.
+func waitWhile(name, file string) {
+	mu.Lock()
+	hold := filepath.Join(dir, "respond", name, file)
+	mu.Unlock()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(hold); err != nil {
+			return
+		}
+	}
+}
+
+// streamScript reads and removes executor.execute_stream.script.once.json.
+func streamScript() (streamScriptFile, bool) {
+	mu.Lock()
+	base, name := dir, label
+	mu.Unlock()
+	var script streamScriptFile
+	if base == "" {
+		return script, false
+	}
+	path := filepath.Join(base, "respond", name, pluginabi.MethodExecutorExecuteStream+".script.once.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return script, false
+	}
+	_ = os.Remove(path)
+	return script, json.Unmarshal(raw, &script) == nil
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

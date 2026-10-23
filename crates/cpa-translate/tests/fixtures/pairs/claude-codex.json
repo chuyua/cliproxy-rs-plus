@@ -245,29 +245,40 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_WebSearchToolMapping:466",
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470",
+   "path": "request",
+   "model": "test-model",
+   "input": "}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchToolMapping:504",
    "path": "request",
    "model": "test-model",
    "input": "{\n\t\t\"model\": \"claude-3-opus\",\n\t\t\"tools\": [\n\t\t\t{\n\t\t\t\t\"type\": \"web_search_20260209\",\n\t\t\t\t\"name\": \"web_search\",\n\t\t\t\t\"allowed_domains\": [\"example.com\"],\n\t\t\t\t\"blocked_domains\": [\"blocked.example\"],\n\t\t\t\t\"user_location\": {\n\t\t\t\t\t\"type\": \"approximate\",\n\t\t\t\t\t\"city\": \"Beijing\",\n\t\t\t\t\t\"country\": \"CN\",\n\t\t\t\t\t\"timezone\": \"Asia/Shanghai\"\n\t\t\t\t}\n\t\t\t}\n\t\t],\n\t\t\"tool_choice\": {\"type\":\"tool\",\"name\":\"web_search\"},\n\t\t\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}]\n\t}",
    "outputs": [
     [
-     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"example.com\"]},\"user_location\":{\n\t\t\t\t\t\"type\": \"approximate\",\n\t\t\t\t\t\"city\": \"Beijing\",\n\t\t\t\t\t\"country\": \"CN\",\n\t\t\t\t\t\"timezone\": \"Asia/Shanghai\"\n\t\t\t\t}}]}"
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"example.com\"]},\"user_location\":{\n\t\t\t\t\t\"type\": \"approximate\",\n\t\t\t\t\t\"city\": \"Beijing\",\n\t\t\t\t\t\"country\": \"CN\",\n\t\t\t\t\t\"timezone\": \"Asia/Shanghai\"\n\t\t\t\t}}]}"
     ]
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_WebSearchToolChoiceUsesDeclaredTypedToolName:497",
+   "name": "TestConvertClaudeRequestToCodex_WebSearchToolChoiceUsesDeclaredTypedToolName:535",
    "path": "request",
    "model": "test-model",
    "input": "{\n\t\t\"model\": \"claude-opus-4-7\",\n\t\t\"tools\": [\n\t\t\t{\"type\": \"web_search_20250305\", \"name\": \"browser_search\"},\n\t\t\t{\"name\": \"web_search\", \"description\": \"Local search\", \"input_schema\": {\"type\":\"object\",\"properties\":{}}}\n\t\t],\n\t\t\"tool_choice\": {\"type\":\"tool\",\"name\":\"web_search\"},\n\t\t\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}]\n\t}",
    "outputs": [
     [
-     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":{\"type\":\"function\",\"name\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"web_search\"},{\"name\": \"web_search\", \"description\": \"Local search\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":{\"type\":\"function\",\"name\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"},{\"name\": \"web_search\", \"description\": \"Local search\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
     ]
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_PreservesBase64PDFDocumentContent:582",
+   "name": "TestConvertClaudeRequestToCodex_PreservesBase64PDFDocumentContent:620",
    "path": "request",
    "model": "gpt-5.6-sol",
    "input": "{\n\t\t\"messages\": [{\n\t\t\t\"role\": \"user\",\n\t\t\t\"content\": [\n\t\t\t\t{\"type\": \"text\", \"text\": \"before\"},\n\t\t\t\t{\"type\": \"document\", \"source\": {\"type\": \"base64\", \"media_type\": \"application/pdf\", \"data\": \"JVBERi0xLjQK\"}},\n\t\t\t\t{\"type\": \"text\", \"text\": \"after\"}\n\t\t\t]\n\t\t}]\n\t}",
@@ -289,13 +300,46 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets:literal",
+   "name": "TestConvertClaudeRequestToCodex_AssistantMetaSignatureToReasoningItem:literal",
+   "path": "request",
+   "model": "muse-spark-1.3",
+   "input": "{\"model\":\"muse-spark-1.3\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"muse-spark-1.3\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets:literal",
    "path": "request",
    "model": "gpt-5.3-codex",
    "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
    "outputs": [
     [
      "{\"model\":\"gpt-5.3-codex\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:literal",
+   "path": "request",
+   "model": "deployment-123",
+   "input": "{\"model\":\"meta/muse-wonder\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"deployment-123\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:literal#2",
+   "path": "request",
+   "model": "deployment-123",
+   "input": "{\"model\":\"muse-spark-1.3\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"deployment-123\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
     ]
    ]
   },
@@ -311,7 +355,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:796",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:911",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"max_tokens\": 128,\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"Return an object with one string field named answer.\"}\n\t\t\t],\n\t\t\t\"output_config\": {\n\t\t\t\t\"format\": {\n\t\t\t\t\t\"type\": \"json_schema\",\n\t\t\t\t\t\"schema\": {\n\t\t\t\t\t\t\"type\": \"object\",\n\t\t\t\t\t\t\"properties\": {\n\t\t\t\t\t\t\t\"answer\": {\"type\": \"string\"}\n\t\t\t\t\t\t},\n\t\t\t\t\t\t\"required\": [\"answer\"],\n\t\t\t\t\t\t\"additionalProperties\": false\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}",
@@ -322,7 +366,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:834",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:949",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"hello\"}\n\t\t\t],\n\t\t\t\"output_config\": {\n\t\t\t\t\"format\": {\n\t\t\t\t\t\"type\": \"json_schema\",\n\t\t\t\t\t\"name\": \"custom_schema\",\n\t\t\t\t\t\"strict\": false,\n\t\t\t\t\t\"schema\": {\n\t\t\t\t\t\t\"type\": \"object\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}",
@@ -333,7 +377,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:853",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:968",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"hello\"}\n\t\t\t]\n\t\t}",
@@ -344,7 +388,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:870",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:985",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"thinking\": {\"type\": \"adaptive\"},\n\t\t\t\"output_config\": {\"effort\": \"high\"},\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"hello\"}\n\t\t\t]\n\t\t}",
@@ -355,7 +399,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:904",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:1019",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"hello\"}\n\t\t\t],\n\t\t\t\"output_config\": {\n\t\t\t\t\"format\": {\n\t\t\t\t\t\"type\": \"json_schema\",\n\t\t\t\t\t\"name\": \"cli_proxy_structured_output\",\n\t\t\t\t\t\"strict\": true,\n\t\t\t\t\t\"schema\": {\n\t\t\t\t\t\t\"type\": \"object\",\n\t\t\t\t\t\t\"properties\": {\n\t\t\t\t\t\t\t\"answer\": {\"type\": \"string\"},\n\t\t\t\t\t\t\t\"impossible\": {\"type\": \"string\"}\n\t\t\t\t\t\t},\n\t\t\t\t\t\t\"required\": [\"answer\"],\n\t\t\t\t\t\t\"additionalProperties\": false\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}",
@@ -366,7 +410,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:935",
+   "name": "TestConvertClaudeRequestToCodex_OutputConfigFormat:1050",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\t\"model\": \"gpt-5.4\",\n\t\t\t\"messages\": [\n\t\t\t\t{\"role\": \"user\", \"content\": \"hello\"}\n\t\t\t],\n\t\t\t\"output_config\": {\n\t\t\t\t\"format\": {\n\t\t\t\t\t\"type\": \"json_schema\",\n\t\t\t\t\t\"schema\": {\n\t\t\t\t\t\t\"type\": \"object\",\n\t\t\t\t\t\t\"properties\": {\n\t\t\t\t\t\t\t\"answer\": {\"type\": \"string\"}\n\t\t\t\t\t\t},\n\t\t\t\t\t\t\"required\": [\"answer\"],\n\t\t\t\t\t\t\"additionalProperties\": false\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}",
@@ -377,7 +421,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_StripsNestedToolSchemaMeta:1102",
+   "name": "TestConvertClaudeRequestToCodex_StripsNestedToolSchemaMeta:1217",
    "path": "request",
    "model": "gpt-5",
    "input": "{\n\t\t\"model\": \"gpt-5\",\n\t\t\"messages\": [{\"role\": \"user\", \"content\": \"hi\"}],\n\t\t\"tools\": [{\n\t\t\t\"name\": \"lookup\",\n\t\t\t\"description\": \"Lookup\",\n\t\t\t\"input_schema\": {\n\t\t\t\t\"type\": \"object\",\n\t\t\t\t\"$schema\": \"http://json-schema.org/draft-07/schema#\",\n\t\t\t\t\"properties\": {\n\t\t\t\t\t\"q\": {\n\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\"$schema\": \"http://json-schema.org/draft-07/schema#\",\n\t\t\t\t\t\t\"$id\": \"https://example.invalid/q\"\n\t\t\t\t\t},\n\t\t\t\t\t\"tags\": {\n\t\t\t\t\t\t\"type\": \"array\",\n\t\t\t\t\t\t\"items\": {\"type\": \"string\", \"$id\": \"https://example.invalid/tag\"}\n\t\t\t\t\t},\n\t\t\t\t\t\"mode\": {\n\t\t\t\t\t\t\"anyOf\": [\n\t\t\t\t\t\t\t{\"type\": \"string\", \"$schema\": \"http://json-schema.org/draft-07/schema#\"},\n\t\t\t\t\t\t\t{\"type\": \"null\"}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t},\n\t\t\t\t\"$defs\": {\n\t\t\t\t\t\"hint\": {\"type\": \"string\", \"$id\": \"https://example.invalid/hint\"}\n\t\t\t\t},\n\t\t\t\t\"required\": [\"q\"]\n\t\t\t}\n\t\t}]\n\t}",
@@ -388,7 +432,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_StripsUnsupportedUnicodePropertyEscapePatterns:1181",
+   "name": "TestConvertClaudeRequestToCodex_StripsUnsupportedUnicodePropertyEscapePatterns:1296",
    "path": "request",
    "model": "gpt-5.6",
    "input": "{\n\t\t\"model\": \"gpt-5.6\",\n\t\t\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}],\n\t\t\"tools\": [{\n\t\t\t\"name\": \"Artifact\",\n\t\t\t\"description\": \"Render an HTML file to an Artifact\",\n\t\t\t\"input_schema\": {\n\t\t\t\t\"type\": \"object\",\n\t\t\t\t\"properties\": {\n\t\t\t\t\t\"field\": {\n\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\"description\": \"field to replace\",\n\t\t\t\t\t\t\"pattern\": \"^(?!__.*__$)[^\\\\p{Cc}\\\\p{Cf}\\\\p{Zl}\\\\p{Zp}\\\"\\\\\\\\./[\\\\]]{1,200}$\"\n\t\t\t\t\t},\n\t\t\t\t\t\"asset_id\": {\n\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\"pattern\": \"^[0-9a-f]{32}$\"\n\t\t\t\t\t},\n\t\t\t\t\t\"lookahead_safe\": {\n\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\"pattern\": \"^(?!__.*__$).{1,200}$\"\n\t\t\t\t\t},\n\t\t\t\t\t\"literal_p\": {\n\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\"pattern\": \"^\\\\\\\\p{Cc}$\"\n\t\t\t\t\t},\n\t\t\t\t\t\"nested\": {\n\t\t\t\t\t\t\"type\": \"object\",\n\t\t\t\t\t\t\"properties\": {\n\t\t\t\t\t\t\t\"inner_field\": {\n\t\t\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\t\t\"pattern\": \"\\\\P{L}+\"\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t},\n\t\t\t\t\t\"union_field\": {\n\t\t\t\t\t\t\"anyOf\": [\n\t\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\t\"type\": \"string\",\n\t\t\t\t\t\t\t\t\"pattern\": \"\\\\p{N}+\"\n\t\t\t\t\t\t\t},\n\t\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\t\"type\": \"null\"\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t},\n\t\t\t\t\"required\": [\"field\"]\n\t\t\t}\n\t\t}]\n\t}",
@@ -399,7 +443,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_StripsPatternPropertiesIncompatibleKeys:1250",
+   "name": "TestConvertClaudeRequestToCodex_StripsPatternPropertiesIncompatibleKeys:1365",
    "path": "request",
    "model": "gpt-5.6",
    "input": "{\n\t\t\"model\": \"gpt-5.6\",\n\t\t\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}],\n\t\t\"tools\": [{\n\t\t\t\"name\": \"pattern_tool\",\n\t\t\t\"input_schema\": {\n\t\t\t\t\"type\": \"object\",\n\t\t\t\t\"patternProperties\": {\n\t\t\t\t\t\"^\\\\\\\\p{L}+$\": {\n\t\t\t\t\t\t\"type\": \"string\"\n\t\t\t\t\t},\n\t\t\t\t\t\"^[a-z]+$\": {\n\t\t\t\t\t\t\"type\": \"number\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}]\n\t}",
@@ -874,7 +918,32 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1079:events",
+   "name": "TestConvertCodexResponseToClaude_StreamWebSearchCallActionSources:1001:events",
+   "path": "stream",
+   "model": "gpt-5.3-codex",
+   "lines": [
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4\"}}",
+    "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws_123\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}",
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"ws_123\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"xAI web search docs\",\"sources\":[{\"type\":\"url\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"title\":\"xAI Docs\"},{\"type\":\"url\",\"url\":\"https://example.com/notitle\"},{\"type\":\"url\",\"url\":\"\"},{\"type\":\"url\",\"url\":\"   \"}]}}}",
+    "data: {\"type\":\"response.completed\",\"response\":{\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}}"
+   ],
+   "outputs": [
+    [
+     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"grok-4\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n"
+    ],
+    [
+     ""
+    ],
+    [
+     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"ws_123\",\"name\":\"web_search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"xAI web search docs\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_123\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"xAI Docs\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"page_age\":null},{\"type\":\"web_search_result\",\"title\":\"https://example.com/notitle\",\"url\":\"https://example.com/notitle\",\"page_age\":null}]}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+    ],
+    [
+     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1132:events",
    "path": "stream",
    "model": "gpt-5.3-codex",
    "lines": [
@@ -971,7 +1040,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks:1138",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks:1191",
    "path": "non_stream",
    "model": "gpt-5.3-codex",
    "input": "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.3-codex-spark\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_123\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"search weather\"}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}",
@@ -1005,7 +1074,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchDedupesEmptyOpenPageItems:1182",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchDedupesEmptyOpenPageItems:1235",
    "path": "non_stream",
    "model": "gpt-5.3-codex",
    "input": "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.3-codex-spark\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"open_page\"}},{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"weather\"}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}",
@@ -1035,6 +1104,40 @@
    "outputs": [
     [
      "{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5.3-codex-spark\",\"content\":[{\"type\":\"server_tool_use\",\"id\":\"ws_1\",\"name\":\"web_search\",\"input\":{\"query\":\"weather\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_1\",\"content\":[]},{\"type\":\"text\",\"text\":\"ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallActionSources:1277",
+   "path": "non_stream",
+   "model": "gpt-5.3-codex",
+   "input": "{\n\t\t\"type\":\"response.completed\",\n\t\t\"response\":{\n\t\t\t\"id\":\"resp_1\",\n\t\t\t\"model\":\"grok-4\",\n\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\"usage\":{\"input_tokens\":5,\"output_tokens\":10},\n\t\t\t\"output\":[\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"web_search_call\",\n\t\t\t\t\t\"id\":\"ws_123\",\n\t\t\t\t\t\"status\":\"completed\",\n\t\t\t\t\t\"action\":{\n\t\t\t\t\t\t\"type\":\"search\",\n\t\t\t\t\t\t\"query\":\"xAI web search docs\",\n\t\t\t\t\t\t\"sources\":[\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"title\":\"xAI Docs\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://example.com/notitle\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"   \"}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t},\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"message\",\n\t\t\t\t\t\"content\":[{\"type\":\"output_text\",\"text\":\"here are the docs\"}]\n\t\t\t\t}\n\t\t\t]\n\t\t}\n\t}",
+   "original": "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\"messages\":[{\"role\":\"user\",\"content\":\"search xai docs\"}]}",
+   "outputs": [
+    [
+     "{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"grok-4\",\"content\":[{\"type\":\"server_tool_use\",\"id\":\"ws_123\",\"name\":\"web_search\",\"input\":{\"query\":\"xAI web search docs\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_123\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"xAI Docs\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"page_age\":null},{\"type\":\"web_search_result\",\"title\":\"https://example.com/notitle\",\"url\":\"https://example.com/notitle\",\"page_age\":null}]},{\"type\":\"text\",\"text\":\"here are the docs\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallActionSources:literal",
+   "path": "non_stream",
+   "model": "gpt-5.3-codex",
+   "input": "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\"messages\":[{\"role\":\"user\",\"content\":\"search xai docs\"}]}",
+   "outputs": [
+    [
+     ""
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallActionSources:literal#2",
+   "path": "non_stream",
+   "model": "gpt-5.3-codex",
+   "input": "{\n\t\t\"type\":\"response.completed\",\n\t\t\"response\":{\n\t\t\t\"id\":\"resp_1\",\n\t\t\t\"model\":\"grok-4\",\n\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\"usage\":{\"input_tokens\":5,\"output_tokens\":10},\n\t\t\t\"output\":[\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"web_search_call\",\n\t\t\t\t\t\"id\":\"ws_123\",\n\t\t\t\t\t\"status\":\"completed\",\n\t\t\t\t\t\"action\":{\n\t\t\t\t\t\t\"type\":\"search\",\n\t\t\t\t\t\t\"query\":\"xAI web search docs\",\n\t\t\t\t\t\t\"sources\":[\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"title\":\"xAI Docs\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://example.com/notitle\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"   \"}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t},\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"message\",\n\t\t\t\t\t\"content\":[{\"type\":\"output_text\",\"text\":\"here are the docs\"}]\n\t\t\t\t}\n\t\t\t]\n\t\t}\n\t}",
+   "outputs": [
+    [
+     "{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"grok-4\",\"content\":[{\"type\":\"server_tool_use\",\"id\":\"ws_123\",\"name\":\"web_search\",\"input\":{\"query\":\"xAI web search docs\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_123\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"xAI Docs\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"page_age\":null},{\"type\":\"web_search_result\",\"title\":\"https://example.com/notitle\",\"url\":\"https://example.com/notitle\",\"page_age\":null}]},{\"type\":\"text\",\"text\":\"here are the docs\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}"
     ]
    ]
   },
@@ -1083,7 +1186,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopSequenceMapping:1284",
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopSequenceMapping:1401",
    "path": "non_stream",
    "model": "gpt-5.3-codex",
    "input": "{\n\t\t\"type\":\"response.completed\",\n\t\t\"response\":{\n\t\t\t\"id\":\"resp_1\",\n\t\t\t\"model\":\"gpt-5\",\n\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\"stop_sequence\":\"\\nEND\",\n\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\"output\":[]\n\t\t}\n\t}",
@@ -4143,7 +4246,7 @@
    "input": "{\"tools\":[{\"name\":\"a\"},{\"description\":\"no name\"},{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\"messages\":[]}",
    "outputs": [
     [
-     "{\"model\":\"gpt-5.3-codex\",\"instructions\":\"\",\"input\":[],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"name\":\"a\",\"type\":\"function\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false},{\"description\":\"no name\",\"type\":\"function\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false},{\"type\":\"web_search\"}]}"
+     "{\"model\":\"gpt-5.3-codex\",\"instructions\":\"\",\"input\":[],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"name\":\"a\",\"type\":\"function\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false},{\"description\":\"no name\",\"type\":\"function\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false},{\"type\":\"web_search\"}]}"
     ]
    ]
   },
@@ -4827,7 +4930,7 @@
    "input": "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"allowed_domains\":[\"a.com\"],\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search_20260209\",\"name\":\"ws2\",\"allowed_domains\":\"notarray\",\"user_location\":\"str\"},{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"},\"strict\":true,\"cache_control\":{\"type\":\"ephemeral\"},\"defer_loading\":true,\"type\":\"custom\"},{\"name\":\"g\",\"input_schema\":{\"$schema\":\"x\",\"$id\":\"y\",\"type\":\"object\",\"properties\":null},\"strict\":false}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"ws2\"},\"messages\":[]}",
    "outputs": [
     [
-     "{\"model\":\"gpt-5.3-codex\",\"instructions\":\"\",\"input\":[],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"a.com\"]},\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search\"},{\"name\":\"f\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}},{\"name\":\"g\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}}]}"
+     "{\"model\":\"gpt-5.3-codex\",\"instructions\":\"\",\"input\":[],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"a.com\"]},\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search\"},{\"name\":\"f\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}},{\"name\":\"g\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}}]}"
     ]
    ]
   },
@@ -4838,7 +4941,7 @@
    "input": "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"allowed_domains\":[\"a.com\"],\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search_20260209\",\"name\":\"ws2\",\"allowed_domains\":\"notarray\",\"user_location\":\"str\"},{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"},\"strict\":true,\"cache_control\":{\"type\":\"ephemeral\"},\"defer_loading\":true,\"type\":\"custom\"},{\"name\":\"g\",\"input_schema\":{\"$schema\":\"x\",\"$id\":\"y\",\"type\":\"object\",\"properties\":null},\"strict\":false}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"ws2\"},\"messages\":[]}",
    "outputs": [
     [
-     "{\"model\":\"grok-4.7(high)\",\"instructions\":\"\",\"input\":[],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"a.com\"]},\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search\"},{\"name\":\"f\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}},{\"name\":\"g\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}}]}"
+     "{\"model\":\"grok-4.7(high)\",\"instructions\":\"\",\"input\":[],\"tool_choice\":{\"type\":\"web_search\"},\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\",\"filters\":{\"allowed_domains\":[\"a.com\"]},\"user_location\":{\"type\":\"approximate\",\"city\":\"X\"}},{\"type\":\"web_search\"},{\"name\":\"f\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}},{\"name\":\"g\",\"strict\":false,\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"}}]}"
     ]
    ]
   },
@@ -8053,7 +8156,7 @@
      ""
     ],
     [
-     ""
+     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"raw\"}}\n\n"
     ],
     [
      "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello é\"}}\n\n"
@@ -8495,7 +8598,7 @@
    "original": "{\"tools\":[{\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"},{\"name\":\"mcp__server_with_a_very_long_name_that_goes_on_and_on__read_file_contents_now\"},{\"name\":\"late\"}],\"messages\":[]}",
    "outputs": [
     [
-     "{\"id\":\"r1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"s1s2{\\\"x\\\":1}\",\"signature\":\"sig\"},{\"type\":\"thinking\",\"thinking\":\"plain summary\"},{\"type\":\"thinking\",\"thinking\":\"c1c2\"},{\"type\":\"thinking\",\"thinking\":\"str content\"},{\"type\":\"text\",\"text\":\"t \u003c1\u003e\"},{\"type\":\"text\",\"text\":\"string message\"},{\"type\":\"server_tool_use\",\"id\":\"ws\",\"name\":\"web_search\",\"input\":{\"query\":\"q\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"https://a\",\"url\":\"https://a\",\"page_age\":null}]},{\"type\":\"tool_use\",\"id\":\"call_id_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_abd19f5ba168e376\",\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"input\":{\"a\":1}  },{\"type\":\"tool_use\",\"id\":\"c2\",\"name\":\"x\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"toolu_1790984609477535950_1\",\"name\":\"y\",\"input\":{}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":\"\\n\\n\",\"usage\":{\"input_tokens\":13,\"output_tokens\":5,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4,\"output_tokens_details\":{\"thinking_tokens\":5}}}"
+     "{\"id\":\"r1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"s1s2{\\\"x\\\":1}\",\"signature\":\"sig\"},{\"type\":\"thinking\",\"thinking\":\"plain summary\"},{\"type\":\"thinking\",\"thinking\":\"c1c2\"},{\"type\":\"thinking\",\"thinking\":\"str content\"},{\"type\":\"text\",\"text\":\"t \u003c1\u003e\"},{\"type\":\"text\",\"text\":\"string message\"},{\"type\":\"server_tool_use\",\"id\":\"ws\",\"name\":\"web_search\",\"input\":{\"query\":\"q\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"https://a\",\"url\":\"https://a\",\"page_age\":null}]},{\"type\":\"tool_use\",\"id\":\"call_id_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_abd19f5ba168e376\",\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"input\":{\"a\":1}  },{\"type\":\"tool_use\",\"id\":\"c2\",\"name\":\"x\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"toolu_1792530649419932126_99\",\"name\":\"y\",\"input\":{}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":\"\\n\\n\",\"usage\":{\"input_tokens\":13,\"output_tokens\":5,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4,\"output_tokens_details\":{\"thinking_tokens\":5}}}"
     ]
    ],
    "dynamic": [
@@ -8879,7 +8982,237 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_AssistantThinkingSignatureToReasoningItem:534",
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#2",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#3",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#4",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#5",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#6",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"name\":\"lookup\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#7",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"name\":\"lookup\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#8",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"name\":\"web_search\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"name\":\"web_search\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#9",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"name\":\"web_search\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"name\":\"web_search\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#10",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20990101\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"function\",\"name\":\"web_search\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#11",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20990101\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"function\",\"name\":\"web_search\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#12",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#13",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#14",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20260209\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#15",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20260209\",\"name\":\"web_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#16",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"browser_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#17",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"browser_search\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#18",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#19",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#20",
+   "path": "request",
+   "model": "test-model",
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"search_one\"},{\"type\":\"web_search_20260209\",\"name\":\"search_two\"},{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"},{\"type\":\"web_search\"},{\"name\":\"lookup\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_WebSearchSourcesInclude:470#21",
+   "path": "request",
+   "model": "test-model",
+   "stream": true,
+   "input": "{\"model\":\"claude-opus-4-7\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"search_one\"},{\"type\":\"web_search_20260209\",\"name\":\"search_two\"},{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\"}}]}",
+   "outputs": [
+    [
+     "{\"model\":\"test-model\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\",\"web_search_call.action.sources\"],\"tools\":[{\"type\":\"web_search\"},{\"type\":\"web_search\"},{\"name\":\"lookup\",\"type\":\"function\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"strict\":false}]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantThinkingSignatureToReasoningItem:572",
    "path": "request",
    "model": "test-model",
    "input": "{\n\t\t\"model\": \"claude-3-opus\",\n\t\t\"messages\": [\n\t\t\t{\n\t\t\t\t\"role\": \"assistant\",\n\t\t\t\t\"content\": [\n\t\t\t\t\t{\n\t\t\t\t\t\t\"type\": \"thinking\",\n\t\t\t\t\t\t\"thinking\": \"visible summary must not be replayed\",\n\t\t\t\t\t\t\"signature\": \"gAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"\n\t\t\t\t\t},\n\t\t\t\t\t{\n\t\t\t\t\t\t\"type\": \"text\",\n\t\t\t\t\t\t\"text\": \"visible answer\"\n\t\t\t\t\t}\n\t\t\t\t]\n\t\t\t},\n\t\t\t{\n\t\t\t\t\"role\": \"user\",\n\t\t\t\t\"content\": \"continue\"\n\t\t\t}\n\t\t]\n\t}",
@@ -8890,7 +9223,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_PreservesContentOrderAcrossToolAndReasoningItems:631",
+   "name": "TestConvertClaudeRequestToCodex_PreservesContentOrderAcrossToolAndReasoningItems:669",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\n\t\t\"system\": \"system rules\",\n\t\t\"messages\": [\n\t\t\t{\"role\":\"assistant\",\"content\":[\n\t\t\t\t{\"type\":\"text\",\"text\":\"before reasoning\"},\n\t\t\t\t{\"type\":\"thinking\",\"signature\":\"gAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"},\n\t\t\t\t{\"type\":\"text\",\"text\":\"before tool\"},\n\t\t\t\t{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{\"query\":\"test\"}},\n\t\t\t\t{\"type\":\"text\",\"text\":\"after tool\"}\n\t\t\t]},\n\t\t\t{\"role\":\"user\",\"content\":[\n\t\t\t\t{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":[\n\t\t\t\t\t{\"type\":\"text\",\"text\":\"tool output\"},\n\t\t\t\t\t{\"type\":\"image\",\"source\":{\"media_type\":\"image/png\",\"data\":\"aW1hZ2U=\"}}\n\t\t\t\t]},\n\t\t\t\t{\"type\":\"text\",\"text\":\"continue\"}\n\t\t\t]}\n\t\t],\n\t\t\"tools\": [{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\"}}]\n\t}",
@@ -8901,7 +9234,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_AssistantGrokSignatureToReasoningItem:669",
+   "name": "TestConvertClaudeRequestToCodex_AssistantGrokSignatureToReasoningItem:707",
    "path": "request",
    "model": "grok-4.5",
    "input": "{\"model\":\"grok-4.5\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
@@ -8912,7 +9245,95 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets:686",
+   "name": "TestConvertClaudeRequestToCodex_AssistantMetaSignatureToReasoningItem:731",
+   "path": "request",
+   "model": "muse-spark-1.3",
+   "input": "{\"model\":\"muse-spark-1.3\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"muse-spark-1.3\",\"instructions\":\"\",\"input\":[{\"type\":\"reasoning\",\"summary\":[],\"content\":null,\"encrypted_content\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets:748",
+   "path": "request",
+   "model": "gpt-5.4",
+   "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"gpt-5.4\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets:748#2",
+   "path": "request",
+   "model": "claude-sonnet-4-6",
+   "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"claude-sonnet-4-6\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets:748#3",
+   "path": "request",
+   "model": "grok-4.5",
+   "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"grok-4.5\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:764",
+   "path": "request",
+   "model": "meta/muse-wonder",
+   "input": "{\"model\":\"meta/muse-wonder\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3A\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"meta/muse-wonder\",\"instructions\":\"\",\"input\":[{\"type\":\"reasoning\",\"summary\":[],\"content\":null,\"encrypted_content\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3A\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:773",
+   "path": "request",
+   "model": "gpt-5.4",
+   "input": "{\"model\":\"meta/muse-wonder\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3A\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"gpt-5.4\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:781",
+   "path": "request",
+   "model": "muse-spark-1.3",
+   "input": "{\"model\":\"muse-spark-1.3\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"gAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"muse-spark-1.3\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem:788",
+   "path": "request",
+   "model": "deployment-123",
+   "input": "{\"model\":\"meta/muse-wonder\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3A\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"deployment-123\",\"instructions\":\"\",\"input\":[{\"type\":\"reasoning\",\"summary\":[],\"content\":null,\"encrypted_content\":\"Q-PaDgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3Ab3A\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets:801",
    "path": "request",
    "model": "gpt-5.4",
    "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
@@ -8923,7 +9344,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets:686#2",
+   "name": "TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets:801#2",
    "path": "request",
    "model": "claude-sonnet-4-6",
    "input": "{\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"summary\",\"signature\":\"HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X\"},{\"type\":\"text\",\"text\":\"answer\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
@@ -8934,7 +9355,7 @@
    ]
   },
   {
-   "name": "TestConvertClaudeRequestToCodex_IgnoresNonCodexThinkingSignatures:747",
+   "name": "TestConvertClaudeRequestToCodex_IgnoresNonCodexThinkingSignatures:862",
    "path": "request",
    "model": "test-model",
    "input": "{\n\t\t\t\t\"model\": \"claude-3-opus\",\n\t\t\t\t\"messages\": [\n\t\t\t\t\t{\n\t\t\t\t\t\t\"role\": \"user\",\n\t\t\t\t\t\t\"content\": [\n\t\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\t\"type\": \"thinking\",\n\t\t\t\t\t\t\t\t\"thinking\": \"user supplied thinking\",\n\t\t\t\t\t\t\t\t\"signature\": \"gAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"\n\t\t\t\t\t\t\t},\n\t\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\t\"type\": \"text\",\n\t\t\t\t\t\t\t\t\"text\": \"hello\"\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t]\n\t\t\t}",
@@ -8957,7 +9378,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_ShortensLongToolUseIDs:1043",
+   "name": "TestConvertCodexResponseToClaude_ShortensLongToolUseIDs:1096",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\"type\":\"response.completed\",\n\t\t\t\"response\":{\n\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\t\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"lookup\",\"arguments\":\"{}\"}]\n\t\t\t}\n\t\t}",
@@ -8969,7 +9390,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks:1138#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks:1191#2",
    "path": "non_stream",
    "model": "",
    "input": "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.3-codex-spark\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_123\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"search weather\"}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}",
@@ -8981,7 +9402,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchStopReasonEndTurn:1171",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchStopReasonEndTurn:1224",
    "path": "non_stream",
    "model": "",
    "input": "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.3-codex-spark\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_123\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"search weather\"}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}",
@@ -8993,7 +9414,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchDedupesEmptyOpenPageItems:1182#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchDedupesEmptyOpenPageItems:1235#2",
    "path": "non_stream",
    "model": "",
    "input": "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.3-codex-spark\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"open_page\"}},{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"weather\"}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}",
@@ -9005,7 +9426,19 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1259",
+   "name": "TestConvertCodexResponseToClaudeNonStream_WebSearchCallActionSources:1277#2",
+   "path": "non_stream",
+   "model": "",
+   "input": "{\n\t\t\"type\":\"response.completed\",\n\t\t\"response\":{\n\t\t\t\"id\":\"resp_1\",\n\t\t\t\"model\":\"grok-4\",\n\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\"usage\":{\"input_tokens\":5,\"output_tokens\":10},\n\t\t\t\"output\":[\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"web_search_call\",\n\t\t\t\t\t\"id\":\"ws_123\",\n\t\t\t\t\t\"status\":\"completed\",\n\t\t\t\t\t\"action\":{\n\t\t\t\t\t\t\"type\":\"search\",\n\t\t\t\t\t\t\"query\":\"xAI web search docs\",\n\t\t\t\t\t\t\"sources\":[\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"title\":\"xAI Docs\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"https://example.com/notitle\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"\"},\n\t\t\t\t\t\t\t{\"type\":\"url\",\"url\":\"   \"}\n\t\t\t\t\t\t]\n\t\t\t\t\t}\n\t\t\t\t},\n\t\t\t\t{\n\t\t\t\t\t\"type\":\"message\",\n\t\t\t\t\t\"content\":[{\"type\":\"output_text\",\"text\":\"here are the docs\"}]\n\t\t\t\t}\n\t\t\t]\n\t\t}\n\t}",
+   "original": "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\"messages\":[{\"role\":\"user\",\"content\":\"search xai docs\"}]}",
+   "outputs": [
+    [
+     "{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"grok-4\",\"content\":[{\"type\":\"server_tool_use\",\"id\":\"ws_123\",\"name\":\"web_search\",\"input\":{\"query\":\"xAI web search docs\"}},{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_123\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"xAI Docs\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"page_age\":null},{\"type\":\"web_search_result\",\"title\":\"https://example.com/notitle\",\"url\":\"https://example.com/notitle\",\"page_age\":null}]},{\"type\":\"text\",\"text\":\"here are the docs\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1376",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\t\t\"output\":[]\n\t\t\t\t}\n\t\t\t}",
@@ -9017,7 +9450,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1259#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1376#2",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.incomplete\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\n\t\t\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\t\t\"output\":[]\n\t\t\t\t}\n\t\t\t}",
@@ -9029,7 +9462,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1259#3",
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1376#3",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\t\t\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}]\n\t\t\t\t}\n\t\t\t}",
@@ -9041,7 +9474,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1259#4",
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopReasonMapping:1376#4",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.incomplete\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"incomplete_details\":{\"reason\":\"content_filter\"},\n\t\t\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\t\t\"output\":[]\n\t\t\t\t}\n\t\t\t}",
@@ -9053,7 +9486,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_StopSequenceMapping:1284#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_StopSequenceMapping:1401#2",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\"type\":\"response.completed\",\n\t\t\"response\":{\n\t\t\t\"id\":\"resp_1\",\n\t\t\t\"model\":\"gpt-5\",\n\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\"stop_sequence\":\"\\nEND\",\n\t\t\t\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\n\t\t\t\"output\":[]\n\t\t}\n\t}",
@@ -9065,7 +9498,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":1000,\"output_tokens\":200,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9077,7 +9510,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669#2",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":1000,\"output_tokens\":200,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_creation_tokens\":150}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9089,7 +9522,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552#3",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669#3",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":500,\"output_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":50}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9101,7 +9534,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552#4",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669#4",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":1000,\"output_tokens\":200,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":0}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9113,7 +9546,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552#5",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669#5",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":4022,\"output_tokens\":462,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":4019}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9125,7 +9558,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1552#6",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage:1669#6",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":500,\"output_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":300,\"cache_write_tokens\":300}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9137,7 +9570,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":420,\"output_tokens\":518,\"output_tokens_details\":{\"reasoning_tokens\":163},\"total_tokens\":938},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9149,7 +9582,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#2",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#2",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":0}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9161,7 +9594,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#3",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#3",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9173,7 +9606,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#4",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#4",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":999}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9185,7 +9618,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#5",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#5",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":-5}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9197,7 +9630,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#6",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#6",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":-0.5}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9209,7 +9642,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#7",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#7",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":9223372036854775808}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9221,7 +9654,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#8",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#8",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":\"163\"}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9233,7 +9666,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#9",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#9",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":true}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9245,7 +9678,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1781#10",
+   "name": "TestConvertCodexResponseToClaudeNonStream_PreservesReasoningUsage:1898#10",
    "path": "non_stream",
    "model": "",
    "input": "{\n\t\t\t\t\"type\":\"response.completed\",\n\t\t\t\t\"response\":{\n\t\t\t\t\t\"id\":\"resp_1\",\n\t\t\t\t\t\"model\":\"gpt-5\",\n\t\t\t\t\t\"stop_reason\":\"stop\",\n\t\t\t\t\t\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"output_tokens_details\":{\"reasoning_tokens\":null}},\n\t\t\t\t\t\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]\n\t\t\t\t}\n\t\t\t}",
@@ -9255,6 +9688,227 @@
      "{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}"
     ]
    ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: container_upload"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#2",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"system\":\"sys\",\"messages\":[{\"role\":\"system\",\"content\":\"reminder\"},{\"role\":\"user\",\"content\":[{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"sys\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\\u003csystem-reminder\\u003e\\nreminder\\n\\u003c/system-reminder\\u003e\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: container_upload"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#3",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]},{\"role\":\"user\",\"content\":\"next\"}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: container_upload"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#4",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":[{\"type\":\"document\",\"source\":{\"type\":\"file\",\"file_id\":\"file-1\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: document"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_KeepsTurnWithTextBesideAttachment:61:compat",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"keep me\"},{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep me\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_Base64DocumentAfterHistoryStaysAFile:72:compat",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":[{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBERi0xLjQK\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_file\",\"file_data\":\"data:application/pdf;base64,JVBERi0xLjQK\",\"filename\":\"document.pdf\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_EmptyTextDoesNotHideAnEmptiedUserTurn:89:compat",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: container_upload"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_EmptyTextDoesNotHideAnEmptiedUserTurn:89:compat#2",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":[{\"type\":\"container_upload\",\"file_id\":\"file-1\"},{\"type\":\"text\",\"text\":\"\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: container_upload"
+  },
+  {
+   "name": "TestConvertClaudeRequestToCodex_NonEmptyTextBesideAttachmentStillSucceeds:103:compat",
+   "path": "request_compat",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"keep me\"},{\"type\":\"container_upload\",\"file_id\":\"file-1\"}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"},{\"type\":\"input_text\",\"text\":\"keep me\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestClaudeToCodexImageOnlyTurnKeepsTheImage:116:envelope",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestClaudeToCodexImageOnlyTurnKeepsTheImage:116:envelope#2",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.test/a.png\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"https://example.test/a.png\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestClaudeToCodexImageOnlyTurnKeepsTheImage:116:envelope#3",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"file\",\"file_id\":\"file-1\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"file_id\":\"file-1\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"unknown\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#2",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#3",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"ftp://example.test/a.png\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#4",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#5",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"file\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
+  },
+  {
+   "name": "TestClaudeToCodexUnrepresentableImageBesideTextStillSucceeds:116:envelope",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"keep me\"},{\"type\":\"image\",\"source\":{\"type\":\"file\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep me\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ]
+  },
+  {
+   "name": "TestClaudeToCodexEmptyTextDoesNotHideAnUnrepresentableImage:116:envelope",
+   "path": "request",
+   "model": "m",
+   "input": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"image\",\"source\":{\"type\":\"file\"}}]}]}",
+   "outputs": [
+    [
+     "{\"model\":\"m\",\"instructions\":\"\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}],\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"medium\"},\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"
+    ]
+   ],
+   "request_error": "unsupported content part: image"
   },
   {
    "name": "TestSummaryIntentTranslation:76",
@@ -9520,13 +10174,13 @@
      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_parallel\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n"
     ],
     [
-     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1791031646428474301_3\",\"name\":\"Read\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n"
+     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1792530649590744601_101\",\"name\":\"Read\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n"
     ],
     [
      ""
     ],
     [
-     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"a\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1791031646428500016_4\",\"name\":\"Read\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"b\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"a\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1792530649590774476_102\",\"name\":\"Read\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"b\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
     ]
    ],
    "dynamic": [
@@ -10251,7 +10905,33 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_ShortensLongToolUseIDs:1004:stream",
+   "name": "TestConvertCodexResponseToClaude_StreamWebSearchCallActionSources:1009:stream",
+   "path": "stream",
+   "model": "",
+   "original": "{\n\t\t\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\n\t\t\"messages\":[{\"role\":\"user\",\"content\":\"search xai docs\"}]\n\t}",
+   "lines": [
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4\"}}",
+    "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws_123\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}",
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"ws_123\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"xAI web search docs\",\"sources\":[{\"type\":\"url\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"title\":\"xAI Docs\"},{\"type\":\"url\",\"url\":\"https://example.com/notitle\"},{\"type\":\"url\",\"url\":\"\"},{\"type\":\"url\",\"url\":\"   \"}]}}}",
+    "data: {\"type\":\"response.completed\",\"response\":{\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}}"
+   ],
+   "outputs": [
+    [
+     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"grok-4\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n"
+    ],
+    [
+     ""
+    ],
+    [
+     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"ws_123\",\"name\":\"web_search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"xAI web search docs\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_123\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"xAI Docs\",\"url\":\"https://docs.x.ai/developers/tools/web-search\",\"page_age\":null},{\"type\":\"web_search_result\",\"title\":\"https://example.com/notitle\",\"url\":\"https://example.com/notitle\",\"page_age\":null}]}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+    ],
+    [
+     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":5,\"output_tokens\":10}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    ]
+   ]
+  },
+  {
+   "name": "TestConvertCodexResponseToClaude_ShortensLongToolUseIDs:1057:stream",
    "path": "stream",
    "model": "",
    "original": "{\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]}",
@@ -10265,7 +10945,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1102:stream",
+   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1155:stream",
    "path": "stream",
    "model": "",
    "original": "{\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]}",
@@ -10279,7 +10959,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1102:stream#2",
+   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1155:stream#2",
    "path": "stream",
    "model": "",
    "original": "{\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]}",
@@ -10293,7 +10973,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1102:stream#3",
+   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1155:stream#3",
    "path": "stream",
    "model": "",
    "original": "{\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]}",
@@ -10311,7 +10991,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1102:stream#4",
+   "name": "TestConvertCodexResponseToClaude_StreamStopReasonMapping:1155:stream#4",
    "path": "stream",
    "model": "",
    "original": "{\"tools\":[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]}",
@@ -10325,7 +11005,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamStopSequenceMapping:1121:stream",
+   "name": "TestConvertCodexResponseToClaude_StreamStopSequenceMapping:1174:stream",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10339,7 +11019,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10361,7 +11041,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream#2",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream#2",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10383,7 +11063,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream#3",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream#3",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10405,7 +11085,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream#4",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream#4",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10427,7 +11107,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream#5",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream#5",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10449,7 +11129,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1406:stream#6",
+   "name": "TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage:1523:stream#6",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10471,7 +11151,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10493,7 +11173,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#2",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#2",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10515,7 +11195,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#3",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#3",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10537,7 +11217,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#4",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#4",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10559,7 +11239,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#5",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#5",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10581,7 +11261,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#6",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#6",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10603,7 +11283,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#7",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#7",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10625,7 +11305,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#8",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#8",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10647,7 +11327,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#9",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#9",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10669,7 +11349,7 @@
    ]
   },
   {
-   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1664:stream#10",
+   "name": "TestConvertCodexResponseToClaude_PreservesReasoningUsage:1781:stream#10",
    "path": "stream",
    "model": "",
    "original": "{\"messages\":[]}",
@@ -10741,6 +11421,7 @@
    ]
   }
  ],
+ "reference": "ae3ee3be",
  "token_count": true,
  "upstream": "codex"
 }

@@ -6,6 +6,7 @@
 //! and one task pushes them. A Home that rejects the key or command disables
 //! forwarding until the next [`Forwarder::bind`].
 
+use cpa_core::gostr::GoStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -169,7 +170,7 @@ impl Forwarder {
 
 /// Go `isHomeAppLogUnsupported`.
 fn unsupported(message: &str) -> bool {
-    let message = message.trim().to_lowercase();
+    let message = message.trim().go_lower();
     ["unsupported key", "unknown command", "unsupported command"]
         .iter()
         .any(|needle| message.contains(needle))
