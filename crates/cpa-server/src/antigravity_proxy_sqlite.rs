@@ -292,6 +292,7 @@ impl ProxyGroupDb {
         random_slot: usize,
         inject_failure: bool,
     ) -> Result<Option<BoundProxy>> {
+        ensure!(cooldown_seconds > 0, "failed proxy cooldown must be positive");
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (group_id, node_id, generation): (i64, Option<i64>, i64) = tx
@@ -309,7 +310,7 @@ impl ProxyGroupDb {
             node_id == expected_node_id && generation == expected_generation,
             "stale proxy failure: binding node or generation changed"
         );
-        let until = now.saturating_add(cooldown_seconds.max(0));
+        let until = now.saturating_add(cooldown_seconds);
         let updated = tx.execute(
             "UPDATE rust_ag_nodes SET failure_count=CASE
                WHEN failure_count < 9223372036854775807 THEN failure_count+1
@@ -737,6 +738,23 @@ mod tests {
         }
         assert_eq!(db.binding("mock-1.json").unwrap(), initial);
         assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_failure_cooldown_cannot_reselect_failed_node() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        for seconds in [0, -1, i64::MIN] {
+            assert!(db
+                .invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, seconds, 0)
+                .is_err());
+            let still_bound = db.select_and_bind("mock-1.json", 101, 0).unwrap().unwrap();
+            assert_eq!(still_bound.node_id, first.node_id);
+            assert_eq!(still_bound.binding_generation, first.binding_generation);
+        }
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 0);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }
