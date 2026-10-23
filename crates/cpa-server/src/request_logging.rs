@@ -128,7 +128,10 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
+    // Eager capture can delay even a handler that rejects without reading its
+    // body. Unknown-length, large and multipart uploads must be streamed to
+    // the existing bounded deferred spool instead of buffered to EOF here.
+    let eager = !multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY);
     let mut request_body = Vec::new();
     if eager {
         let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
@@ -147,9 +150,14 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             }
         };
         *request.body_mut() = Body::from(bytes.clone());
-        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
+        // A small compressed upload can still expand dramatically. Bound only
+        // the diagnostic copy; the original bytes are forwarded unchanged.
+        let capture_limit = limit.unwrap_or(DEFERRED_BODY).min(DEFERRED_BODY);
+        request_body = decode(bytes.to_vec(), request.headers(), true, Some(capture_limit))
+            .await
+            .0;
     }
-    let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
+    let deferred = if !eager && (enabled || !multipart) && length != Some(0) && !request.body().is_end_stream() {
         Spool::new(&state.dir, "request-body").ok().map(|spool| {
             Arc::new(Mutex::new(Deferred {
                 spool,
@@ -1750,6 +1758,95 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "log"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_does_not_wait_for_unconsumed_request_bodies() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|| async { StatusCode::UNAUTHORIZED })),
+        );
+        // A handler that rejects before reading the body must not wait forever
+        // for an unknown-length, oversized, or multipart client upload.
+        for (name, length, content_type) in [
+            ("chunked", None, None),
+            ("large", Some(SMALL_BODY + 1), None),
+            ("multipart", None, Some("multipart/form-data; boundary=fixture")),
+        ] {
+            let mut request = HttpRequest::builder().method("POST").uri("/fixture");
+            if let Some(length) = length {
+                request = request.header("content-length", length.to_string());
+            }
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), app.call(request.body(body).unwrap()))
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}: logger waited for an unread request body"))
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+            let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while logs(&dir)
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .filter(|content| content.contains("Status: 401"))
+            .count()
+            < 3
+        {
+            assert!(tokio::time::Instant::now() < deadline, "request logs did not finalize");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_deferred_body_forwards_original_chunks() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|body: Bytes| async move { body })),
+        );
+        let body = Body::from_stream(futures_util::stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ]));
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/fixture")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap(),
+            "hello world"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if logs(&dir)
+                .iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .any(|content| content.contains("hello world"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "deferred request log did not finalize"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
