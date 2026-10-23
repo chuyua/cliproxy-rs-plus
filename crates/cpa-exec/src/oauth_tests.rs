@@ -193,6 +193,30 @@ async fn token_key_singleflight_survives_canceled_waiter() {
 }
 
 #[tokio::test]
+async fn refreshes_on_distinct_proxies_do_not_share_an_exchange() {
+    let mock = Arc::new(Mock {
+        hold: true,
+        ..Default::default()
+    });
+    let oauth = service(mock.clone()).await;
+    let direct = oauth.via(&Proxy::Direct);
+    let proxied = oauth.via(&Proxy::Url("http://127.0.0.1:3128".into()));
+    let first = tokio::spawn(async move { direct.refresh("fake-shared-proxy-token").await });
+    tokio::time::timeout(Duration::from_secs(3), mock.started.notified())
+        .await
+        .expect("first proxy must start an exchange");
+    let second = tokio::spawn(async move { proxied.refresh("fake-shared-proxy-token").await });
+    tokio::time::timeout(Duration::from_secs(3), mock.started.notified())
+        .await
+        .expect("different proxy must not join another proxy's OAuth exchange");
+    mock.release.notify_waiters();
+    mock.release.notify_one(); // Permit a handler that has not yet parked.
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(mock.token_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn a_late_joiner_keeps_its_own_retry_budget() {
     // Go shares one exchange per token, not a caller's retry loop: B joins A's third
     // (failing) attempt and still retries on its own budget.
