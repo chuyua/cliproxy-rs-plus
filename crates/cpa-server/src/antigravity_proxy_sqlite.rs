@@ -190,6 +190,17 @@ impl ProxyGroupDb {
         Ok(())
     }
 
+    /// Read-only group membership check before first-use binding writes.
+    pub fn account_group_id(&self, name: &str) -> Result<i64> {
+        self.connection()?
+            .query_row(
+                "SELECT group_id FROM rust_ag_accounts WHERE credential_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .context("account group not found")
+    }
+
     pub fn binding(&self, name: &str) -> Result<BindingState> {
         self.connection()?
             .query_row(
