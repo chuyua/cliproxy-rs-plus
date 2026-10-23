@@ -1279,7 +1279,7 @@ impl Record {
             writeln!(out, "Upstream Transport: {upstream}")?;
         }
         write!(out, "Timestamp: {}\n\n\n=== HEADERS ===\n", timestamp(self.timestamp))?;
-        headers(out, &self.headers, true)?;
+        headers(out, &self.headers)?;
         out.write_all(b"\n\n")?;
         if !websocket {
             out.write_all(b"=== REQUEST BODY ===\n")?;
@@ -1317,7 +1317,7 @@ impl Record {
             return Ok(());
         }
         write!(out, "=== RESPONSE ===\nStatus: {}\n", self.status)?;
-        headers(out, &self.response_headers, false)?;
+        headers(out, &self.response_headers)?;
         if let Some(spool) = &self.response_spool
             && self.redact_sdp
         {
@@ -1451,16 +1451,11 @@ fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
     }
 }
 
-fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<()> {
+fn headers(out: &mut dyn Write, headers: &HeaderMap) -> io::Result<()> {
     for (name, value) in headers {
         write!(out, "{}: ", header_name(name.as_str()))?;
-        if mask {
-            out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if cookie(name.as_str()) {
-            out.write_all(REDACTED.as_bytes())?;
-        } else {
-            out.write_all(value.as_bytes())?;
-        }
+        // Even response headers may carry credentials. Never persist them verbatim.
+        out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
         out.write_all(b"\n")?;
     }
     Ok(())
@@ -1658,6 +1653,20 @@ mod tests {
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::response::IntoResponse;
     use tower_service::Service;
+
+    #[test]
+    fn response_headers_mask_sensitive_values() {
+        let mut response = HeaderMap::new();
+        response.insert("authorization", "Bearer marker-response-123456".parse().unwrap());
+        response.insert("x-api-key", "marker-key-123456".parse().unwrap());
+        response.insert("content-type", "application/json".parse().unwrap());
+        let mut output = Vec::new();
+        headers(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("marker-response"));
+        assert!(!output.contains("marker-key"));
+        assert!(output.contains("Content-Type: application/json"));
+    }
 
     /// `capture_go.json`, recorded with the Go generator's `buildinfo.Version` pinned to
     /// `cliproxy-rs-0.1.0` (tests/reference/capture/main.go). The version of this build
