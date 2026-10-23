@@ -247,22 +247,39 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
             record.status = response.status().as_u16();
             record.response_headers = response.headers().clone();
         }
+        // HEAD bodies are suppressed by the HTTP serving layer, but the
+        // handler body can be arbitrarily large or even infinite. Never
+        // replace the response body with an empty one on capture overflow:
+        // consume at most the logging budget and leave transport semantics
+        // to the serving layer. Cancellation drops the remainder promptly.
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        match axum::body::to_bytes(body, RESPONSE_CAPTURE_LIMIT).await {
-            Ok(bytes) => {
-                if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                    record.capture_response_chunk(&bytes);
+        let mut body = body;
+        let mut remaining = RESPONSE_CAPTURE_LIMIT;
+        while remaining > 0 {
+            use std::future::poll_fn;
+            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(bytes) = frame.into_data() {
+                        let captured = bytes.len().min(remaining);
+                        if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                            record.capture_response_chunk(&bytes[..captured]);
+                            record.response_truncated |= captured < bytes.len();
+                        }
+                        remaining -= captured;
+                    }
                 }
-                *response.body_mut() = Body::from(bytes);
-            }
-            Err(_) => {
-                // HEAD bodies are suppressed by HTTP. Do not allocate an
-                // unbounded handler body solely for its diagnostic log.
-                if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                    record.response_truncated = true;
-                }
+                Some(Err(_)) | None => break,
             }
         }
+        if remaining == 0 {
+            if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                record.response_truncated = true;
+            }
+        }
+        // The serving stack suppresses HEAD output; preserve the body object
+        // rather than silently replacing an over-limit body with an empty one.
+        *response.body_mut() = body;
     }
     let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(record) = locked.as_mut() else {
@@ -1784,6 +1801,51 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "log"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn head_large_response_capture_stays_bounded_and_returns_empty_body() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().route(
+            "/head-large",
+            axum::routing::head(|| async {
+                let chunk = Bytes::from(vec![b'h'; 1 << 20]);
+                let chunks = futures_util::stream::iter((0..16).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+                Response::new(Body::from_stream(chunks))
+            }),
+        );
+        let mut app = router(&state, crate::app(state.rt.clone(), app));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.call(
+                HttpRequest::builder()
+                    .method("HEAD")
+                    .uri("/head-large")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(body.is_empty(), "HEAD must never forward the handler body");
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if logs(&dir)
+                    .iter()
+                    .any(|path| std::fs::read_to_string(path).is_ok_and(|s| s.contains(marker)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
