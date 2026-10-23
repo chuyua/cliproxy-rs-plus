@@ -149,13 +149,13 @@ pub fn rebind_failed_group_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use crate::antigravity_proxy_group::{Node, Strategy};
     use cpa_core::config::Config;
     use cpa_core::credential::MetadataPatch;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sandbox() -> (ProxyGroupDb, Credential, PathBuf) {
