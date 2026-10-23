@@ -1,4 +1,4 @@
-# Development PRs run one Linux build and two targeted concurrency/failover tests.
+# Development PRs run one Linux build and targeted concurrency, failover and logging regressions.
 # Full multi-OS, integration, and resource-budget gates remain on main promotion PRs.
 name: Develop fast gates
 
