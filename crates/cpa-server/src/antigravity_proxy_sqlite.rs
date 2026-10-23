@@ -242,6 +242,12 @@ impl ProxyGroupDb {
     /// Stable assignment: concurrent callers get the same bound node.
     /// The caller supplies an RNG index for Strategy::Random.
     pub fn select_and_bind(&self, name: &str, now: i64, random_slot: usize) -> Result<Option<BoundProxy>> {
+        // Hot path: already-bound accounts do not need a write transaction.
+        // This snapshot can race an invalidation; callers must revalidate
+        // the generation before dispatching a request.
+        if let Some(active) = self.active_bound_proxy(name, now)? {
+            return Ok(Some(active.binding));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let selected = bind_in_tx(&tx, name, now, random_slot)?;
@@ -716,6 +722,22 @@ mod tests {
         assert_eq!(same.node_id, initial.node_id);
         assert_eq!(same.binding_generation, 1);
         drop(upgraded);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bound_account_hot_path_preserves_cursor_and_generation() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        let initial = db.binding("mock-1.json").unwrap();
+        for slot in 0..128 {
+            let next = db.select_and_bind("mock-1.json", 101, slot).unwrap().unwrap();
+            assert_eq!(next.node_id, first.node_id);
+            assert_eq!(next.binding_generation, first.binding_generation);
+        }
+        assert_eq!(db.binding("mock-1.json").unwrap(), initial);
+        assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
