@@ -132,6 +132,24 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .and_then(|s| s.parse::<u64>().ok());
     // Do not wait for large, chunked or multipart uploads before routing. In
     // particular, logging must not hold a handler's early 401/413 response.
+    // With request logging enabled Go consumes the body before auth and routing.
+    // For bounded chunked uploads, probe at most the configured limit plus one
+    // byte so an oversized upload is refused consistently on every route.
+    if enabled && length.is_none() {
+        if let Some(max) = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0) {
+            let body = std::mem::replace(request.body_mut(), Body::empty());
+            match axum::body::to_bytes(body, max.saturating_add(1) as usize).await {
+                Ok(bytes) => *request.body_mut() = Body::from(bytes),
+                Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
+                Err(error) => {
+                    *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                        Err::<Bytes, _>(io::Error::other(error.to_string()))
+                    }));
+                    return next.run(request).await;
+                }
+            }
+        }
+    }
     let eager = !multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY);
     let mut request_body = Vec::new();
     if eager {
