@@ -154,7 +154,10 @@ impl ProxyGroupDb {
     }
 
     pub fn add_node(&self, node: Node, proxy_url: &str) -> Result<()> {
-        ensure!(!proxy_url.trim().is_empty(), "proxy URL required");
+        ensure!(
+            matches!(cpa_exec::proxy::Proxy::parse(proxy_url), cpa_exec::proxy::Proxy::Url(_)),
+            "proxy node requires a supported proxy URL"
+        );
         let failures = i64::try_from(node.failure_count).context("failure count too large")?;
         self.connection()?.execute(
             "INSERT INTO rust_ag_nodes(id,group_id,proxy_url,enabled,failure_count,cooldown_until)
@@ -475,6 +478,34 @@ mod tests {
 
     fn db_value(db: &ProxyGroupDb, query: &str) -> i64 {
         db.connection().unwrap().query_row(query, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rejects_invalid_proxy_nodes_without_persisting_them() {
+        let (db, dir) = sandbox();
+        for (offset, url) in ["", " ", "direct", "none", "not-a-url", "ftp://example.com"]
+            .iter()
+            .enumerate()
+        {
+            let id = 100 + offset as i64;
+            assert!(
+                db.add_node(
+                    Node {
+                        id,
+                        group_id: 10,
+                        enabled: true,
+                        cooldown_until: None,
+                        failure_count: 0
+                    },
+                    url
+                )
+                .is_err(),
+                "unexpectedly accepted {url:?}"
+            );
+        }
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
