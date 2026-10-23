@@ -36,6 +36,194 @@ pub(crate) fn current() -> Option<RequestLog> {
 }
 
 #[derive(Clone)]
+struct Captured;
+
+/// Install at the handler boundary, before axum synthesizes Content-Length or
+/// suppresses HEAD bodies. The outer middleware still owns request capture.
+pub(crate) async fn response(request: Request, next: Next) -> Response {
+    let sink = request.extensions().get::<RequestLog>().cloned();
+    let head = request.method() == "HEAD";
+    let cors = request.extensions().get::<crate::management::Cors>().is_some();
+    let mut response = next.run(request).await;
+    if cors {
+        crate::management::cors_headers(&mut response);
+    }
+    match sink {
+        Some(sink) => capture_response(sink, head, response).await,
+        None => response,
+    }
+}
+
+fn setting<'a>(config: &'a cpa_core::config::Config, key: &str) -> Option<&'a serde_yaml_ng::Value> {
+    config.document.get("observability")?.get("logs")?.get(key)
+}
+
+#[derive(Clone)]
+struct CaptureState {
+    rt: Arc<Runtime>,
+    dir: PathBuf,
+}
+
+/// Install inside access logging so the UUID is already in request extensions.
+/// Commercial mode is a construction-time choice, exactly like Go's server.
+pub fn router(management: &Arc<Management>, app: axum::Router) -> axum::Router {
+    if management
+        .rt
+        .config()
+        .document
+        .get("server")
+        .and_then(|s| s.get("commercial-mode"))
+        .and_then(serde_yaml_ng::Value::as_bool)
+        == Some(true)
+    {
+        return app;
+    }
+    // Go resolves relative request-log directories against the config directory.
+    let dir = if management.log_dir.is_absolute() {
+        management.log_dir.clone()
+    } else {
+        management
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&management.log_dir)
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        CaptureState {
+            rt: management.rt.clone(),
+            dir,
+        },
+        capture,
+    ))
+}
+
+fn eligible(request: &Request, path: &str) -> bool {
+    if ["/v0/management", "/v8/management", "/management"]
+        .iter()
+        .any(|p| path.starts_with(p))
+    {
+        return false;
+    }
+    request.method() != "GET"
+        || (matches!(path, "/v1/responses" | "/backend-api/codex/responses")
+            && request
+                .headers()
+                .get("upgrade")
+                .is_some_and(|v| trim(v.as_bytes()).eq_ignore_ascii_case(b"websocket")))
+}
+
+async fn capture(State(state): State<CaptureState>, mut request: Request, next: Next) -> Response {
+    let path = crate::management::percent_decode(request.uri().path());
+    if !eligible(&request, &path) {
+        return next.run(request).await;
+    }
+    let config = state.rt.config();
+    let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
+    let multipart = request.headers().get("content-type").is_some_and(|v| {
+        String::from_utf8_lossy(trim(v.as_bytes()))
+            .go_lower()
+            .starts_with("multipart/form-data")
+    });
+    let length = request
+        .headers()
+        .get("content-length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
+    let mut request_body = Vec::new();
+    if eager {
+        let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            // Go answers before it logs anything.
+            Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
+            Err(error) => {
+                // Preserve the transport error downstream; never turn it into
+                // a successful empty body when capture cannot read the input.
+                *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                    Err::<Bytes, _>(io::Error::other(error.to_string()))
+                }));
+                return next.run(request).await;
+            }
+        };
+        *request.body_mut() = Body::from(bytes.clone());
+        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
+    }
+    let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
+        Spool::new(&state.dir, "request-body").ok().map(|spool| {
+            Arc::new(Mutex::new(Deferred {
+                spool,
+                length,
+                read: 0,
+                captured: 0,
+                eof: false,
+                truncated: false,
+                failed: false,
+            }))
+        })
+    } else {
+        None
+    };
+    if let Some(deferred) = &deferred {
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        *request.body_mut() = Body::new(RequestBody {
+            body,
+            deferred: deferred.clone(),
+        });
+    }
+    let query = mask_query(request.uri().query().unwrap_or_default());
+    let url = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    };
+    let id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_default();
+    let sink = RequestLog(
+        Arc::new(Mutex::new(Some(Record {
+            state,
+            enabled,
+            url,
+            method: request.method().to_string(),
+            id,
+            timestamp: Local::now(),
+            headers: request.headers().clone(),
+            request_body,
+            deferred,
+            status: 200,
+            response_headers: HeaderMap::new(),
+            response: Vec::new(),
+            response_truncated: false,
+            response_spool: None,
+            streaming: false,
+            streaming_failed: false,
+            detached: false,
+            metadata_ready: false,
+            websocket_done: false,
+            timeline: None,
+            api_timeline: Section::new("api-websocket-timeline"),
+            api_request: Section::new("api-request"),
+            deferred_api_request: Vec::new(),
+            api_response: Section::new("api-response"),
+            api_timestamp: None,
+            api_errors: Vec::new(),
+            upstream: UpstreamCapture::default(),
+            redact_sdp: false,
+        }))),
+        Arc::new(Finished::default()),
+    );
+    request.extensions_mut().insert(sink.clone());
+    let mut guard = Completion(Some(sink.clone()));
+    let head = request.method() == "HEAD";
+    let response = CURRENT.scope(sink.clone(), next.run(request)).await;
+    guard.0 = None;
+    capture_response(sink, head, response).await
+}
+
 async fn capture_response(sink: RequestLog, head: bool, mut response: Response) -> Response {
     if response.extensions().get::<Captured>().is_some() {
         return response;
