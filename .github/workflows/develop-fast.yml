@@ -37,3 +37,5 @@ jobs:
         run: cargo test --locked -p cpa-server --lib concurrent_double_bind_keeps_single_node_and_one_cursor_advance -- --nocapture
       - name: Scheduler concurrent reset regression
         run: cargo test --locked -p cpa-server --lib concurrent_resets_keep_or_shorten_the_window -- --nocapture
+      - name: Request log streaming and early-rejection regression
+        run: cargo test --locked -p cpa-server --lib enabled_logging_does_not_wait_for_unconsumed_request_bodies -- --nocapture
