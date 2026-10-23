@@ -135,18 +135,19 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     // With request logging enabled Go consumes the body before auth and routing.
     // For bounded chunked uploads, probe at most the configured limit plus one
     // byte so an oversized upload is refused consistently on every route.
-    if enabled && length.is_none() {
-        if let Some(max) = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0) {
-            let body = std::mem::replace(request.body_mut(), Body::empty());
-            match axum::body::to_bytes(body, max.saturating_add(1) as usize).await {
-                Ok(bytes) => *request.body_mut() = Body::from(bytes),
-                Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
-                Err(error) => {
-                    *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
-                        Err::<Bytes, _>(io::Error::other(error.to_string()))
-                    }));
-                    return next.run(request).await;
-                }
+    if enabled
+        && length.is_none()
+        && let Some(max) = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0)
+    {
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        match axum::body::to_bytes(body, max.saturating_add(1) as usize).await {
+            Ok(bytes) => *request.body_mut() = Body::from(bytes),
+            Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
+            Err(error) => {
+                *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                    Err::<Bytes, _>(io::Error::other(error.to_string()))
+                }));
+                return next.run(request).await;
             }
         }
     }
@@ -1033,8 +1034,8 @@ const SECTION_HEAD: usize = 32;
 /// session does not grow in memory. Here a section stays in memory until it
 /// passes SECTION_MEMORY bytes, then the buffered bytes and everything after
 /// them go to a spool file in the log directory. If the spool cannot be
-/// written, the section keeps the rest in memory, as Go's writeAttemptResponse
-/// falls back to a strings.Builder.
+/// written, keep only the diagnostic prefix and mark it truncated instead of
+/// allowing an unavailable log disk to turn a long stream into an OOM.
 struct Section {
     prefix: &'static str,
     memory: Vec<u8>,
@@ -1043,6 +1044,7 @@ struct Section {
     /// failed write can leave more after them, which are never read.
     spilled: u64,
     spill_failed: bool,
+    truncated: bool,
     /// The first SECTION_HEAD bytes of the section.
     head: Vec<u8>,
     /// Newlines at the end of the section.
@@ -1059,6 +1061,7 @@ impl Section {
             spool: None,
             spilled: 0,
             spill_failed: false,
+            truncated: false,
             head: Vec::new(),
             trailing: 0,
             blank: true,
@@ -1098,13 +1101,22 @@ impl Section {
             return;
         }
         self.track(bytes);
-        if !self.spill_failed && self.memory.len() + bytes.len() > SECTION_MEMORY {
+        if !self.spill_failed && self.memory.len().saturating_add(bytes.len()) > SECTION_MEMORY {
             if self.spill(dir, bytes).is_ok() {
                 return;
             }
             self.spill_failed = true;
         }
-        self.memory.extend_from_slice(bytes);
+        // A disk-full or unwritable log directory must not turn a long upstream
+        // response or WebSocket into an unbounded in-memory log. Preserve the
+        // prefix (and any bytes already spooled) for diagnostics.
+        let kept = if self.spill_failed {
+            bytes.len().min(SECTION_MEMORY.saturating_sub(self.memory.len()))
+        } else {
+            bytes.len()
+        };
+        self.memory.extend_from_slice(&bytes[..kept]);
+        self.truncated |= kept < bytes.len();
     }
 
     /// Moves the buffered bytes and then `bytes` to the spool file. On error,
@@ -1134,7 +1146,11 @@ impl Section {
                 ));
             }
         }
-        out.write_all(&self.memory)
+        out.write_all(&self.memory)?;
+        if self.truncated {
+            out.write_all(b"\n[LOG SECTION TRUNCATED: disk spool unavailable]\n")?;
+        }
+        Ok(())
     }
 }
 
@@ -3125,5 +3141,49 @@ mod tests {
         let mut stream = vec![chunk.clone(); CHUNKS].join(&b"\n\n"[..]);
         stream.extend_from_slice(b"\n\n\n=== RESPONSE ===\nStatus: 200\n");
         expect(start, &stream);
+    }
+
+    #[test]
+    fn upstream_section_spool_failure_does_not_accumulate_unbounded_memory() {
+        let dir = scratch();
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        let mut section = Section::new("api-response");
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..32 {
+            section.append(&blocked, &chunk);
+        }
+        assert!(section.spill_failed);
+        assert!(section.memory.len() <= SECTION_MEMORY, "{}", section.memory.len());
+        let mut output = Vec::new();
+        section.write_to(&mut output).unwrap();
+        assert!(output.starts_with(b"xxxx"));
+        assert!(
+            output
+                .windows(b"SECTION TRUNCATED".len())
+                .any(|w| w == b"SECTION TRUNCATED")
+        );
+
+        // Also cover a spool that was created successfully but whose write
+        // fails after the stream begins (e.g. disk-full / read-only handle).
+        let mut section = Section::new("api-response");
+        let mut spool = Spool::new(&dir, "api-response").unwrap();
+        spool.file = unwritable(&dir);
+        section.spool = Some(spool);
+        for _ in 0..32 {
+            section.append(&dir, &chunk);
+        }
+        assert!(section.spill_failed);
+        assert!(section.truncated);
+        assert!(section.memory.len() <= SECTION_MEMORY);
+        let mut output = Vec::new();
+        section.write_to(&mut output).unwrap();
+        assert!(
+            output
+                .windows(b"SECTION TRUNCATED".len())
+                .any(|w| w == b"SECTION TRUNCATED")
+        );
+        drop(section);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
