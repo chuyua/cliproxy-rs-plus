@@ -1506,6 +1506,20 @@ fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
     if cookie(name) {
         return REDACTED.as_bytes().to_vec();
     }
+    // Go's header masker only recognizes a narrow set of key names. Custom
+    // upstream auth headers can carry full passwords or signed credentials;
+    // never persist even a prefix or suffix of those values.
+    if name.ends_with("-auth")
+        || ["password", "passwd", "credential", "signature"]
+            .iter()
+            .any(|word| name.contains(word))
+    {
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            REDACTED.as_bytes().to_vec()
+        };
+    }
     if name.contains("authorization") {
         let trimmed = trim(value);
         if let Some(i) = trimmed.iter().position(|b| *b == b' ') {
@@ -1742,6 +1756,41 @@ mod tests {
         assert!(!output.contains("marker-response"));
         assert!(!output.contains("marker-key"));
         assert!(output.contains("Content-Type: application/json"));
+    }
+
+    #[test]
+    fn custom_auth_headers_never_reach_downstream_or_upstream_logs() {
+        let cases = [
+            ("x-password", "dummy-password-123456"),
+            ("x-passwd", "dummy-passwd-123456"),
+            ("x-auth", "dummy-auth-123456"),
+            ("x-credential", "dummy-credential-123456"),
+            ("x-signature", "dummy-signature-123456"),
+        ];
+        let mut downstream = HeaderMap::new();
+        let mut upstream = Vec::new();
+        for (name, value) in cases {
+            downstream.insert(name, value.parse().unwrap());
+            upstream.push((name.to_owned(), value.to_owned()));
+        }
+        downstream.insert("content-type", "application/json".parse().unwrap());
+        upstream.push(("Content-Type".into(), "application/json".into()));
+        let mut downstream_log = Vec::new();
+        headers(&mut downstream_log, &downstream).unwrap();
+        let mut upstream_log = Vec::new();
+        upstream_headers(&mut upstream_log, &upstream);
+        for logged in [downstream_log, upstream_log] {
+            let logged = String::from_utf8(logged).unwrap();
+            let logged_lower = logged.to_ascii_lowercase();
+            for (name, value) in cases {
+                assert!(!logged.contains(value), "{name} leaked into request log");
+                assert!(
+                    logged_lower.contains(&format!("{name}: <redacted>")),
+                    "{name} was not fully masked"
+                );
+            }
+            assert!(logged.contains("Content-Type: application/json"));
+        }
     }
 
     #[test]

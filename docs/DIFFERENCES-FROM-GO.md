@@ -8,6 +8,10 @@ The compatibility target is frozen at CLIProxyAPI v8.0.35, commit `ae3ee3be303fb
   unrecognized non-OAuth auth types as well as `api_key`. Devin's value is
   already masked by its executor and retains its Go-compatible first/last-four
   display. This avoids logging raw keys if another provider adds an auth type.
+- Request-log security: downstream and upstream diagnostic headers named
+  `x-auth` (or ending in `-auth`) or containing `password`, `passwd`,
+  `credential`, or `signature` have their nonempty values fully redacted.
+  Go's narrower header-name matcher can persist these custom credentials.
 - Private gcl2api-plus migration branch: Antigravity 403 messages explicitly
   indicating model denial use a model-only 300-second cooldown; account
   verification challenges (`VALIDATION_REQUIRED`, `validation_url`, or
