@@ -1,4 +1,4 @@
-# Formatting, lints, the full test suite and the harness build on every pull request and
+# Formatting, lints, the full test suite and the harness build on promotion pull requests and
 # push to master, plus clippy and the file writer tests on Windows and the Linux size and
 # idle gates. release.yml calls this workflow too, so a tagged release runs the same checks
 # before it builds anything.
@@ -12,6 +12,7 @@ on:
   push:
     branches: [master]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   workflow_call:
 
@@ -31,6 +32,7 @@ env:
 
 jobs:
   linux:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: tests (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -125,6 +127,7 @@ jobs:
   # the harness, and the Codex Live media relay tests, which build cpa-server with its
   # optional media-relay feature. In parallel with the tests above.
   lint:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: fmt, clippy, harness and media relay tests (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -176,6 +179,7 @@ jobs:
             sh "$(id -u)" "$(id -g)"
 
   perf:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: ${{ matrix.gates }} (Linux)
     # The release builds use Ubuntu 22.04 too, so the sizes compare with theirs, and its
     # unprivileged user namespaces give bench/idle.sh a loopback-only network. The two
@@ -237,6 +241,7 @@ jobs:
   # that only builds on Windows, test-only code included, is held to the Linux rules.
   # Checking only, no codegen or link, so it stays a few minutes on a warm cache.
   windows:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: clippy (Windows)
     runs-on: windows-2025
     timeout-minutes: 60

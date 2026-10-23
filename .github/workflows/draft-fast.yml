@@ -1,0 +1,44 @@
+name: Draft fast checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, converted_to_draft]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lightweight:
+    if: github.event.pull_request.draft
+    name: draft format and provenance basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate workflow definitions and whitespace
+        run: |
+          python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in sorted(Path('.github/workflows').glob('*.yml')):
+              parsed = yaml.safe_load(path.read_text(encoding='utf-8'))
+              assert isinstance(parsed, dict) and isinstance(parsed.get('jobs'), dict), path
+              for job in parsed['jobs'].values():
+                  assert isinstance(job, dict) and ('runs-on' in job or 'uses' in job), path
+          PY
+          git diff --check
+      - name: Upstream provenance negative controls
+        run: python3 -m unittest discover -s scripts -p 'test_verify_upstream.py' -v
+      - name: Rust formatting
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+          cargo +1.99.0 fmt --all --check
