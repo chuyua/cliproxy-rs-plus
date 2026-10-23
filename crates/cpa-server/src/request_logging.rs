@@ -25,7 +25,6 @@ use crate::management::Management;
 use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
-#[cfg(test)]
 const RESPONSE_CAPTURE_LIMIT: usize = 8 << 20;
 const DEFERRED_BODY: u64 = 32 << 20;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
