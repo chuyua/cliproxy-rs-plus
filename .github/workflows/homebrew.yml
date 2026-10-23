@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths: [packaging/homebrew/**, .github/workflows/homebrew.yml, .github/workflows/release.yml]
   pull_request:
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths: [packaging/homebrew/**, .github/workflows/homebrew.yml, .github/workflows/release.yml]
   workflow_dispatch:
