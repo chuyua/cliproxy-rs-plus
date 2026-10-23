@@ -61,7 +61,6 @@ main() {
     Linux-x86_64 | Linux-amd64) target=x86_64-unknown-linux-gnu ;;
     Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
     Darwin-arm64) target=aarch64-apple-darwin ;;
-    Darwin-x86_64) target=x86_64-apple-darwin ;;
     *) fail "there is no release binary for $os $(uname -m); build from source (docs/INSTALL.md)" ;;
   esac
 

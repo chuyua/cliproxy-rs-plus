@@ -46,7 +46,6 @@ def main():
         ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
         ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
         ("Darwin", "arm64"): "aarch64-apple-darwin",
-        ("Darwin", "x86_64"): "x86_64-apple-darwin",
         ("Windows", "AMD64"): "x86_64-pc-windows-msvc",
     }[(platform.system(), platform.machine())]
     exe = "cliproxy.exe" if windows else "cliproxy"
