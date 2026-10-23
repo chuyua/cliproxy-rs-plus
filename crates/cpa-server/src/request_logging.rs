@@ -3052,12 +3052,12 @@ mod tests {
         let content = persisted(true, StatusCode::OK, |log| {
             let sink = log.capture_sink();
             sink.record(Request(upstream_request(
-                "https://alice:pw-h1dden@proxy.example/v1/models?alt=sse&key=AIza-h1dden-query-123&access_token=tok-x-h1dden-x-456#frag",
+                "https://alice:pw-h1dden@proxy.example/v1/models?alt=sse&key=AIza-h1dden-query-123&access_token=tok-x-h1dden-x-456&password=pw3-h1dden-456#frag",
                 &[],
                 b"",
             )));
             sink.record(WebsocketRequest(upstream_request(
-                "wss://bob:pw2-h1dden@ws.example/realtime?client_secret=cs-xx-h1dden-xx-789&model=gpt",
+                "wss://bob:pw2-h1dden@ws.example/realtime?client_secret=cs-xx-h1dden-xx-789&auth=Bearer-h1dden-456&model=gpt",
                 &[],
                 b"",
             )));

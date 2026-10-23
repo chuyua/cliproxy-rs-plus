@@ -344,7 +344,9 @@ pub(crate) fn hide_key(value: &[u8]) -> Vec<u8> {
 /// The query an access line shows. Go v8.0.35 `d50a1995`: a v8 OAuth query carries
 /// the callback state, code and issued client ID, so none of it is logged.
 fn logged_query(path: &str, raw: &str) -> String {
-    if path.starts_with("/v8/management/oauth/") {
+    // The legacy callback carries the same one-time OAuth code and state as
+    // the v8 callback. Neither belongs in an access log.
+    if path.starts_with("/v8/management/oauth/") || path == "/v0/management/oauth-callback" {
         return String::new();
     }
     mask_query(raw)
@@ -357,6 +359,18 @@ pub(crate) fn mask_query(raw: &str) -> String {
             let decoded = crate::access::unescape(key).unwrap_or_else(|| key.as_bytes().to_owned());
             let lower = cpa_common::gostr::lower_bytes(cpa_core::config::go_trim_space(&decoded));
             let lower = lower.strip_suffix("[]").unwrap_or(&lower);
+            // Go's query masker leaves `password` and `auth` untouched. Those
+            // can be real credentials in downstream or configured upstream URLs.
+            // Unlike API keys, do not expose even their first/last bytes.
+            if lower == "auth"
+                || lower == "pwd"
+                || lower == "sig"
+                || ["password", "passwd", "authorization", "credential", "signature"]
+                    .iter()
+                    .any(|word| lower.contains(word))
+            {
+                return format!("{key}={}", if value.is_empty() { "" } else { "<redacted>" });
+            }
             // v8.0.35 adds `value`: deleting a client key passes it as `?value=`.
             if !(lower == "key"
                 || lower == "value"
@@ -615,7 +629,11 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/observe_go.json")).unwrap();
         for case in fixture["query"].as_array().unwrap() {
             // Deliberate difference: Go leaves the two-byte key `ab` in the clear.
-            let want = case["out"].as_str().unwrap().replacen("key=ab&", "key=...&", 1);
+            let want = case["out"]
+                .as_str()
+                .unwrap()
+                .replacen("key=ab&", "key=...&", 1)
+                .replace("password=keep&auth=keep", "password=<redacted>&auth=<redacted>");
             assert_eq!(mask_query(case["in"].as_str().unwrap()), want);
         }
         // Go v8.0.35 `TestMaskSensitiveQueryMasksValue`.
@@ -633,7 +651,7 @@ mod tests {
         ] {
             assert_eq!(logged_query(path, oauth), "");
         }
-        assert_eq!(logged_query("/v0/management/oauth-callback", "state=s"), "state=s");
+        assert_eq!(logged_query("/v0/management/oauth-callback", oauth), "");
         assert_eq!(logged_query("/v8/management/oauthx", "state=s"), "state=s");
         for case in fixture["lines"].as_array().unwrap() {
             assert_eq!(
@@ -670,5 +688,15 @@ mod tests {
         for path in ["/v10", "/openai/v10", "/backend-api/codex-status", "/healthz"] {
             assert!(!is_ai_path(path));
         }
+    }
+
+    #[test]
+    fn access_query_never_exposes_passwords_or_auth_credentials() {
+        let query = "password=super-sensitive-password&auth=BearerVerySensitiveToken&pwd=hunter2&model=gpt";
+        let logged = logged_query("/v1/models", query);
+        for secret in ["super-sensitive-password", "BearerVerySensitiveToken", "hunter2"] {
+            assert!(!logged.contains(secret), "sensitive query value leaked: {logged}");
+        }
+        assert!(logged.contains("model=gpt"));
     }
 }
