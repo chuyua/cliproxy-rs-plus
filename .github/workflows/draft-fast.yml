@@ -42,3 +42,19 @@ jobs:
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component rustfmt
           cargo +1.99.0 fmt --all --check
+  proxy-stress:
+    if: github.event.pull_request.draft
+    name: draft Antigravity proxy concurrency stress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native Rust build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Parallel binding and stale-failure stress tests
+        run: cargo +1.99.0 test --locked -p cpa-server --lib antigravity_proxy_sqlite::tests::stress_ -- --test-threads=2
