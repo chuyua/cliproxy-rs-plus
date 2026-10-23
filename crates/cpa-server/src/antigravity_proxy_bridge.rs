@@ -42,8 +42,12 @@ pub fn bind_and_resolve_group_proxy_lease(
         .or_else(|| configured_group.as_str().and_then(|s| s.parse::<i64>().ok()))
         .context("invalid group ID")?;
     ensure!(group_id > 0, "group ID must be positive");
-    // The SQLite adapter checks account existence before binding; the
-    // resolved lease checks the configured group against the selected node.
+    // Reject mismatched groups before any selection transaction mutates
+    // the cursor or creates a binding for an invalid credential.
+    ensure!(
+        db.account_group_id(&credential.id)? == group_id,
+        "credential and SQLite groups differ"
+    );
     db.select_and_bind(&credential.id, now, random_slot)?
         .context("no eligible group proxy; direct fallback forbidden")?;
     resolve_group_proxy_lease(db, credential, now)
@@ -194,6 +198,16 @@ mod tests {
         assert_eq!(first.node_id, again.node_id);
         assert_eq!(first.binding_generation, again.binding_generation);
         assert_eq!(first.node_id, 11);
+        finish(db, dir);
+    }
+
+    #[test]
+    fn mismatched_group_does_not_create_binding() {
+        let (db, mut credential, dir) = sandbox();
+        credential.metadata.insert("proxy_group_id".into(), json!(999));
+        assert!(bind_and_resolve_group_proxy_lease(&db, &credential, 100, 0).is_err());
+        assert_eq!(db.binding(&credential.id).unwrap().binding_generation, 0);
+        assert!(db.active_bound_proxy(&credential.id, 100).unwrap().is_none());
         finish(db, dir);
     }
 
