@@ -128,10 +128,13 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    // Eager capture can delay even a handler that rejects without reading its
-    // body. Unknown-length, large and multipart uploads must be streamed to
-    // the existing bounded deferred spool instead of buffered to EOF here.
-    let eager = !multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY);
+    // Without a server body limit, eager capture can stall handlers that reject
+    // unknown-length, large, or multipart uploads without reading the body.
+    // With a small configured limit, preserve Go's eager request-log behavior:
+    // exceeding the cap must yield its 413 even if auth or routing rejects first.
+    let bounded_limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
+    let eager = bounded_limit.is_some_and(|max| max <= SMALL_BODY && length != Some(0))
+        || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
     let mut request_body = Vec::new();
     if eager {
         let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
