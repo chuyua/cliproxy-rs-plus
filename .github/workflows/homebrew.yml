@@ -44,7 +44,6 @@ jobs:
           checksums = "\n".join(
               f"{'1' * 64}  cliproxy-1.2.3-{target}.tar.gz"
               for target in (
-                  "aarch64-apple-darwin", "x86_64-apple-darwin",
                   "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
               )
           )
