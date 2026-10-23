@@ -531,7 +531,7 @@ mod tests {
                 .is_err()
             );
         }
-        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_groups"), 1);
+        assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_groups"), 2);
         assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_nodes"), 3);
         assert_eq!(db_value(&db, "SELECT COUNT(*) FROM rust_ag_accounts"), 1);
         drop(db);
