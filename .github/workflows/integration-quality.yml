@@ -22,7 +22,10 @@ jobs:
           persist-credentials: false
       - name: Fetch upstream master from the original project
         run: git fetch --no-tags https://github.com/vayungodara/cliproxy-rs.git +refs/heads/master:refs/remotes/provenance/master
-      - name: Verify exact upstream commit is contained in the integration
+      - name: Verify pinned upstream lineage without requiring a moving tip
+        run: python3 scripts/verify_upstream.py
+      - name: Require latest upstream only for dedicated upstream sync PRs
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/upstream-')
         run: python3 scripts/verify_upstream.py --require-tip
       - name: Negative-control tests must catch forged or stale provenance
         run: python3 -m unittest discover -s scripts -p 'test_verify_upstream.py' -v
