@@ -18,6 +18,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
 use chrono::{DateTime, Local, SecondsFormat};
+use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::Runtime;
@@ -25,7 +26,6 @@ use crate::management::Management;
 use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
-#[cfg(test)]
 const RESPONSE_CAPTURE_LIMIT: usize = 8 << 20;
 const DEFERRED_BODY: u64 = 32 << 20;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -205,6 +205,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             status: 200,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
+            response_truncated: false,
             response_spool: None,
             streaming: false,
             streaming_failed: false,
@@ -253,11 +254,11 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
             record.response_headers = response.headers().clone();
         }
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
+        let mut chunks = body.into_data_stream();
+        while let Some(Ok(bytes)) = chunks.next().await {
             if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                record.response.extend_from_slice(&bytes);
+                record.append_response(&bytes);
             }
-            *response.body_mut() = Body::from(bytes);
         }
     }
     let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -882,7 +883,7 @@ impl HttpBody for ResponseBody {
                 let config = record.state.rt.config();
                 if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
                 {
-                    record.response.extend_from_slice(bytes);
+                    record.append_response(bytes);
                 }
             }
         }
@@ -1132,6 +1133,7 @@ struct Record {
     status: u16,
     response_headers: HeaderMap,
     response: Vec<u8>,
+    response_truncated: bool,
     response_spool: Option<Spool>,
     streaming: bool,
     streaming_failed: bool,
@@ -1152,6 +1154,16 @@ struct Record {
 }
 
 impl Record {
+    fn append_response(&mut self, bytes: &[u8]) {
+        // Diagnostic bytes must not grow with a large downstream response.
+        // ResponseBody still forwards the original frame to the client.
+        let kept = bytes
+            .len()
+            .min(RESPONSE_CAPTURE_LIMIT.saturating_sub(self.response.len()));
+        self.response.extend_from_slice(&bytes[..kept]);
+        self.response_truncated |= kept < bytes.len();
+    }
+
     async fn finish(mut self) {
         if self.streaming_failed {
             return;
@@ -1183,8 +1195,22 @@ impl Record {
             }
         }
         let decompress_error = if !self.streaming {
-            let (body, error) = decode(std::mem::take(&mut self.response), &self.response_headers, false, None).await;
+            let (body, error) = decode(
+                std::mem::take(&mut self.response),
+                &self.response_headers,
+                false,
+                Some(RESPONSE_CAPTURE_LIMIT as u64),
+            )
+            .await;
             self.response = body;
+            if self.response_truncated {
+                if !self.response.ends_with(b"\n") {
+                    self.response.push(b'\n');
+                }
+                self.response.extend_from_slice(
+                    format!("[RESPONSE BODY TRUNCATED: captured first {RESPONSE_CAPTURE_LIMIT} bytes]").as_bytes(),
+                );
+            }
             error
         } else {
             None
@@ -1648,7 +1674,11 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             if !output.ends_with(b"\n") {
                 output.push(b'\n');
             }
-            output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
+            output.extend_from_slice(if request {
+                b"[DECOMPRESSED REQUEST BODY TRUNCATED]".as_slice()
+            } else {
+                b"[DECOMPRESSED RESPONSE BODY TRUNCATED]".as_slice()
+            });
             return (output, None);
         }
         body = output;
@@ -1844,6 +1874,50 @@ mod tests {
         .await
         .unwrap();
         assert!(content.len() < (9 << 20), "log storage must be bounded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_only_large_response_log_is_bounded() {
+        let dir = scratch();
+        let state = management(&dir, false, false);
+        let app = axum::Router::new().fallback(|| async {
+            let chunk = Bytes::from(vec![b'e'; 1 << 20]);
+            let chunks = futures_util::stream::iter((0..9).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+            let mut response = Response::new(Body::from_stream(chunks));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let delivered = axum::body::to_bytes(response.into_body(), 10 << 20).await.unwrap();
+        assert_eq!(delivered.len(), 9 << 20);
+
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        let content = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = logs(&dir).first()
+                    && let Ok(content) = std::fs::read_to_string(path)
+                    && content.contains(marker)
+                {
+                    return content;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(content.len() < (9 << 20));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
