@@ -54,17 +54,29 @@ async fn env(
     auths: &[(&str, &str)],
     prepare: impl FnOnce(&Path),
 ) -> Option<Env> {
-    env_with(name, plugins, extra_yaml, auths, prepare, Default::default()).await
+    env_with(name, plugins, extra_yaml, auths, prepare, executors()).await
 }
 
-/// [`env`] with a Codex executor (for Codex live endpoints on a local mock).
+/// Executors whose built-in upstreams are dead local ports.
+fn executors() -> Executors {
+    Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: Default::default(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    }
+}
+
+/// [`env`] with these executors (for Codex live endpoints or Claude OAuth on a local
+/// mock).
 async fn env_with(
     name: &str,
     plugins: &[(&str, &str)],
     extra_yaml: &str,
     auths: &[(&str, &str)],
     prepare: impl FnOnce(&Path),
-    codex: cpa_exec::codex::CodexExecutor,
+    executors: Executors,
 ) -> Option<Env> {
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let serial = SERIAL.lock().await;
@@ -93,17 +105,7 @@ async fn env_with(
     prepare(&records);
     let cfg = Config::parse(&yaml).unwrap();
     let credentials = cpa_core::config::credentials::load(&cfg);
-    let rt = Arc::new(cpa_server::testing::runtime(
-        cfg,
-        credentials,
-        Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-            codex,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-        },
-    ));
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
     cpa_server::plugins::start(&rt).await;
     let proxy = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -149,7 +151,19 @@ impl Env {
         (response.status().as_u16(), response.text().await.unwrap())
     }
 
+    /// Stops the refresh loop and waits for the refreshes it started. Stopping drops a
+    /// refresh still waiting for its plugin, but one whose plugin answered commits (and
+    /// writes its credential's file) after the loop is gone, holding the credential's
+    /// prepare lock until it has.
+    async fn stop_refreshes(&self) {
+        self.rt.stop_auto_refresh();
+        for credential in self.rt.store().snapshot() {
+            drop(self.rt.store().prepare_lock(&credential.id).lock_owned().await);
+        }
+    }
+
     async fn finish(self) {
+        self.stop_refreshes().await;
         self.rt.plugins().shutdown_all(None).await;
         std::fs::remove_dir_all(self.dir).unwrap();
     }
@@ -641,7 +655,7 @@ async fn a_plugin_scheduler_picks_rejects_or_delegates() {
                 r#"{"type":"codex","access_token":"at-FAKE","account_id":"acct-FAKE"}"#,
             )],
             |_| {},
-            codex,
+            Executors { codex, ..executors() },
         )
         .await
         else {
@@ -2191,6 +2205,757 @@ async fn a_reload_and_a_serial_plugins_save_both_complete() {
     env.finish().await;
 }
 
+/// Plugin `label` saves auth file `name` with `json` (`host.auth.save` through its
+/// management route); returns the host's response envelope.
+async fn host_save(env: &Env, label: &str, name: &str, json: Value) -> Value {
+    let body = json!({"calls":[{"method":"host.auth.save","request":{"name":name,"json":json}}]});
+    let response = env
+        .rt
+        .plugins()
+        .serve_management(cpa_plugin::management::Inbound {
+            method: "POST".into(),
+            path: format!("/v0/management/rec/{label}/calls"),
+            body: serde_json::to_vec(&body).unwrap().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let response: Value = serde_json::from_slice(&response.body).unwrap();
+    let result = response["results"][0].as_str().unwrap().to_owned();
+    serde_json::from_str::<Value>(result.split_once(' ').unwrap().1).unwrap()
+}
+
+/// What a save registers and writes follows Go's `buildAuthsFromFileData` and
+/// `Manager.persist`: the parsed auth's own fields win over the file's in either
+/// spelling, the file's priority overrides the parsed one, a runtime-only or
+/// plugin-virtual auth or one whose storage cannot be built leaves the saved bytes in
+/// the file, and an auth naming another file is refused before the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_save_applies_the_files_settings_and_persists_as_go_does() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-settings",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[],
+        |_| {},
+    )
+    .await
+    else {
+        return;
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    let store = env.rt.store().clone();
+    let auth_dir = env.rt.config().auth_dir.clone();
+    let answer = |auth: Value| {
+        canned(
+            &env.records,
+            "acme",
+            "auth.parse",
+            json!({"Handled":true,"Auths":[auth]}),
+        )
+    };
+    let on_disk = |name: &str| std::fs::read(auth_dir.join(name)).unwrap();
+
+    // The plugin's `base-url` is normalized before the file's `base_url` is inherited.
+    answer(json!({"Provider":"acme","ID":"a","Metadata":{"type":"acme","base-url":"https://plugin.invalid"}}));
+    let saved = host_save(
+        &env,
+        "acme",
+        "a.json",
+        json!({"type":"acme","base_url":"https://file.invalid"}),
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let a = store.get("a").unwrap();
+    assert_eq!(a.metadata["base_url"], "https://plugin.invalid");
+    assert!(a.metadata.get("base-url").is_none());
+
+    // The file's priority, not the plugin's, is the credential's and the file's.
+    answer(json!({"Provider":"acme","ID":"p","Metadata":{"type":"acme","priority":1}}));
+    assert_eq!(
+        host_save(&env, "acme", "p.json", json!({"type":"acme","priority":10})).await["ok"],
+        true
+    );
+    let p = store.get("p").unwrap();
+    assert_eq!(
+        (p.attributes["priority"].as_str(), p.metadata["priority"].as_f64()),
+        ("10", Some(10.0))
+    );
+    // Go's encoder writes the decoded float 10 as `10`.
+    let written = String::from_utf8(on_disk("p.json")).unwrap();
+    assert!(
+        written.contains(r#""priority":10"#) && !written.contains("10.0"),
+        "{written}"
+    );
+
+    // Runtime-only and plugin-virtual auths are registered, and the file keeps the
+    // saved bytes; so does one whose storage JSON is not an object ("[]").
+    for (name, attributes, storage) in [
+        ("r.json", json!({"runtime_only":"true"}), Value::Null),
+        ("v.json", json!({"plugin_virtual":"TRUE"}), Value::Null),
+        ("s.json", json!({}), json!("W10=")),
+    ] {
+        let id = name.trim_end_matches(".json");
+        answer(
+            json!({"Provider":"acme","ID":id,"Attributes":attributes,"StorageJSON":storage,
+            "Metadata":{"type":"acme","access_token":"parsed"}}),
+        );
+        let submitted = json!({"type":"acme","note":"as saved"});
+        let saved = host_save(&env, "acme", name, submitted.clone()).await;
+        assert_eq!(saved["ok"], true, "{name}: {saved}");
+        let written: Value = serde_json::from_slice(&on_disk(name)).unwrap();
+        assert_eq!(written, submitted, "{name}");
+        assert_eq!(store.get(id).unwrap().metadata["access_token"], "parsed", "{name}");
+    }
+
+    // Persisting records the auth's disabled state in its metadata before the storage
+    // fails to serialize (Go `FileTokenStore.Save`), and the file keeps the saved bytes.
+    answer(json!({"Provider":"acme","ID":"d","Disabled":true,"StorageJSON":"W10=",
+        "Metadata":{"type":"acme","disabled":false}}));
+    let submitted = json!({"type":"acme","disabled":false});
+    assert_eq!(host_save(&env, "acme", "d.json", submitted.clone()).await["ok"], true);
+    let d = store.get("d").unwrap();
+    assert!(d.disabled);
+    assert_eq!(d.metadata["disabled"], true);
+    assert_eq!(serde_json::from_slice::<Value>(&on_disk("d.json")).unwrap(), submitted);
+    for id in ["r", "v"] {
+        assert!(store.get(id).unwrap().metadata.get("disabled").is_none(), "{id}");
+    }
+
+    // Only Go's save-time rules apply: the file's excluded models do not replace the
+    // parsed auth's (the watcher applies them when it next parses the file).
+    answer(
+        json!({"Provider":"acme","ID":"x","Attributes":{"excluded_models":"plugin-model"},
+        "Metadata":{"type":"acme","excluded_models":["plugin-model"]}}),
+    );
+    let saved = host_save(
+        &env,
+        "acme",
+        "x.json",
+        json!({"type":"acme","excluded_models":["file-model"]}),
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let x = store.get("x").unwrap();
+    assert_eq!(x.attributes["excluded_models"], "plugin-model");
+    assert_eq!(x.metadata["excluded_models"], json!(["plugin-model"]));
+
+    // JSON null decodes as Go decodes it into a map (no fields): the auth provider that
+    // handles it is registered, and its document (the null storage overlaid with its
+    // metadata) is persisted.
+    answer(json!({"Provider":"acme","ID":"n","Metadata":{"type":"acme"}}));
+    let saved = host_save(&env, "acme", "n.json", Value::Null).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert!(store.get("n").is_some());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&on_disk("n.json")).unwrap(),
+        json!({"type":"acme","disabled":false})
+    );
+
+    // An auth naming another file is refused, and nothing is written.
+    answer(json!({"Provider":"acme","ID":"l","FileName":"logical.json","Metadata":{"type":"acme"}}));
+    let refused = host_save(&env, "acme", "physical.json", json!({"type":"acme"})).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]["message"].as_str().unwrap().contains("logical.json"),
+        "{refused}"
+    );
+    assert!(!auth_dir.join("physical.json").exists());
+    assert!(store.get("l").is_none());
+    drop(management);
+    env.finish().await;
+}
+
+/// `host.auth.save` registers what the plugin auth provider for the file's type parses,
+/// as Go's `buildAuthsFromFileData` does: the file's earlier credentials go, one parsed
+/// auth inherits the file's other fields and, without an ID of its own, keeps the ID of
+/// the file's credential (as a built-in save does), and a failed parse fails the save
+/// before anything is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_save_registers_what_the_auth_provider_parses() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-parse",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[("pair.json", r#"{"type":"acme","v":0}"#)],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[
+                    {"Provider":"acme","ID":"acme-1","Metadata":{"type":"acme"}},
+                    {"Provider":"acme","ID":"acme-2","Metadata":{"type":"acme"}}]}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    let store = env.rt.store().clone();
+    assert!(store.get("acme-1").is_some() && store.get("acme-2").is_some());
+    let save = |name: &'static str, json: Value| host_save(&env, "acme", name, json);
+    let answer = |auth: Value| {
+        canned(
+            &env.records,
+            "acme",
+            "auth.parse",
+            json!({"Handled":true,"Auths":[auth]}),
+        )
+    };
+
+    // One auth without an ID: the file's two virtual credentials go, and the auth takes
+    // the file's ID and its other fields.
+    answer(json!({"Provider":"acme","Metadata":{"type":"acme","access_token":"t1"}}));
+    let saved = save("pair.json", json!({"type":"acme","note":"kept","v":1})).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let asked = calls(&env.records, "acme", "auth.parse");
+    let asked = asked.last().unwrap();
+    assert_eq!(asked["Provider"], "acme");
+    assert_eq!(asked["FileName"], "pair.json");
+    assert_eq!(
+        asked["Path"],
+        env.rt.config().auth_dir.join("pair.json").display().to_string()
+    );
+    assert!(
+        store.get("acme-1").is_none() && store.get("acme-2").is_none(),
+        "stale credentials stayed"
+    );
+    let one = store.get("pair.json").expect("the parsed auth was not registered");
+    assert_eq!(one.metadata["access_token"], "t1");
+    assert_eq!(one.metadata["note"], "kept");
+    file_matches_store(&env, "pair.json");
+
+    // An auth with its own ID replaces the file's credential.
+    answer(json!({"Provider":"acme","ID":"acct-7","Metadata":{"type":"acme","access_token":"t2"}}));
+    assert_eq!(save("pair.json", json!({"type":"acme","v":2})).await["ok"], true);
+    assert!(store.get("pair.json").is_none());
+    assert_eq!(store.get("acct-7").unwrap().metadata["access_token"], "t2");
+
+    // Without an ID again, the auth keeps the file's credential's ID.
+    answer(json!({"Provider":"acme","Metadata":{"type":"acme","access_token":"t3"}}));
+    assert_eq!(save("pair.json", json!({"type":"acme","v":3})).await["ok"], true);
+    assert!(store.get("pair.json").is_none());
+    assert_eq!(store.get("acct-7").unwrap().metadata["access_token"], "t3");
+
+    // A built-in save of the file keeps that ID too.
+    assert_eq!(
+        save("pair.json", json!({"type":"claude","access_token":"t4"})).await["ok"],
+        true
+    );
+    assert!(store.get("pair.json").is_none());
+    let built_in = store.get("acct-7").unwrap();
+    assert_eq!(
+        (built_in.provider.as_str(), &built_in.metadata["access_token"]),
+        ("claude", &json!("t4"))
+    );
+
+    // A failed parse fails the save, and nothing is written.
+    std::fs::write(
+        env.records.join("respond/acme/auth.parse.json"),
+        json!({"ok":false,"error":{"code":"bad","message":"unreadable material"}}).to_string(),
+    )
+    .unwrap();
+    let failed = save("bad.json", json!({"type":"acme"})).await;
+    assert_eq!(failed["ok"], false, "{failed}");
+    let message = failed["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("invalid auth file") && message.contains("unreadable material"),
+        "{message}"
+    );
+    assert!(!env.rt.config().auth_dir.join("bad.json").exists());
+    assert!(store.get("bad.json").is_none());
+    drop(management);
+    env.finish().await;
+}
+
+/// Go registers a new auth from a save with the `NextRefreshAfter` its plugin parsed: a
+/// saved credential the parse dates to 2099 waits, while one saved without a date is due
+/// by its interval at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_auth_waits_for_its_parsed_refresh_deadline() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-deadline",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"r","refresh_interval":"1h"}}}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let answer = |id: &str, deadline: Option<&str>| {
+        let mut auth = json!({"Provider":"acme","ID":id,
+            "Metadata":{"type":"acme","access_token":"t","refresh_interval":"1h"}});
+        if let Some(at) = deadline {
+            auth["NextRefreshAfter"] = at.into();
+        }
+        canned(
+            &env.records,
+            "acme",
+            "auth.parse",
+            json!({"Handled":true,"Auths":[auth]}),
+        )
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    answer("later", Some("2099-01-01T00:00:00Z"));
+    let saved = host_save(&env, "acme", "later.json", json!({"type":"acme"})).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    answer("now", None);
+    let saved = host_save(&env, "acme", "now.json", json!({"type":"acme"})).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let store = env.rt.store();
+    assert!(store.get("later").is_some() && store.get("now").is_some());
+    let refreshed = |id: &str| {
+        calls(&env.records, "acme", "auth.refresh")
+            .iter()
+            .filter(|r| r["AuthID"] == id)
+            .count()
+    };
+    env.rt.start_auto_refresh();
+    eventually("the undated credential's refresh", || refreshed("now") >= 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    env.rt.stop_auto_refresh();
+    assert_eq!(refreshed("later"), 0, "waiting for the parsed NextRefreshAfter");
+    drop(management);
+    env.finish().await;
+}
+
+/// A save registers its refresh deadlines with its credentials (Go
+/// `preserveExistingAuthState`, then `upsertAuthRecordsForPath`): a save without an auth
+/// manager or one refused after its parse leaves nothing for a later save of that ID; an
+/// auth replacing the file's credential under a new ID takes that one's deadlines, unset
+/// ones too, over its parsed one, and the one it replaced loses them; and a save
+/// replacing an auth keeps its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_auth_takes_its_refresh_deadline_only_when_registered() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-deadline-registered",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"r","refresh_interval":"1h"}}}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let auth = |id: &str, deadline: Option<&str>| {
+        let mut auth = json!({"Provider":"acme","ID":id,
+            "Metadata":{"type":"acme","access_token":"t","refresh_interval":"1h"}});
+        if let Some(at) = deadline {
+            auth["NextRefreshAfter"] = at.into();
+        }
+        auth
+    };
+    let answer = |auths: Vec<Value>| {
+        canned(
+            &env.records,
+            "acme",
+            "auth.parse",
+            json!({"Handled":true,"Auths":auths}),
+        )
+    };
+    let save = |name: &'static str| host_save(&env, "acme", name, json!({"type":"acme"}));
+    let later = Some("2099-01-01T00:00:00Z");
+
+    // No auth manager: the file is written and nothing is registered.
+    answer(vec![auth("orphan", later)]);
+    assert_eq!(save("orphan.json").await["ok"], true);
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    answer(vec![auth("orphan", None)]);
+    assert_eq!(save("orphan.json").await["ok"], true);
+
+    // The second auth names another file, which refuses the save after the first parsed.
+    answer(vec![
+        auth("refused", later),
+        json!({"Provider":"acme","ID":"refused-2","FileName":"elsewhere.json","Metadata":{"type":"acme"}}),
+    ]);
+    assert_eq!(save("refused.json").await["ok"], false);
+    answer(vec![auth("refused", None)]);
+    assert_eq!(save("refused.json").await["ok"], true);
+
+    // A new ID at the same path takes the file's credential's deadlines.
+    answer(vec![auth("old", later)]);
+    assert_eq!(save("moved.json").await["ok"], true);
+    answer(vec![auth("new", None)]);
+    assert_eq!(save("moved.json").await["ok"], true);
+    answer(vec![auth("plain", None)]);
+    assert_eq!(save("swapped.json").await["ok"], true);
+    answer(vec![auth("swapped", later)]);
+    assert_eq!(save("swapped.json").await["ok"], true);
+
+    // The same ID again keeps its own.
+    answer(vec![auth("again", later)]);
+    assert_eq!(save("again.json").await["ok"], true);
+    answer(vec![auth("again", None)]);
+    assert_eq!(save("again.json").await["ok"], true);
+
+    // A credential a save removes takes its deadlines along (Go `Manager.Remove`): the
+    // built-in credential of another file registered under its ID starts without them.
+    answer(vec![auth("reused.json", later)]);
+    assert_eq!(save("first.json").await["ok"], true);
+    answer(vec![auth("moved-on", None)]);
+    assert_eq!(save("first.json").await["ok"], true);
+    canned(&env.records, "acme", "auth.parse", json!({"Handled":false}));
+    let built_in = json!({"type":"acme","access_token":"t","refresh_interval":"1h"});
+    assert_eq!(host_save(&env, "acme", "reused.json", built_in).await["ok"], true);
+
+    let store = env.rt.store();
+    for id in [
+        "orphan",
+        "refused",
+        "new",
+        "swapped",
+        "again",
+        "moved-on",
+        "reused.json",
+    ] {
+        assert!(store.get(id).is_some(), "{id} was not registered");
+    }
+    assert!(store.get("old").is_none() && store.get("plain").is_none());
+    let refreshed = |id: &str| {
+        calls(&env.records, "acme", "auth.refresh")
+            .iter()
+            .filter(|r| r["AuthID"] == id)
+            .count()
+    };
+    let (due, waiting) = (
+        ["orphan", "refused", "swapped", "reused.json"],
+        ["new", "again", "moved-on"],
+    );
+    env.rt.start_auto_refresh();
+    // Bounded, so a credential that never comes due is reported with the others.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !due.iter().all(|id| refreshed(id) >= 1) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    env.rt.stop_auto_refresh();
+    let wrong: Vec<_> = due
+        .iter()
+        .filter(|id| refreshed(id) == 0)
+        .chain(waiting.iter().filter(|id| refreshed(id) != 0))
+        .collect();
+    assert!(wrong.is_empty(), "wrong refresh deadlines: {wrong:?}");
+    drop(management);
+    env.finish().await;
+}
+
+/// A reload that parses a saved file again keeps the saved auth's deadline (Go keeps the
+/// registered auth's `NextRefreshAfter` when it registers it again): the parsed one
+/// seeds a credential's schedule only with its first registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_keeps_a_saved_auths_refresh_deadline() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-deadline-reload",
+        &[("acme", "auth_provider,management_api"), ("pp", "auth_provider")],
+        "",
+        &[("p.json", r#"{"type":"pp"}"#)],
+        |records| {
+            for label in ["acme", "pp"] {
+                canned(
+                    records,
+                    label,
+                    "auth.refresh",
+                    json!({"Auth":{"Metadata":{"access_token":"r","refresh_interval":"1h"}}}),
+                );
+            }
+            canned(
+                records,
+                "pp",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[{"Provider":"pp","ID":"p-1",
+                    "Metadata":{"type":"pp","access_token":"p","refresh_interval":"1h"}}]}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let answer = |deadline: Option<&str>| {
+        let mut auth = json!({"Provider":"acme","ID":"kept",
+            "Metadata":{"type":"acme","access_token":"t","refresh_interval":"1h"}});
+        if let Some(at) = deadline {
+            auth["NextRefreshAfter"] = at.into();
+        }
+        canned(
+            &env.records,
+            "acme",
+            "auth.parse",
+            json!({"Handled":true,"Auths":[auth]}),
+        )
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    answer(Some("2099-01-01T00:00:00Z"));
+    let saved = host_save(&env, "acme", "kept.json", json!({"type":"acme"})).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    answer(None);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    let store = env.rt.store();
+    assert!(store.get("kept").is_some() && store.get("p-1").is_some());
+    let refreshed = |label: &str, id: &str| {
+        calls(&env.records, label, "auth.refresh")
+            .iter()
+            .filter(|r| r["AuthID"] == id)
+            .count()
+    };
+    env.rt.start_auto_refresh();
+    eventually("the other plugin's refresh", || refreshed("pp", "p-1") >= 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    env.rt.stop_auto_refresh();
+    assert_eq!(refreshed("acme", "kept"), 0, "the saved NextRefreshAfter was lost");
+    drop(management);
+    env.finish().await;
+}
+
+/// A save the auth provider's parse of the saved file answers by saving that file again,
+/// from inside the parse: Go parses the data before writing it, which recurses through
+/// the plugin without bound. The inner save writes without parsing again, so the save
+/// completes after one parse, the file holds what the outer save wrote, and the
+/// parse's credential is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_whose_parse_saves_the_same_file_completes_after_one_parse() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-reentrant",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[],
+        |records| {
+            let dir = records.join("respond").join("acme");
+            std::fs::create_dir_all(&dir).unwrap();
+            let inner = json!({"type": "acme", "n": 2});
+            std::fs::write(dir.join("auth.parse.json"), parse_saving("acme-a", inner)).unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    let body = json!({"calls":[{"method":"host.auth.save","request":{
+        "name":"acme.json","json":{"type":"acme","n":1}}}]});
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        env.rt.plugins().serve_management(cpa_plugin::management::Inbound {
+            method: "POST".into(),
+            path: "/v0/management/rec/acme/calls".into(),
+            body: serde_json::to_vec(&body).unwrap().into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("the save never completed")
+    .unwrap();
+    let response: Value = serde_json::from_slice(&response.body).unwrap();
+    let result = response["results"][0].as_str().unwrap();
+    let saved: Value = serde_json::from_str(result.split_once(' ').unwrap().1).unwrap();
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["result"]["name"], "acme.json");
+    // The inner save also succeeded, with Go's response.
+    let inner = calls(&env.records, "acme", "host_callback");
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0]["ok"], true, "{}", inner[0]);
+    assert_eq!(inner[0]["result"]["name"], "acme.json");
+    assert_eq!(calls(&env.records, "acme", "auth.parse").len(), 1);
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(env.rt.config().auth_dir.join("acme.json")).unwrap()).unwrap();
+    assert_eq!((&on_disk["type"], &on_disk["n"]), (&json!("acme"), &json!(1)));
+    assert!(env.rt.store().get("acme-a").is_some());
+    drop(management);
+    env.finish().await;
+}
+
+/// On a current-thread runtime the plugin call runs on a scoped thread while the
+/// runtime waits, and a native plugin's synchronous callbacks arrive there: a save of
+/// the file being parsed, made from inside the parse, is still the nested save, written
+/// without a second parse (the watcher publishes the file on its next reload).
+#[tokio::test(flavor = "current_thread")]
+async fn a_nested_save_on_a_current_thread_runtime_skips_the_parse() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-current-thread",
+        &[("acme", "auth_provider")],
+        "",
+        &[("acme.json", r#"{"type":"acme"}"#)],
+        |records| {
+            let dir = records.join("respond").join("acme");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("auth.parse.json"),
+                parse_saving("acme-a", json!({"type":"acme","n":1})),
+            )
+            .unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        cpa_server::plugins::reload_plugin_auth_files(&env.rt),
+    )
+    .await
+    .expect("the reload never completed");
+    let inner = calls(&env.records, "acme", "host_callback");
+    assert_eq!(inner.len(), 1, "{inner:?}");
+    assert_eq!(inner[0]["ok"], true, "{}", inner[0]);
+    assert_eq!(calls(&env.records, "acme", "auth.parse").len(), 1, "no second parse");
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(env.rt.config().auth_dir.join("acme.json")).unwrap()).unwrap();
+    assert_eq!(on_disk["n"], 1);
+    env.finish().await;
+}
+
+/// The save guard is tied to the parsing thread, not just the plugin and file: while
+/// the watcher's reload holds the plugin's parse of P, a save of P that the same plugin
+/// makes for another request (on another thread) is parsed as in Go, so an invalid
+/// weight fails the save and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_from_another_thread_during_a_parse_of_its_file_is_checked_as_in_go() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-concurrent",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[("p.json", r#"{"type":"acme"}"#)],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[{"Provider":"acme","ID":"acme-a","Metadata":{"type":"acme"}}]}),
+            );
+            std::fs::write(records.join("respond/acme/auth.parse.hold"), "").unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let release = Release(env.records.join("respond/acme/auth.parse.hold"));
+    let (management, watcher) = watch(&env);
+    eventually("the reload never reached the parse", || {
+        !calls(&env.records, "acme", "auth.parse").is_empty()
+    })
+    .await;
+    let saved = host_save(&env, "acme", "p.json", json!({"type":"acme","weight":1.5})).await;
+    assert_eq!(saved["ok"], false, "{saved}");
+    assert!(
+        saved["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid auth weight"),
+        "{saved}"
+    );
+    let on_disk = std::fs::read(env.rt.config().auth_dir.join("p.json")).unwrap();
+    assert_eq!(on_disk, br#"{"type":"acme"}"#);
+    drop(release);
+    eventually("the reload stalled", || env.rt.store().get("acme-a").is_some()).await;
+    watcher.abort();
+    drop(management);
+    env.finish().await;
+}
+
+/// A plugin whose parse saves the parsed file from a goroutine it spawns and waits for:
+/// that save reaches the host on another thread. During a save's parse it is refused
+/// and writes nothing, so the recursion Go has stops after one parse; during a reload's
+/// parse it gets the save's own parse, as in Go, whose nested save is then refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spawned_save_during_a_saves_parse_is_refused_and_the_recursion_stops() {
+    let Some(env) = env(
+        "plugin-owned-auth-save-spawned",
+        &[("acme", "auth_provider,management_api")],
+        "",
+        &[],
+        |records| {
+            let dir = records.join("respond").join("acme");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut envelope: Value =
+                serde_json::from_str(&parse_saving("acme-a", json!({"type":"acme","n":2}))).unwrap();
+            envelope["spawn"] = true.into();
+            std::fs::write(dir.join("auth.parse.json"), envelope.to_string()).unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let path = env.dir.join("config.yaml");
+    std::fs::write(&path, &env.yaml).unwrap();
+    let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    let file = env.rt.config().auth_dir.join("acme.json");
+    let n = || serde_json::from_slice::<Value>(&std::fs::read(&file).unwrap()).unwrap()["n"].clone();
+    let refused = |response: &Value| {
+        response["ok"] == false
+            && response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("being parsed"))
+    };
+
+    // A save: its parse's spawned save is refused.
+    let saved = tokio::time::timeout(
+        Duration::from_secs(10),
+        host_save(&env, "acme", "acme.json", json!({"type":"acme","n":1})),
+    )
+    .await
+    .expect("the save never completed");
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(calls(&env.records, "acme", "auth.parse").len(), 1);
+    let inner = calls(&env.records, "acme", "host_callback");
+    assert_eq!(inner.len(), 1);
+    assert!(refused(&inner[0]), "{}", inner[0]);
+    assert_eq!(n(), json!(1));
+    assert!(env.rt.store().get("acme-a").is_some());
+
+    // A reload's parse: the spawned save is parsed, and that parse's spawned save is
+    // refused.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        cpa_server::plugins::reload_plugin_auth_files(&env.rt),
+    )
+    .await
+    .expect("the reload never completed");
+    assert_eq!(calls(&env.records, "acme", "auth.parse").len(), 3);
+    let inner = calls(&env.records, "acme", "host_callback");
+    assert_eq!(inner.len(), 3);
+    assert_eq!(inner.iter().filter(|r| refused(r)).count(), 2, "{inner:?}");
+    assert!(inner.iter().any(|r| r["ok"] == true), "{inner:?}");
+    assert_eq!(n(), json!(2));
+    drop(management);
+    env.finish().await;
+}
+
 /// A file that changes after plugins parsed it, before the reload's scan reads it, is
 /// not parsed again by the scan (which may run under the disk lock): it keeps its
 /// credentials until the next reload parses the new bytes. A file that appears then is
@@ -2608,5 +3373,796 @@ async fn a_refresh_committed_during_the_startup_reload_survives_it() {
         store.get("a-claude.json").unwrap().metadata["access_token"],
         "refreshed"
     );
+    env.finish().await;
+}
+
+/// The auth file `name` as JSON.
+fn auth_file(env: &Env, name: &str) -> Value {
+    serde_json::from_slice(&std::fs::read(env.rt.config().auth_dir.join(name)).unwrap()).unwrap()
+}
+
+/// Go `executorAdapter.Refresh` through `tryRefreshAfterUnauthorized`: a 401 from a
+/// plugin executor refreshes its credential through the plugin's auth provider, which
+/// sees the stored document, and the retry carries the refreshed token. The refreshed
+/// metadata overlays the stored document, which keeps the keys the plugin left out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_401_from_a_plugin_executor_refreshes_through_its_auth_provider() {
+    let Some(env) = env(
+        "plugin-owned-refresh-401",
+        &[("catalog", "model_provider"), ("acme", "auth_provider,executor")],
+        "",
+        &[(
+            "acme.json",
+            r#"{"type":"acme","access_token":"old","refresh_token":"r1","keep":"x"}"#,
+        )],
+        |records| {
+            canned(
+                records,
+                "catalog",
+                "model.static",
+                json!({"Provider":"acme","Models":[{"ID":"acme-1"}]}),
+            );
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"new","refresh_token":"r2"}}}),
+            );
+            std::fs::write(
+                records.join("respond/acme/executor.execute.once.json"),
+                json!({"ok":false,"error":{"code":"unauthorized","message":"token expired","http_status":401}})
+                    .to_string(),
+            )
+            .unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let (status, body) = env.chat("acme-1").await;
+    assert_eq!(status, 200, "{body}");
+    let refreshes = calls(&env.records, "acme", "auth.refresh");
+    assert_eq!(refreshes.len(), 1, "{refreshes:?}");
+    assert_eq!(refreshes[0]["AuthID"], "acme.json");
+    assert_eq!(refreshes[0]["AuthProvider"], "acme");
+    assert_eq!(refreshes[0]["Metadata"]["refresh_token"], "r1");
+    let executed = calls(&env.records, "acme", "executor.execute");
+    assert_eq!(executed.len(), 2, "one retry after the refresh");
+    assert_eq!(executed[0]["AuthMetadata"]["access_token"], "old");
+    assert_eq!(executed[1]["AuthMetadata"]["access_token"], "new");
+    assert_eq!(
+        auth_file(&env, "acme.json"),
+        json!({"type":"acme","access_token":"new","refresh_token":"r2","keep":"x","disabled":false})
+    );
+    env.finish().await;
+}
+
+/// Go `pluginRefreshCompatExecutor`: a credential with no plugin executor refreshes
+/// through the auth provider of its provider. When only its `compat_name` matched an
+/// auth provider, no plugin answers for its provider, and with a refresh token the
+/// refresh fails with Go's error instead of keeping the credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compatible_credential_refreshes_through_its_providers_auth_provider() {
+    let Some(env) = env(
+        "plugin-owned-refresh-compat",
+        &[("acme", "auth_provider"), ("pool", "auth_provider")],
+        "",
+        &[
+            (
+                "acme.json",
+                r#"{"type":"acme","access_token":"old","refresh_token":"r1"}"#,
+            ),
+            ("pool.json", r#"{"type":"pool","wrapped":"material"}"#),
+        ],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"new"}}}),
+            );
+            canned(
+                records,
+                "pool",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[{"Provider":"zeta","ID":"zeta-1",
+                    "Attributes":{"compat_name":"pool"},
+                    "Metadata":{"type":"zeta","access_token":"z","refresh_token":"rz"}}]}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    // Storage that does not decode as an object fails the refresh (Go cannot persist it)
+    // and leaves the stored document alone.
+    std::fs::write(
+        env.records.join("respond/acme/auth.refresh.once.json"),
+        json!({"ok":true,"result":{"Auth":{"StorageJSON":"W10=","Metadata":{"type":"acme","access_token":"bad"}}}})
+            .to_string(),
+    )
+    .unwrap();
+    let error = env.rt.refresh_credential("acme.json").await.unwrap_err();
+    assert!(
+        String::from_utf8_lossy(&error.body).contains("persist refreshed auth"),
+        "{error:?}"
+    );
+    assert_eq!(
+        auth_file(&env, "acme.json"),
+        json!({"type":"acme","access_token":"old","refresh_token":"r1"})
+    );
+    let refreshed = env.rt.refresh_credential("acme.json").await.unwrap();
+    assert_eq!(refreshed.metadata["access_token"], "new");
+    assert_eq!(
+        refreshed.metadata["refresh_token"], "r1",
+        "kept from the stored document"
+    );
+    assert_eq!(calls(&env.records, "acme", "auth.refresh").len(), 2);
+    let before = env.rt.store().get("zeta-1").expect("the parsed credential");
+    let error = env.rt.refresh_credential("zeta-1").await.unwrap_err();
+    assert!(
+        String::from_utf8_lossy(&error.body)
+            .contains("plugin auth provider refresh is unavailable for provider openai-compatible-pool"),
+        "{error:?}"
+    );
+    assert!(calls(&env.records, "pool", "auth.refresh").is_empty());
+    assert_eq!(env.rt.store().get("zeta-1").unwrap().revision, before.revision);
+    env.finish().await;
+}
+
+/// Go `shouldRefresh` for a plugin-refreshed credential: only `refresh_interval`
+/// schedules a refresh. A credential never refreshed is due at once; after a refresh the
+/// next one waits the interval from it (Go `LastRefreshedAt`), whatever
+/// `NextRefreshAfter` the plugin answered (Go clears it when it commits the refresh).
+/// A recent `last_refresh` holds the refresh off, and no interval never schedules one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_refresh_interval_schedules_background_refreshes() {
+    let recent = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let held = format!(r#"{{"type":"acme","access_token":"h","refresh_interval":"1h","last_refresh":"{recent}"}}"#);
+    let Some(env) = env(
+        "plugin-owned-refresh-interval",
+        &[("acme", "auth_provider")],
+        "",
+        &[
+            (
+                "due.json",
+                r#"{"type":"acme","access_token":"old","refresh_interval":"2s"}"#,
+            ),
+            ("held.json", &held),
+            (
+                "never.json",
+                r#"{"type":"acme","access_token":"n","refresh_token":"rn"}"#,
+            ),
+        ],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"new"}},
+                    "NextRefreshAfter":"2099-01-01T00:00:00Z"}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    env.rt.start_auto_refresh();
+    let refreshed = || {
+        calls(&env.records, "acme", "auth.refresh")
+            .iter()
+            .map(|r| r["AuthID"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    eventually("the first refresh", || !refreshed().is_empty()).await;
+    let first = std::time::Instant::now();
+    eventually("the second refresh", || refreshed().len() >= 2).await;
+    assert!(
+        first.elapsed() >= Duration::from_millis(1500),
+        "the second refresh waits the interval: {:?}",
+        first.elapsed()
+    );
+    assert_eq!(refreshed(), ["due.json", "due.json"]);
+    assert_eq!(env.rt.store().get("due.json").unwrap().metadata["access_token"], "new");
+    env.stop_refreshes().await;
+    env.finish().await;
+}
+
+/// Go's `NextRefreshAfter` and `LastRefreshedAt` for plugin-refreshed credentials,
+/// each due by its `refresh_interval` at once (as the control `c.json` is): a parsed
+/// auth waits for the `NextRefreshAfter` its plugin parsed, a failed management refresh
+/// holds the next one off for 5 min, and a refresh whose result an unrelated edit made
+/// a no-op still counts as the last refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plugin_refresh_deadlines_follow_gos_lifecycle_fields() {
+    let Some(env) = env(
+        "plugin-owned-refresh-deadlines",
+        &[("acme", "auth_provider"), ("pp", "auth_provider")],
+        "",
+        &[
+            (
+                "c.json",
+                r#"{"type":"acme","access_token":"c","refresh_interval":"1h"}"#,
+            ),
+            (
+                "f.json",
+                r#"{"type":"acme","access_token":"f","refresh_interval":"1h"}"#,
+            ),
+            (
+                "s.json",
+                r#"{"type":"acme","access_token":"s","refresh_interval":"1h","disabled":false}"#,
+            ),
+            ("p.json", r#"{"type":"pp","wrapped":"material"}"#),
+        ],
+        |records| {
+            // An answer without auth fields keeps the credential as it was.
+            canned(records, "acme", "auth.refresh", json!({"Auth":{}}));
+            canned(
+                records,
+                "pp",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[{"Provider":"pp","ID":"p-1",
+                    "Metadata":{"type":"pp","access_token":"p","refresh_interval":"1h"},
+                    "NextRefreshAfter":"2099-01-01T00:00:00Z"}]}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    assert!(env.rt.store().get("p-1").is_some());
+    let refreshed = |id: &str| {
+        calls(&env.records, "acme", "auth.refresh")
+            .iter()
+            .filter(|r| r["AuthID"] == id)
+            .count()
+    };
+    std::fs::write(
+        env.records.join("respond/acme/auth.refresh.once.json"),
+        json!({"ok":false,"error":{"code":"upstream","message":"refresh failed","http_status":502}}).to_string(),
+    )
+    .unwrap();
+    env.rt.refresh_credential("f.json").await.unwrap_err();
+    // An edit of other fields lands while the plugin refreshes `s.json`.
+    let release = Release(env.records.join("respond/acme/auth.refresh.hold"));
+    std::fs::write(&release.0, "").unwrap();
+    let pending = tokio::spawn({
+        let rt = env.rt.clone();
+        async move { rt.refresh_credential("s.json").await }
+    });
+    eventually("the refresh of s.json", || refreshed("s.json") == 1).await;
+    let store = env.rt.store();
+    let mut edit = cpa_core::credential::MetadataPatch::default();
+    edit.set.insert("note".into(), "edited".into());
+    store
+        .apply_patch("s.json", store.get("s.json").unwrap().revision, &edit)
+        .unwrap();
+    drop(release);
+    pending.await.unwrap().unwrap();
+    assert_eq!(store.get("s.json").unwrap().metadata["note"], "edited");
+
+    env.rt.start_auto_refresh();
+    eventually("the control refresh", || refreshed("c.json") >= 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(refreshed("f.json"), 1, "backing off after the failed refresh");
+    assert_eq!(refreshed("s.json"), 1, "the no-op refresh counts as the last one");
+    assert!(
+        calls(&env.records, "pp", "auth.refresh").is_empty(),
+        "waiting for the parsed NextRefreshAfter"
+    );
+    env.rt.stop_auto_refresh();
+    env.finish().await;
+}
+
+/// Go `refreshAuth` after a failed refresh while the access token is still valid: the
+/// next one waits 5 min or until the token expires, whichever comes first. A
+/// background refresh that fails seconds before expiry retries at the expiry, not after
+/// the shared 5 min backoff of built-in refreshes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_background_plugin_refresh_retries_when_the_token_expires() {
+    let Some(env) = env(
+        "plugin-owned-refresh-expiry",
+        &[("acme", "auth_provider")],
+        "",
+        &[(
+            "e.json",
+            r#"{"type":"acme","access_token":"e","refresh_interval":"1h"}"#,
+        )],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"e2","refresh_interval":"1h",
+                    "expired":"2099-01-01T00:00:00Z"}}}),
+            );
+            std::fs::write(
+                records.join("respond/acme/auth.refresh.once.json"),
+                json!({"ok":false,"error":{"code":"upstream","message":"refresh failed","http_status":502}})
+                    .to_string(),
+            )
+            .unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    // The token expires 3 s from now; the first refresh fails at once, before that.
+    let expiry = chrono::Utc::now() + chrono::Duration::seconds(3);
+    let store = env.rt.store();
+    let mut patch = cpa_core::credential::MetadataPatch::default();
+    patch.set.insert("expired".into(), expiry.to_rfc3339().into());
+    store
+        .apply_patch("e.json", store.get("e.json").unwrap().revision, &patch)
+        .unwrap();
+    let refreshes = || calls(&env.records, "acme", "auth.refresh").len();
+    env.rt.start_auto_refresh();
+    eventually("the failing refresh", || refreshes() >= 1).await;
+    assert!(chrono::Utc::now() < expiry, "the first refresh ran before the expiry");
+    eventually("the retry at the expiry", || refreshes() >= 2).await;
+    eventually("the retry's commit", || {
+        env.rt.store().get("e.json").unwrap().metadata["access_token"] == "e2"
+    })
+    .await;
+    env.rt.stop_auto_refresh();
+    env.finish().await;
+}
+
+/// A plugin refresh whose result cannot be saved backs off like a failed refresh,
+/// instead of refreshing again at once on every pass of the refresh loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_refresh_that_cannot_be_saved_backs_off() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(env) = env(
+        "plugin-owned-refresh-unsaved",
+        &[("acme", "auth_provider")],
+        "",
+        &[(
+            "u.json",
+            r#"{"type":"acme","access_token":"u","refresh_interval":"1h"}"#,
+        )],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"acme","access_token":"u2","refresh_interval":"1h"}}}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let auth_dir = env.rt.config().auth_dir.clone();
+    let mode = |m: u32| std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(m)).unwrap();
+    // A read-only auth dir: the atomic write of the refreshed file fails.
+    mode(0o555);
+    if std::fs::write(auth_dir.join("probe"), "").is_ok() {
+        // Running as root: permissions do not stop the write.
+        mode(0o755);
+        return;
+    }
+    let refreshes = || calls(&env.records, "acme", "auth.refresh").len();
+    env.rt.start_auto_refresh();
+    eventually("the refresh", || refreshes() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    env.rt.stop_auto_refresh();
+    mode(0o755);
+    assert_eq!(refreshes(), 1, "backing off after the unsaved refresh");
+    assert_eq!(auth_file(&env, "u.json")["access_token"], "u");
+    env.finish().await;
+}
+
+/// A parsed `NextRefreshAfter` seeds the registration it came with only. A credential
+/// registered afresh is due by its interval at once, as Go registers it: after its
+/// file is deleted and created again as an ordinary credential the parser no longer
+/// handles (whether or not the refresh loop saw the parsed one). A credential disabled
+/// and enabled again is not registered afresh: it keeps the parsed deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_registered_afresh_does_not_inherit_a_parsed_refresh_deadline() {
+    let parsed = |id: &str| {
+        json!({"Handled":true,"Auths":[{"Provider":"pp","ID":id,
+            "Metadata":{"type":"pp","access_token":"p","refresh_interval":"1h"},
+            "NextRefreshAfter":"2099-01-01T00:00:00Z"}]})
+    };
+    let Some(env) = env(
+        "plugin-owned-refresh-seed",
+        &[("pp", "auth_provider")],
+        "",
+        &[],
+        |records| {
+            canned(
+                records,
+                "pp",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"pp","access_token":"p2","refresh_interval":"1h"}}}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let auth_dir = env.rt.config().auth_dir.clone();
+    let refreshes = |id: &str| {
+        calls(&env.records, "pp", "auth.refresh")
+            .iter()
+            .filter(|r| r["AuthID"] == id)
+            .count()
+    };
+    let write = |name: &str, body: &str| std::fs::write(auth_dir.join(name), body).unwrap();
+    // A refresh is done when its tokens are committed, in the store and on disk: one
+    // committing after its section ends would write its file back into the next.
+    let committed = |id: &str| {
+        let on_disk = std::fs::read(auth_dir.join(id))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        env.rt
+            .store()
+            .get(id)
+            .is_some_and(|c| c.metadata["access_token"] == "p2")
+            && on_disk.is_some_and(|d| d["access_token"] == "p2")
+    };
+    // What a missing refresh looks like, for the failure message.
+    let state = || {
+        let store: Vec<String> = env
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .map(|c| format!("{} {:?} {}", c.id, c.source, c.metadata["access_token"]))
+            .collect();
+        let parsed: Vec<Value> = calls(&env.records, "pp", "auth.parse")
+            .iter()
+            .map(|r| r["Path"].clone())
+            .collect();
+        let files: Vec<_> = std::fs::read_dir(&auth_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        format!(
+            "store {store:?}, parsed {parsed:?}, files {files:?}, refreshed {:?}",
+            calls(&env.records, "pp", "auth.refresh")
+                .iter()
+                .map(|r| r["AuthID"].clone())
+                .collect::<Vec<_>>()
+        )
+    };
+    let wrapped = r#"{"type":"pp","wrapped":"material"}"#;
+    let ordinary = r#"{"type":"pp","access_token":"q","refresh_interval":"1h"}"#;
+    // The refresh loop coalesces store changes for 1 s.
+    let settle = || tokio::time::sleep(Duration::from_millis(2000));
+
+    // Seen by the refresh loop, deleted, then created again.
+    canned(&env.records, "pp", "auth.parse", parsed("a.json"));
+    write("a.json", wrapped);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    env.rt.start_auto_refresh();
+    settle().await;
+    assert_eq!(refreshes("a.json"), 0, "waiting for the parsed NextRefreshAfter");
+    std::fs::remove_file(auth_dir.join("a.json")).unwrap();
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    assert!(env.rt.store().get("a.json").is_none());
+    settle().await;
+    canned(&env.records, "pp", "auth.parse", json!({"Handled":false}));
+    write("a.json", ordinary);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    assert_eq!(env.rt.store().get("a.json").unwrap().metadata["access_token"], "q");
+    eventually("a.json's committed refresh", || committed("a.json")).await;
+    env.stop_refreshes().await;
+    std::fs::remove_file(auth_dir.join("a.json")).unwrap();
+
+    // Parsed, deleted and created again before the refresh loop runs.
+    canned(&env.records, "pp", "auth.parse", parsed("b.json"));
+    write("b.json", wrapped);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    std::fs::remove_file(auth_dir.join("b.json")).unwrap();
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    canned(&env.records, "pp", "auth.parse", json!({"Handled":false}));
+    write("b.json", ordinary);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    assert!(env.rt.store().get("a.json").is_none(), "{}", state());
+    env.rt.start_auto_refresh();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !committed("b.json") {
+        assert!(std::time::Instant::now() < deadline, "b.json's refresh: {}", state());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    env.stop_refreshes().await;
+    std::fs::remove_file(auth_dir.join("b.json")).unwrap();
+
+    // Disabled and enabled again.
+    canned(&env.records, "pp", "auth.parse", parsed("c.json"));
+    write("c.json", wrapped);
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    env.rt.start_auto_refresh();
+    settle().await;
+    assert_eq!(refreshes("c.json"), 0, "waiting for the parsed NextRefreshAfter");
+    let store = env.rt.store();
+    for disabled in [true, false] {
+        let mut patch = cpa_core::credential::MetadataPatch::default();
+        patch.set.insert("disabled".into(), disabled.into());
+        store
+            .apply_patch("c.json", store.get("c.json").unwrap().revision, &patch)
+            .unwrap();
+        settle().await;
+    }
+    assert_eq!(refreshes("c.json"), 0, "still waiting for the parsed NextRefreshAfter");
+    env.stop_refreshes().await;
+    env.finish().await;
+}
+
+/// What a plugin refresh response saves (Go `MergeRefreshedAuth`, then the store): its
+/// `disabled` state and the merged proxy URL reach the document, and the proxy URL the
+/// running credential, so the next refresh starts from it. A response that moves the
+/// credential to another provider or ID is refused; attribute changes are not applied,
+/// and the refreshed tokens are saved anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_refresh_saves_its_tokens_disabled_state_and_proxy_url() {
+    let Some(env) = env(
+        "plugin-owned-refresh-fields",
+        &[("acme", "auth_provider")],
+        "",
+        &[
+            ("d.json", r#"{"type":"acme","access_token":"d"}"#),
+            (
+                "x.json",
+                r#"{"type":"acme","access_token":"x","proxy_url":"socks5://old:1"}"#,
+            ),
+            ("o.json", r#"{"type":"acme","access_token":"o"}"#),
+            (
+                "y.json",
+                r#"{"type":"acme","access_token":"y","proxy_url":"socks5://a:1"}"#,
+            ),
+        ],
+        |_| {},
+    )
+    .await
+    else {
+        return;
+    };
+    let respond = |auth: Value| {
+        std::fs::write(
+            env.records.join("respond/acme/auth.refresh.once.json"),
+            json!({"ok":true,"result":{"Auth":auth}}).to_string(),
+        )
+        .unwrap();
+    };
+    std::fs::create_dir_all(env.records.join("respond/acme")).unwrap();
+    let store = env.rt.store();
+
+    respond(json!({"Disabled":true,"Metadata":{"type":"acme","access_token":"d2"}}));
+    env.rt.refresh_credential("d.json").await.unwrap();
+    assert!(store.get("d.json").unwrap().disabled);
+    assert_eq!(
+        auth_file(&env, "d.json"),
+        json!({"type":"acme","access_token":"d2","disabled":true})
+    );
+
+    // Only the field changed, so the field's proxy URL wins.
+    respond(json!({"ProxyURL":"socks5://new:2",
+        "Metadata":{"type":"acme","access_token":"x2","proxy_url":"socks5://old:1"}}));
+    env.rt.refresh_credential("x.json").await.unwrap();
+    assert_eq!(
+        auth_file(&env, "x.json"),
+        json!({"type":"acme","access_token":"x2","proxy_url":"socks5://new:2","disabled":false})
+    );
+    assert_eq!(store.get("x.json").unwrap().attributes["proxy_url"], "socks5://new:2");
+    // The next refresh, with no reload between, echoes the metadata and leaves the
+    // field out: nothing changed, so the proxy URL stays the one the last refresh set.
+    respond(json!({"Metadata":{"type":"acme","access_token":"x3","proxy_url":"socks5://new:2"}}));
+    env.rt.refresh_credential("x.json").await.unwrap();
+    assert_eq!(
+        auth_file(&env, "x.json"),
+        json!({"type":"acme","access_token":"x3","proxy_url":"socks5://new:2","disabled":false})
+    );
+
+    // A management edit of the proxy URL lands while the plugin refreshes and answers
+    // another one: the edit wins in the document and the running credential alike.
+    respond(json!({"ProxyURL":"socks5://b:2",
+        "Metadata":{"type":"acme","access_token":"y2","proxy_url":"socks5://a:1"}}));
+    let release = Release(env.records.join("respond/acme/auth.refresh.hold"));
+    std::fs::write(&release.0, "").unwrap();
+    let pending = tokio::spawn({
+        let rt = env.rt.clone();
+        async move { rt.refresh_credential("y.json").await }
+    });
+    eventually("the refresh of y.json", || {
+        calls(&env.records, "acme", "auth.refresh")
+            .iter()
+            .any(|r| r["AuthID"] == "y.json")
+    })
+    .await;
+    let mut edit = cpa_core::credential::MetadataPatch::default();
+    edit.set.insert("proxy_url".into(), "socks5://c:3".into());
+    store
+        .apply_patch("y.json", store.get("y.json").unwrap().revision, &edit)
+        .unwrap();
+    drop(release);
+    pending.await.unwrap().unwrap();
+    let proxies = || {
+        (
+            auth_file(&env, "y.json")["proxy_url"].clone(),
+            store.get("y.json").unwrap().attributes.get("proxy_url").cloned(),
+        )
+    };
+    assert_eq!(proxies(), (json!("socks5://c:3"), Some("socks5://c:3".into())));
+    // The next refresh, with no reload between, echoes its input.
+    respond(json!({"Metadata":{"type":"acme","access_token":"y3","proxy_url":"socks5://c:3"}}));
+    env.rt.refresh_credential("y.json").await.unwrap();
+    assert_eq!(proxies(), (json!("socks5://c:3"), Some("socks5://c:3".into())));
+    assert_eq!(auth_file(&env, "y.json")["access_token"], "y3");
+
+    for (change, auth) in [
+        (
+            "provider from acme to other",
+            json!({"Provider":"other","Metadata":{"type":"other","access_token":"o2"}}),
+        ),
+        (
+            "ID to elsewhere",
+            json!({"ID":"elsewhere","Metadata":{"type":"acme","access_token":"o2"}}),
+        ),
+    ] {
+        respond(auth);
+        let error = env.rt.refresh_credential("o.json").await.unwrap_err();
+        assert!(
+            String::from_utf8_lossy(&error.body)
+                .contains(&format!("plugin auth refresh changed the credential's {change}")),
+            "{error:?}"
+        );
+        assert_eq!(auth_file(&env, "o.json"), json!({"type":"acme","access_token":"o"}));
+    }
+    assert!(store.get("elsewhere").is_none());
+    respond(json!({"Attributes":{"tier":"gold"},"Metadata":{"type":"acme","access_token":"o2"}}));
+    let o = env.rt.refresh_credential("o.json").await.unwrap();
+    assert_eq!(o.metadata["access_token"], "o2");
+    assert!(!o.attributes.contains_key("tier"));
+    assert_eq!(
+        auth_file(&env, "o.json"),
+        json!({"type":"acme","access_token":"o2","disabled":false})
+    );
+    env.finish().await;
+}
+
+/// Built-in providers keep their own refresh: a plugin auth provider registered for
+/// `claude` never refreshes a Claude credential, even one with a `base_url`. A 401 and a
+/// management refresh each reach Claude's token endpoint once, as without the plugin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claude_credential_keeps_its_builtin_refresh_beside_a_claude_auth_provider() {
+    let tokens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let token_url = {
+        let tokens = tokens.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let n = tokens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    axum::Json(
+                        json!({"access_token":format!("plain-new-{n}"),"refresh_token":format!("r{}", n + 1),
+                        "expires_in":3600,"account":{"uuid":"acct-fake","email_address":"a@example.invalid"}}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/token")
+    };
+    let oauth = cpa_exec::oauth::OAuth::with_endpoints(wreq::Client::new(), &token_url, &token_url, &token_url);
+    let Some(env) = env_with(
+        "plugin-owned-refresh-claude",
+        &[("claude", "auth_provider")],
+        "",
+        &[(
+            "claude.json",
+            r#"{"type":"claude","access_token":"plain-old","refresh_token":"r1","base_url":"http://127.0.0.1:1","expired":"2099-01-01T00:00:00Z"}"#,
+        )],
+        |records| {
+            canned(
+                records,
+                "claude",
+                "auth.refresh",
+                json!({"Auth":{"Metadata":{"type":"claude","access_token":"from-plugin"}}}),
+            );
+        },
+        Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1")
+                .unwrap()
+                .with_oauth(oauth),
+            ..executors()
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    let cfg = env.rt.config();
+    let credential = env.rt.store().get("claude.json").unwrap();
+    let retried = env
+        .rt
+        .refresh_after_unauthorized(&credential, &cfg)
+        .await
+        .expect("refreshed");
+    assert_eq!(retried.metadata["access_token"], "plain-new-1");
+    assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let forced = env.rt.refresh_credential("claude.json").await.unwrap();
+    assert_eq!(forced.metadata["access_token"], "plain-new-2");
+    assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(calls(&env.records, "claude", "auth.refresh").is_empty());
+    env.finish().await;
+}
+
+/// `executor.http_request` (M6-0114): the request goes over the wire in Go's
+/// `rpcExecutorHTTPRequest` encoding (fields in declaration order, bytes as base64, the
+/// callback ID last) and the plugin's `ExecutorHTTPResponse` decodes back. Go's server
+/// never calls it for a plugin executor (only Codex credentials use `HttpRequest`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn executor_http_request_crosses_the_wire_as_go_encodes_it() {
+    let Some(env) = env(
+        "plugin-owned-http-request",
+        &[("acme", "executor")],
+        "",
+        &[],
+        |records| {
+            canned(
+                records,
+                "acme",
+                "executor.http_request",
+                json!({"StatusCode":201,"Headers":{"X-Up":["a","b"]},"Body":"aGk="}),
+            );
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let host = env.rt.plugins();
+    let adapter = host.executor_adapter("acme").await.unwrap();
+    let req = cpa_plugin::api::ExecutorHttpRequest {
+        auth_id: "a1".into(),
+        auth_provider: "acme".into(),
+        method: "POST".into(),
+        url: "https://up.invalid/v1/x?q=1".into(),
+        headers: [("X-Test".to_owned(), vec!["1".to_owned()])].into(),
+        body: bytes::Bytes::from_static(b"hello"),
+        storage_json: bytes::Bytes::from_static(b"{}"),
+        metadata: [("k".to_owned(), json!(1.5))].into(),
+        attributes: [("path".to_owned(), "/p".to_owned())].into(),
+    };
+    let resp = host
+        .executor_http_request(&adapter, &req, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(resp.status_code, 201);
+    assert_eq!(resp.headers["X-Up"], ["a", "b"]);
+    assert_eq!(&resp.body[..], b"hi");
+    let raw = std::fs::read_to_string(env.records.join("acme.jsonl")).unwrap();
+    let line: Value = raw
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|r| r["method"] == "executor.http_request")
+        .unwrap();
+    let sent = line["request"].as_str().unwrap();
+    let want = concat!(
+        r#"{"AuthID":"a1","AuthProvider":"acme","Method":"POST","URL":"https://up.invalid/v1/x?q=1","#,
+        r#""Headers":{"X-Test":["1"]},"Body":"aGVsbG8=","StorageJSON":"e30=","Metadata":{"k":1.5},"#,
+        r#""Attributes":{"path":"/p"},"host_callback_id":""#
+    );
+    let id = sent
+        .strip_prefix(want)
+        .and_then(|rest| rest.strip_suffix(r#""}"#))
+        .unwrap_or_else(|| panic!("{sent}"));
+    assert!(!id.is_empty() && !id.contains('"'), "{sent}");
     env.finish().await;
 }

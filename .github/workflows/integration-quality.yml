@@ -3,6 +3,7 @@ name: Integration quality gates
 on:
   pull_request:
     branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -10,6 +11,7 @@ permissions:
 
 jobs:
   upstream:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: upstream ancestry and negative controls
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -26,6 +28,7 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_verify_upstream.py' -v
 
   dashboard:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: dashboard behavior and checked-in build
     runs-on: ubuntu-24.04
     timeout-minutes: 20

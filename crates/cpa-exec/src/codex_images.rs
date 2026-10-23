@@ -112,6 +112,35 @@ impl CodexExecutor {
         }
         let cache = request::session_uuid(&req, None);
         let body = json_body(body, cache.as_deref());
+        // The payload rules run last (868e137), on the body's JSON view.
+        let original = if req.original_body.is_empty() {
+            &req.body
+        } else {
+            &req.original_body
+        };
+        let requested = if req.requested_model.trim().is_empty() {
+            req.model.trim()
+        } else {
+            req.requested_model.trim()
+        };
+        let client_content_type = request::header(&req.headers, "content-type");
+        let (body, content_type) =
+            crate::payload_media::apply(&body, &content_type, original, client_content_type, |view, original| {
+                let rules = cpa_common::payload::Request {
+                    target_executor: "codex",
+                    model,
+                    requested_model: requested,
+                    protocol: "openai",
+                    from_protocol: SOURCE,
+                    root: "",
+                    original,
+                    request_path: path,
+                    headers: Some(&req.headers),
+                };
+                cpa_common::payload::apply(&settings.payload, &rules, view)
+            })
+            .map_err(plain_err)?;
+        let body = Bytes::from(body);
         // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
         let mut client = req.headers.clone();
         client.remove(http::header::USER_AGENT);
@@ -209,13 +238,33 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let prepared = prepare(&req, path)?;
         let main_model = main_model(&settings.image_base_model);
-        let body = tool_body(&prepared.body, &req, settings, path, main_model, view.siwc)?;
+        let body = tool_body(&prepared.body, main_model, view.siwc)?;
         let cache = request::session_uuid(&req, None);
         let body = match &cache {
             Some(id) => set_str_if_different(body, "prompt_cache_key", id),
             None => body,
         };
         let body = request::sanitize_input_ids(body);
+        // The payload rules run last (868e137), as the codex executor, on the
+        // prepared image request.
+        let requested = if req.requested_model.trim().is_empty() {
+            req.model.trim()
+        } else {
+            req.requested_model.trim()
+        };
+        let rules = cpa_common::payload::Request {
+            target_executor: "codex",
+            model: main_model,
+            requested_model: requested,
+            protocol: "codex",
+            from_protocol: SOURCE,
+            root: "",
+            original: prepared.body.as_bytes(),
+            request_path: path,
+            headers: Some(&req.headers),
+        };
+        let body = cpa_common::payload::apply(&settings.payload, &rules, body.into_bytes());
+        let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         report_request(&req, Format::Codex, &body);
         let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
@@ -578,9 +627,10 @@ fn image_files(form: &Form) -> &[Part] {
 
 /// `codexMultipartFileToDataURL`: the part's Content-Type, else the sniffed type.
 fn data_url(part: &Part) -> String {
-    let media = part
-        .header("Content-Type")
-        .map(str::trim)
+    // ponytail: a Content-Type that is not UTF-8 reaches the data URL lossily (image
+    // clients send ASCII media types); building the URL as bytes would keep it.
+    let header = String::from_utf8_lossy(part.header("Content-Type").unwrap_or_default());
+    let media = Some(header.trim())
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| detect_content_type(&part.body));
     format!(
@@ -803,15 +853,8 @@ fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
     set_raw(&req, "input", &input)
 }
 
-/// `prepareCodexOpenAIImageBody`: thinking, payload rules, then the Codex request rules.
-fn tool_body(
-    body: &str,
-    req: &ExecRequest,
-    settings: &Settings,
-    path: &str,
-    main_model: &str,
-    siwc: bool,
-) -> Result<String, ExecError> {
+/// `prepareCodexOpenAIImageBody`: thinking, then the Codex request rules.
+fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecError> {
     let thought = cpa_common::thinking::apply_thinking_with_source_payload(
         body.as_bytes(),
         body.as_bytes(),
@@ -823,24 +866,7 @@ fn tool_body(
         false,
     )
     .map_err(|e| ExecError::local(e.status(), cpa_core::exec::FailureScope::Request, e.message))?;
-    let requested = if req.requested_model.trim().is_empty() {
-        req.model.trim()
-    } else {
-        req.requested_model.trim()
-    };
-    let rules = cpa_common::payload::Request {
-        target_executor: "",
-        model: main_model,
-        requested_model: requested,
-        protocol: "codex",
-        from_protocol: SOURCE,
-        root: "",
-        original: body.as_bytes(),
-        request_path: path,
-        headers: Some(&req.headers),
-    };
-    let out = cpa_common::payload::apply(&settings.payload, &rules, thought);
-    let mut out = String::from_utf8_lossy(&out).into_owned();
+    let mut out = String::from_utf8_lossy(&thought).into_owned();
     out = set_str_if_different(out, "model", main_model);
     out = set_bool_if_different(out, "stream", true);
     for key in [

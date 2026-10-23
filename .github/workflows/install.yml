@@ -9,6 +9,7 @@ on:
     branches: [master]
     paths: [install.sh, install.ps1, .github/workflows/install.yml, .github/scripts/test-installers.py, .github/scripts/installer-fixture.rs, crates/cliproxy/**, crates/cpa-server/src/logging.rs, crates/cpa-server/build.rs, crates/cpa-server/src/management.rs, ui/dist/**]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths: [install.sh, install.ps1, .github/workflows/install.yml, .github/scripts/test-installers.py, .github/scripts/installer-fixture.rs, crates/cliproxy/**, crates/cpa-server/src/logging.rs, crates/cpa-server/build.rs, crates/cpa-server/src/management.rs, ui/dist/**]
   workflow_dispatch:
     inputs:
@@ -31,6 +32,7 @@ env:
 
 jobs:
   unix:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: install.sh (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -123,6 +125,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then launchctl print "gui/$(id -u)/io.github.vayungodara.cliproxy-rs" || true; fi
 
   candidate:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Local upgrade paths (${{ matrix.os }})
     strategy:
       fail-fast: false
