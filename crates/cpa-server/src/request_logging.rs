@@ -763,7 +763,10 @@ fn upstream_auth(out: &mut Vec<u8>, info: &cpa_core::exec::UpstreamRequest<'_>) 
     if !kind.is_empty() {
         let mut text = format!("type={kind}");
         if kind != "oauth" && !value.is_empty() {
-            let value = if kind == "api_key" {
+            // Devin's executor has already reduced its key to first/last four
+            // bytes. Every other non-OAuth kind may contain a raw credential,
+            // including kinds supplied by future providers or plugins.
+            let value = if kind != "devin" {
                 String::from_utf8_lossy(&hide_key(value.as_bytes())).into_owned()
             } else {
                 value.into()
@@ -1739,6 +1742,44 @@ mod tests {
         assert!(!output.contains("marker-response"));
         assert!(!output.contains("marker-key"));
         assert!(output.contains("Content-Type: application/json"));
+    }
+
+    #[test]
+    fn nonstandard_upstream_auth_types_never_log_raw_credentials() {
+        use cpa_core::exec::UpstreamRequest;
+
+        for kind in ["bearer", "github-token", "apikey"] {
+            let mut output = Vec::new();
+            upstream_auth(
+                &mut output,
+                &UpstreamRequest {
+                    auth_type: kind,
+                    auth_value: "mock-secret-1234567890",
+                    ..Default::default()
+                },
+            );
+            let logged = String::from_utf8(output).unwrap();
+            assert!(logged.contains(&format!("type={kind}")), "{logged}");
+            assert!(
+                !logged.contains("mock-secret-1234567890"),
+                "{kind} leaked its credential"
+            );
+        }
+        // Devin supplies an already-redacted value and must keep Go's log shape.
+        let mut output = Vec::new();
+        upstream_auth(
+            &mut output,
+            &UpstreamRequest {
+                auth_type: "devin",
+                auth_value: "mock...7890",
+                ..Default::default()
+            },
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("type=devin value=mock...7890")
+        );
     }
 
     /// `capture_go.json`, recorded with the Go generator's `buildinfo.Version` pinned to
