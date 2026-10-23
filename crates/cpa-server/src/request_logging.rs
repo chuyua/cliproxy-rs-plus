@@ -197,7 +197,6 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             status: 200,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
-            response_truncated: false,
             response_spool: None,
             streaming: false,
             streaming_failed: false,
