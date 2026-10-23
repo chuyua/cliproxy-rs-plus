@@ -129,7 +129,9 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
+    // Do not wait for large, chunked or multipart uploads before routing. In
+    // particular, logging must not hold a handler's early 401/413 response.
+    let eager = !multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY);
     let mut request_body = Vec::new();
     if eager {
         let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
@@ -148,9 +150,14 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             }
         };
         *request.body_mut() = Body::from(bytes.clone());
-        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
+        // A small compressed upload may inflate far beyond its wire length.
+        // Bound the diagnostic copy without altering the forwarded body.
+        let capture_limit = limit.unwrap_or(DEFERRED_BODY).min(DEFERRED_BODY);
+        request_body = decode(bytes.to_vec(), request.headers(), true, Some(capture_limit))
+            .await
+            .0;
     }
-    let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
+    let deferred = if !eager && (enabled || !multipart) && length != Some(0) && !request.body().is_end_stream() {
         Spool::new(&state.dir, "request-body").ok().map(|spool| {
             Arc::new(Mutex::new(Deferred {
                 spool,
@@ -1870,6 +1877,11 @@ mod tests {
             ("chunked", None, None),
             ("large", Some(SMALL_BODY + 1), None),
             ("multipart", None, Some("multipart/form-data; boundary=fixture")),
+            (
+                "multipart-small",
+                Some(SMALL_BODY - 1),
+                Some("multipart/form-data; boundary=fixture"),
+            ),
         ] {
             let mut request = HttpRequest::builder().method("POST").uri("/fixture");
             if let Some(length) = length {
@@ -1893,7 +1905,7 @@ mod tests {
             .filter_map(|path| std::fs::read_to_string(path).ok())
             .filter(|content| content.contains("Status: 401"))
             .count()
-            < 3
+            < 4
         {
             assert!(tokio::time::Instant::now() < deadline, "request logs did not finalize");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
