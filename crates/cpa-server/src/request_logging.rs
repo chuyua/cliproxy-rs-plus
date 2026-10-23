@@ -272,10 +272,10 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
                 Some(Err(_)) | None => break,
             }
         }
-        if remaining == 0 {
-            if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                record.response_truncated = true;
-            }
+        if remaining == 0
+            && let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
+        {
+            record.response_truncated = true;
         }
         // The serving stack suppresses HEAD output; preserve the body object
         // rather than silently replacing an over-limit body with an empty one.
