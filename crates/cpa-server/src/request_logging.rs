@@ -25,10 +25,8 @@ use crate::management::Management;
 use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
-const DEFERRED_BODY: u64 = 32 << 20;
-/// Bound non-SSE downstream log capture independently of the response size.
-/// This is log storage only: bytes forwarded to the client are untouched.
 const RESPONSE_CAPTURE_LIMIT: usize = 8 << 20;
+const DEFERRED_BODY: u64 = 32 << 20;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! { static CURRENT: RequestLog; }
@@ -199,7 +197,6 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             status: 200,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
-            response_truncated: false,
             response_spool: None,
             streaming: false,
             streaming_failed: false,
@@ -247,39 +244,13 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
             record.status = response.status().as_u16();
             record.response_headers = response.headers().clone();
         }
-        // HEAD bodies are suppressed by the HTTP serving layer, but the
-        // handler body can be arbitrarily large or even infinite. Never
-        // replace the response body with an empty one on capture overflow:
-        // consume at most the logging budget and leave transport semantics
-        // to the serving layer. Cancellation drops the remainder promptly.
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        let mut body = body;
-        let mut remaining = RESPONSE_CAPTURE_LIMIT;
-        while remaining > 0 {
-            use std::future::poll_fn;
-            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
-            match frame {
-                Some(Ok(frame)) => {
-                    if let Ok(bytes) = frame.into_data() {
-                        let captured = bytes.len().min(remaining);
-                        if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                            record.capture_response_chunk(&bytes[..captured]);
-                            record.response_truncated |= captured < bytes.len();
-                        }
-                        remaining -= captured;
-                    }
-                }
-                Some(Err(_)) | None => break,
+        if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
+            if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                record.response.extend_from_slice(&bytes);
             }
+            *response.body_mut() = Body::from(bytes);
         }
-        if remaining == 0
-            && let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
-        {
-            record.response_truncated = true;
-        }
-        // The serving stack suppresses HEAD output; preserve the body object
-        // rather than silently replacing an over-limit body with an empty one.
-        *response.body_mut() = body;
     }
     let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(record) = locked.as_mut() else {
@@ -903,7 +874,7 @@ impl HttpBody for ResponseBody {
                 let config = record.state.rt.config();
                 if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
                 {
-                    record.capture_response_chunk(bytes);
+                    record.response.extend_from_slice(bytes);
                 }
             }
         }
@@ -1153,7 +1124,6 @@ struct Record {
     status: u16,
     response_headers: HeaderMap,
     response: Vec<u8>,
-    response_truncated: bool,
     response_spool: Option<Spool>,
     streaming: bool,
     streaming_failed: bool,
@@ -1174,12 +1144,6 @@ struct Record {
 }
 
 impl Record {
-    fn capture_response_chunk(&mut self, bytes: &[u8]) {
-        let remaining = RESPONSE_CAPTURE_LIMIT.saturating_sub(self.response.len());
-        self.response.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-        self.response_truncated |= bytes.len() > remaining;
-    }
-
     async fn finish(mut self) {
         if self.streaming_failed {
             return;
@@ -1211,19 +1175,7 @@ impl Record {
             }
         }
         let decompress_error = if !self.streaming {
-            // Truncated compressed input cannot be decoded reliably. Even a
-            // complete small gzip body can inflate many gigabytes.
-            let (body, error) = if self.response_truncated {
-                (std::mem::take(&mut self.response), None)
-            } else {
-                decode(
-                    std::mem::take(&mut self.response),
-                    &self.response_headers,
-                    false,
-                    Some(RESPONSE_CAPTURE_LIMIT as u64),
-                )
-                .await
-            };
+            let (body, error) = decode(std::mem::take(&mut self.response), &self.response_headers, false, None).await;
             self.response = body;
             error
         } else {
@@ -1392,13 +1344,6 @@ impl Record {
                 out.write_all(b"\n")?;
             }
             out.write_all(&self.response)?;
-            if self.response_truncated {
-                write!(
-                    out,
-                    "\n[RESPONSE BODY TRUNCATED: captured first {} bytes]",
-                    self.response.len()
-                )?;
-            }
             if let Some(error) = decompress_error {
                 write!(out, "\n[DECOMPRESSION ERROR: {error}]")?;
             }
@@ -1695,11 +1640,7 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             if !output.ends_with(b"\n") {
                 output.push(b'\n');
             }
-            output.extend_from_slice(if request {
-                b"[DECOMPRESSED REQUEST BODY TRUNCATED]".as_slice()
-            } else {
-                b"[DECOMPRESSED RESPONSE BODY TRUNCATED]".as_slice()
-            });
+            output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
             return (output, None);
         }
         body = output;
@@ -1913,6 +1854,95 @@ mod tests {
         assert_eq!(&body[..8], &[0; 8]);
         assert!(body.ends_with(b"[DECOMPRESSED RESPONSE BODY TRUNCATED]"));
         assert!(body.len() < (9 << 20), "gzip inflation must be bounded");
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_does_not_wait_for_unconsumed_request_bodies() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|| async { StatusCode::UNAUTHORIZED })),
+        );
+        // A handler that rejects before reading the body must not wait forever
+        // for an unknown-length, oversized, or multipart client upload.
+        for (name, length, content_type) in [
+            ("chunked", None, None),
+            ("large", Some(SMALL_BODY + 1), None),
+            ("multipart", None, Some("multipart/form-data; boundary=fixture")),
+        ] {
+            let mut request = HttpRequest::builder().method("POST").uri("/fixture");
+            if let Some(length) = length {
+                request = request.header("content-length", length.to_string());
+            }
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), app.call(request.body(body).unwrap()))
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}: logger waited for an unread request body"))
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+            let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while logs(&dir)
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .filter(|content| content.contains("Status: 401"))
+            .count()
+            < 3
+        {
+            assert!(tokio::time::Instant::now() < deadline, "request logs did not finalize");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_deferred_body_forwards_original_chunks() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|body: Bytes| async move { body })),
+        );
+        let body = Body::from_stream(futures_util::stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ]));
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/fixture")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap(),
+            "hello world"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if logs(&dir)
+                .iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .any(|content| content.contains("hello world"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "deferred request log did not finalize"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
