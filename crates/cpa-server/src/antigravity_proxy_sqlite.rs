@@ -775,6 +775,71 @@ mod tests {
     }
 
     #[test]
+    fn stress_parallel_binding_keeps_one_generation_and_cursor() {
+        let (db, dir) = sandbox();
+        let mut workers = Vec::new();
+        for worker in 0..12 {
+            let db = db.clone();
+            workers.push(std::thread::spawn(move || {
+                for iteration in 0..100 {
+                    let binding = db
+                        .select_and_bind("mock-1.json", 100, worker + iteration)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(binding.node_id, 1);
+                    assert_eq!(binding.binding_generation, 1);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(db_value(&db, "SELECT cursor FROM rust_ag_groups WHERE id=10"), 1);
+        assert_eq!(
+            db_value(
+                &db,
+                "SELECT binding_generation FROM rust_ag_accounts WHERE credential_name='mock-1.json'"
+            ),
+            1
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stress_stale_failure_cannot_cool_new_binding() {
+        let (db, dir) = sandbox();
+        let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
+        let second = db
+            .invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, 300, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.node_id, 2);
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let db = db.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert!(
+                        db.invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 102, 300, 0)
+                            .is_err()
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let current = db.select_and_bind("mock-1.json", 102, 0).unwrap().unwrap();
+        assert_eq!(current.node_id, second.node_id);
+        assert_eq!(current.binding_generation, second.binding_generation);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=1"), 1);
+        assert_eq!(db_value(&db, "SELECT failure_count FROM rust_ag_nodes WHERE id=2"), 0);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn cannot_open_unrelated_sqlite_file_or_duplicate_database() {
         let (db, dir) = sandbox();
         assert!(ProxyGroupDb::create_new(dir.join("proxy.sqlite")).is_err());
