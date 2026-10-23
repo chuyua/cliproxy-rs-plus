@@ -1648,7 +1648,11 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             if !output.ends_with(b"\n") {
                 output.push(b'\n');
             }
-            output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
+            output.extend_from_slice(if request {
+                b"[DECOMPRESSED REQUEST BODY TRUNCATED]".as_slice()
+            } else {
+                b"[DECOMPRESSED RESPONSE BODY TRUNCATED]".as_slice()
+            });
             return (output, None);
         }
         body = output;
