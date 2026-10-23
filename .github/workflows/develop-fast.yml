@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Linux compile
         run: cargo build --locked -p cliproxy
+      - name: Claude OAuth proxy-scoped refresh singleflight regression
+        run: cargo test --locked -p cpa-exec --lib refreshes_on_distinct_proxies_do_not_share_an_exchange -- --nocapture
       - name: SQLite concurrent first-bind regression
         run: cargo test --locked -p cpa-server --lib concurrent_double_bind_keeps_single_node_and_one_cursor_advance -- --nocapture
       - name: Scheduler concurrent reset regression

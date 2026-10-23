@@ -4,6 +4,12 @@ The compatibility target is frozen at CLIProxyAPI v8.0.35, commit `ae3ee3be303fb
 
 ## Additions in cliproxy-rs
 
+- Claude OAuth refresh singleflight is scoped to the effective proxy as well
+  as the token endpoint and refresh token. Credentials using the same refresh
+  token over different proxies do not reuse an exchange from another egress
+  route. This narrows Go's token-only singleflight; duplicate credentials
+  with different proxies may race single-use token rotation and should use
+  a consistent proxy binding.
 - Request-log security: the shared upstream capture masks credential values for
   unrecognized non-OAuth auth types as well as `api_key`. Devin's value is
   already masked by its executor and retains its Go-compatible first/last-four

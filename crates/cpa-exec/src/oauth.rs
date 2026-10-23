@@ -51,6 +51,26 @@ fn refreshes() -> std::sync::MutexGuard<'static, Refreshes> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Scope a refresh exchange to the effective egress route. Only a digest is
+/// retained, never the refresh token or proxy credentials.
+fn refresh_key(endpoint: &str, token: &str, proxy: &Proxy) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(endpoint.as_bytes());
+    hash.update([0]);
+    hash.update(token.as_bytes());
+    hash.update([0]);
+    match proxy {
+        Proxy::Inherit => hash.update([0]),
+        Proxy::Direct => hash.update([1]),
+        Proxy::Invalid => hash.update([2]),
+        Proxy::Url(url) => {
+            hash.update([3]);
+            hash.update(url.as_bytes());
+        }
+    }
+    hash.finalize().into()
+}
+
 #[derive(Clone)]
 enum Source {
     Fixed(wreq::Client),
@@ -261,7 +281,7 @@ impl OAuth {
     /// upstream 401 always exchanges again. After a 429 the token is blocked until its
     /// Retry-After; a success clears the block.
     async fn refresh_once(&self, refresh: &str) -> Result<MetadataPatch, ExecError> {
-        let key: [u8; 32] = Sha256::digest(format!("{}\0{refresh}", self.token_url).as_bytes()).into();
+        let key = refresh_key(&self.token_url, refresh, &self.proxy);
         let result = {
             let mut state = refreshes();
             let now = Instant::now();
