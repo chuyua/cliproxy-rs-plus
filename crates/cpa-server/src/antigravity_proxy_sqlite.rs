@@ -747,9 +747,10 @@ mod tests {
         let (db, dir) = sandbox();
         let first = db.select_and_bind("mock-1.json", 100, 0).unwrap().unwrap();
         for seconds in [0, -1, i64::MIN] {
-            assert!(db
-                .invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, seconds, 0)
-                .is_err());
+            assert!(
+                db.invalidate_and_rebind("mock-1.json", first.node_id, first.binding_generation, 101, seconds, 0)
+                    .is_err()
+            );
             let still_bound = db.select_and_bind("mock-1.json", 101, 0).unwrap().unwrap();
             assert_eq!(still_bound.node_id, first.node_id);
             assert_eq!(still_bound.binding_generation, first.binding_generation);
