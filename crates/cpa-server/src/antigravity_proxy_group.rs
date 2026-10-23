@@ -91,17 +91,46 @@ pub fn cool_failed_and_select(
     cooldown_seconds: i64,
     random_slot: usize,
 ) -> Option<Selection> {
+    // Invalid cooldowns must not immediately reintroduce a failed node.
+    // Reject without mutating the caller's in-memory health snapshot.
+    if cooldown_seconds <= 0 {
+        return None;
+    }
     let failed = nodes
         .iter_mut()
         .find(|n| n.group_id == group.id && n.id == failed_node_id)?;
     failed.failure_count = failed.failure_count.saturating_add(1);
-    failed.cooldown_until = Some(now.saturating_add(cooldown_seconds.max(0)));
+    failed.cooldown_until = Some(now.saturating_add(cooldown_seconds));
     select(group, nodes, now, random_slot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_cooldown_does_not_mutate_failed_node() {
+        let mut candidates = nodes();
+        let original = candidates.clone();
+        for seconds in [0, -1, i64::MIN] {
+            assert!(
+                cool_failed_and_select(&group(Strategy::Failover, 0), &mut candidates, 10, 100, seconds, 0).is_none()
+            );
+            assert_eq!(candidates, original);
+        }
+    }
+
+    #[test]
+    fn stress_round_robin_selection_never_returns_ineligible_node() {
+        let mut candidates = nodes();
+        candidates[0].cooldown_until = Some(200);
+        candidates[1].enabled = false;
+        for cursor in 0..10_000 {
+            let chosen = select(&group(Strategy::RoundRobin, cursor), &candidates, 100, cursor).unwrap();
+            assert_eq!(chosen.node_id, 20);
+            assert_eq!(chosen.next_cursor, 0);
+        }
+    }
 
     fn nodes() -> Vec<Node> {
         vec![
