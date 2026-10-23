@@ -364,6 +364,24 @@ pub enum EchoOutcome {
     TemporarilyUnavailable(u16),
 }
 
+/// A grouped account must use a request-scoped proxy lease, never a proxy
+/// inherited from auth JSON, global configuration, or the environment.
+fn health_proxy(credential: &Credential, config: &Config) -> anyhow::Result<Proxy> {
+    if credential.str("proxy_mode") == Some("group") {
+        let Some(Proxy::Url(url)) = credential.attributes.get("proxy_url").map(|url| Proxy::parse(url)) else {
+            bail!("Antigravity group proxy binding unavailable");
+        };
+        ensure!(
+            credential.str("proxy_url").is_none_or(|url| url.trim().is_empty()),
+            "explicit account proxy conflicts with group mode"
+        );
+        return Ok(Proxy::Url(url));
+    }
+    let proxy = Proxy::effective(credential, config);
+    ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
+    Ok(proxy)
+}
+
 /// Check an account's egress through its configured transport, without
 /// falling back to a direct connection when proxy configuration is invalid.
 pub async fn fetch_egress(
@@ -374,8 +392,7 @@ pub async fn fetch_egress(
     user_agent: &str,
 ) -> anyhow::Result<EchoOutcome> {
     ensure!(!url.trim().is_empty(), "missing IP echo URL");
-    let proxy = Proxy::effective(credential, config);
-    ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
+    let proxy = health_proxy(credential, config)?;
     let client = clients.try_get(&proxy).context("account proxy unavailable")?;
     let response = client
         .get(url)
@@ -471,8 +488,7 @@ pub async fn fetch_eligibility(
         credential.str("access_token") == Some(access_token),
         "eligibility token does not match the bound account"
     );
-    let proxy = Proxy::effective(credential, config);
-    ensure!(!matches!(proxy, Proxy::Invalid), "invalid account proxy");
+    let proxy = health_proxy(credential, config)?;
     let client = clients.try_get(&proxy).context("account proxy unavailable")?;
     let url = format!("{}/v1internal:loadCodeAssist", api_base_url.trim_end_matches('/'));
     let response = client
@@ -722,6 +738,93 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn group_health_probes_never_send_unbound_oauth_directly() {
+        use axum::{
+            Router,
+            routing::{get, post},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let get_hits = Arc::clone(&hits);
+        let post_hits = Arc::clone(&hits);
+        let app = Router::new()
+            .route(
+                "/ip",
+                get(move || {
+                    let hits = Arc::clone(&get_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"ip": "203.0.113.8"}))
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:loadCodeAssist",
+                post(move || {
+                    let hits = Arc::clone(&post_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"currentTier": {"id": "free-tier"}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let data = json!({
+            "type": "antigravity", "proxy_mode": "group", "proxy_group_id": 9,
+            "access_token": "dummy-access"
+        });
+        let credential = Credential::from_file(
+            std::path::Path::new("/mock"),
+            std::path::Path::new("/mock/group.json"),
+            data.as_object().unwrap().clone(),
+        )
+        .unwrap();
+        let clients = GoClients::new(Default::default());
+        let base = format!("http://{address}");
+        assert!(
+            fetch_egress(
+                &clients,
+                &Config::default(),
+                &credential,
+                &format!("{base}/ip"),
+                "mock-test"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            fetch_eligibility(
+                &clients,
+                &Config::default(),
+                &credential,
+                &base,
+                "dummy-access",
+                "mock-test"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "unbound group must never send a network request"
+        );
+        let mut explicit_direct = credential.clone();
+        explicit_direct.metadata.insert("proxy_url".into(), json!("direct"));
+        assert!(health_proxy(&explicit_direct, &Config::default()).is_err());
+        let mut bound = credential.clone();
+        bound
+            .attributes
+            .insert("proxy_url".into(), "http://mock-proxy.invalid:1234".into());
+        assert!(matches!(health_proxy(&bound, &Config::default()), Ok(Proxy::Url(_))));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn ip_echo_uses_only_loopback_mock() {
