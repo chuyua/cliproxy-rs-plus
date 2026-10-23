@@ -21,7 +21,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M3 | 424 | 212 | 205 | 7 |
 | M4 | 589 | 260 | 321 | 8 |
 | M5 | 331 | 224 | 104 | 3 |
-| M6 | 267 | 149 | 109 | 9 |
+| M6 | 267 | 151 | 107 | 9 |
 
 ### Gaps by area
 
@@ -29,7 +29,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 |---|---:|---:|---|
 | claude | 11 | 62 | M1-0120, M1-0121, M1-0123, M1-0124, M1-0125, M1-0126, M1-0127, M1-0136, M1-0137, M1-0147, M5-0314 |
 | server | 9 | 285 | M4-0371, M4-0372, M4-0512, M4-0515, M4-0543, M4-0579, M4-0580, M4-0585, M5-0316 |
-| plugins | 8 | 78 | M6-0192, M6-0211, M6-0213, M6-0220, M6-0240, M6-0241, M6-0249, M6-0250 |
+| plugins | 8 | 76 | M6-0192, M6-0211, M6-0213, M6-0220, M6-0240, M6-0241, M6-0249, M6-0250 |
 | translate | 5 | 92 | M2-0166, M2-0167, M2-0168, M2-0181, M3-0405 |
 | codex | 4 | 73 | M3-0362, M3-0363, M3-0364, M5-0323 |
 | google | 3 | 77 | M3-0058, M3-0059, M3-0361 |
@@ -1015,7 +1015,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 |---|---|---|---|---|---|
 | M4-0032 | client.codex.optimize-multi-agent-v2 | covered | read in crates/cpa-common/src/codex_client.rs, crates/cpa-server/src/codex_models.rs (+1); set in crates/cpa-common/src/codex_client_tests.rs, crates/cpa-core/src/config.rs (+6) |  | heuristic: key name match |
 | M4-0033 | client.codex.enable-apply-patch | covered | read in crates/cpa-server/src/codex_models.rs, crates/cpa-server/src/config_diff.rs; set in crates/cpa-core/src/config.rs, crates/cpa-server/tests/fixtures/config_diff_go.json (+1) |  | heuristic: key name match |
-| M4-0034 | requests.proxy-url | covered | read in crates/cliproxy/src/tui/config.rs, crates/cliproxy/src/tui/dashboard.rs (+21); set in crates/cliproxy/tests/fixtures/tui_go.json, crates/cpa-core/src/config/credentials.rs (+24) |  | heuristic: key name match |
+| M4-0034 | requests.proxy-url | covered | read in crates/cliproxy/src/tui/config.rs, crates/cliproxy/src/tui/dashboard.rs (+21); set in crates/cliproxy/tests/fixtures/discovery_cmd_go.json, crates/cliproxy/tests/fixtures/tui_go.json (+25) |  | heuristic: key name match |
 | M4-0035 | routing.force-model-prefix | covered | read in crates/cliproxy/src/tui/config.rs, crates/cpa-core/src/config.rs (+3); set in crates/cliproxy/tests/fixtures/tui_go.json, crates/cpa-core/src/registry/dynamic.rs (+5) |  | heuristic: key name match |
 | M4-0036 | observability.logs.request-log | covered | read in crates/cliproxy/src/tui/config.rs, crates/cpa-home/src/client.rs (+5); set in crates/cliproxy/tests/fixtures/tui_go.json, crates/cpa-home/tests/fixtures/go_home_golden.json (+9) |  | heuristic: key name match |
 | M4-0037 | requests.passthrough-headers | covered | read in crates/cpa-server/src/respond.rs; set in crates/cliproxy/tests/fixtures/plugin_wiring_go.json, crates/cpa-server/tests/fixtures/legacy_go.json (+3) |  | heuristic: key name match |
@@ -1052,7 +1052,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M4-0068 | api-keys.gemini[].keys[].priority | covered | read in crates/cpa-core/src/config/credentials.rs; set in crates/cliproxy/src/home.rs, crates/cliproxy/tests/fixtures/plugin_wiring_go.json (+12) |  | heuristic: key name match |
 | M4-0069 | api-keys.gemini[].keys[].weight | covered | read in crates/cpa-core/src/config/credentials.rs; set in crates/cliproxy/src/home.rs, crates/cpa-core/src/config/credentials/plugin_auth.rs (+6) |  | heuristic: key name match |
 | M4-0070 | api-keys.gemini[].keys[].prefix | covered | read in crates/cpa-core/src/config/credentials.rs; set in crates/cliproxy/src/home.rs, crates/cliproxy/tests/fixtures/tui_go.json (+41) |  | heuristic: key name match |
-| M4-0071 | api-keys.gemini[].keys[].proxy-url | covered | read in crates/cpa-core/src/config/credentials.rs; set in crates/cliproxy/tests/fixtures/tui_go.json, crates/cpa-core/src/config/credentials.rs (+9) |  | heuristic: key name match |
+| M4-0071 | api-keys.gemini[].keys[].proxy-url | covered | read in crates/cpa-core/src/config/credentials.rs; set in crates/cliproxy/tests/fixtures/discovery_cmd_go.json, crates/cliproxy/tests/fixtures/tui_go.json (+10) |  | heuristic: key name match |
 | M4-0072 | api-keys.gemini[].keys[].models[].alias | covered | read in crates/cpa-core/src/config/credentials.rs, crates/cpa-core/src/config/sanitize.rs; set in crates/cliproxy/src/home.rs, crates/cliproxy/tests/fixtures/plugin_wiring_go.json (+20) |  | heuristic: key name match |
 | M4-0073 | api-keys.gemini[].keys[].models[].force-mapping | covered | read in crates/cpa-core/src/config/credentials.rs, crates/cpa-core/src/config/sanitize.rs; set in crates/cpa-core/src/registry/dynamic.rs, crates/cpa-server/tests/routes.rs |  | heuristic: key name match |
 | M4-0074 | api-keys.gemini[].keys[].excluded-models | covered | read in crates/cpa-core/src/config/credentials.rs, crates/cpa-core/src/config/sanitize.rs; set in crates/cpa-core/src/config/credentials.rs, crates/cpa-core/src/registry/dynamic.rs (+4) |  | heuristic: key name match |
@@ -2014,8 +2014,8 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M6-0026 | plugins.store-auth[].apply-to | partial | read in crates/cpa-plugin/src/config.rs; no test sets it | plugins | heuristic: key name match |
 | M6-0027 | plugins.store-auth[].type | covered | read in crates/cpa-common/src/cache.rs, crates/cpa-common/src/codex_catalog.rs (+136); set in crates/cliproxy/src/discovery/mdns.rs, crates/cliproxy/src/home.rs (+258) |  | heuristic: key name match |
 | M6-0028 | plugins.store-auth[].token-env | covered | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; set in crates/cliproxy/src/home_plugins.rs, crates/cpa-plugin/src/homeplugins.rs (+1) |  | heuristic: key name match |
-| M6-0029 | plugins.store-auth[].username-env | partial | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; no test sets it | plugins | heuristic: key name match |
-| M6-0030 | plugins.store-auth[].password-env | partial | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; no test sets it | plugins | heuristic: key name match |
+| M6-0029 | plugins.store-auth[].username-env | covered | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; set in crates/cliproxy/src/home_plugins.rs |  | heuristic: key name match |
+| M6-0030 | plugins.store-auth[].password-env | covered | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; set in crates/cliproxy/src/home_plugins.rs |  | heuristic: key name match |
 | M6-0031 | plugins.store-auth[].header-name | partial | read in crates/cpa-plugin/src/config.rs; no test sets it | plugins | heuristic: key name match |
 | M6-0032 | plugins.store-auth[].header-value-env | partial | read in crates/cpa-plugin/src/config.rs, crates/cpa-plugin/src/store/auth.rs; no test sets it | plugins | heuristic: key name match |
 | M6-0033 | plugins.store-auth[].allow-insecure | partial | read in crates/cpa-plugin/src/config.rs; no test sets it | plugins | heuristic: key name match |
