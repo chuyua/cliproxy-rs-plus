@@ -10,10 +10,6 @@ class CliproxyRs < Formula
       url "https://github.com/vayungodara/cliproxy-rs/releases/download/v@VERSION@/cliproxy-@VERSION@-aarch64-apple-darwin.tar.gz"
       sha256 "@SHA256_AARCH64_APPLE_DARWIN@"
     end
-    on_intel do
-      url "https://github.com/vayungodara/cliproxy-rs/releases/download/v@VERSION@/cliproxy-@VERSION@-x86_64-apple-darwin.tar.gz"
-      sha256 "@SHA256_X86_64_APPLE_DARWIN@"
-    end
   end
 
   on_linux do

@@ -233,6 +233,11 @@ impl Rules {
                             _ => true,
                         }))
                 })
+                // After Go's whole-rule check, which sees every parameter.
+                .map(|mut r| {
+                    r.params.retain(|(path, _)| !unported(path));
+                    r
+                })
                 .collect()
         };
         let filter = section("filter")
@@ -245,6 +250,7 @@ impl Rules {
                     .into_iter()
                     .flatten()
                     .map(|p| yaml_str(Some(p)))
+                    .filter(|path| !unported(path))
                     .collect(),
             })
             .collect();
@@ -319,7 +325,90 @@ fn model_rules(v: Option<&Yaml>) -> Vec<ModelRule> {
             exist: strings(m, "exist"),
             not_exist: strings(m, "not-exist"),
         })
+        // A condition the port cannot read never holds, so its model entry never matches.
+        .filter(|m| {
+            let mut paths = (m.matches.iter().chain(&m.not_matches).flatten().map(|(p, _)| p))
+                .chain(&m.exist)
+                .chain(&m.not_exist);
+            !paths.any(|p| unported(p))
+        })
         .collect()
+}
+
+/// `part` split at each `|` that is not escaped or inside parentheses: gjson pipes.
+fn pipe_parts(part: &str) -> Vec<&str> {
+    let (mut out, mut start, mut depth, mut escaped) = (Vec::new(), 0, 0usize, false);
+    for (i, c) in part.bytes().enumerate() {
+        match c {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 => {
+                out.push(&part[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&part[start..]);
+    out
+}
+
+/// A rule path outside what the port reads exactly like Go (docs/DIFFERENCES-FROM-GO.md);
+/// such a rule is ignored. Allowed: dot-separated plain keys and indexes with `\\`
+/// escapes and `*`/`?` wildcards, a bare `#` (count or `#.key`), `@this` without
+/// arguments, `|` pipes between such parts, and whole `#(query)` or `#(query)#` parts
+/// with a simple predicate (no `@`, `|` or nested query). Everything else (subselectors,
+/// modifiers, static values, JSON lines, `#[...]` and queries after a pipe) is gjson
+/// syntax `cpa_common::json` and the query resolver do not implement.
+fn unported(path: &str) -> bool {
+    let path = path.trim();
+    path.is_empty()
+        || !split_path(path).into_iter().all(|part| match query_part(part) {
+            Some((query, _)) => simple_query(query),
+            None => pipe_parts(part).into_iter().all(plain_read),
+        })
+}
+
+/// A query predicate the resolver reads as gjson does: each `&&`/`||` term is one gjson
+/// query that ends where the term ends, and its path is a plain read.
+fn simple_query(query: &str) -> bool {
+    !query.contains(['@', '|'])
+        && !query.contains("#(")
+        && !query.contains("#[")
+        && split_logical(query, "||").into_iter().all(|or| {
+            split_logical(or, "&&").into_iter().all(|term| {
+                let term = format!("#({})", term.trim());
+                match json::parse_query(term.as_bytes()) {
+                    None => true,
+                    Some((query, end)) => {
+                        end == term.len()
+                            && (query.path.is_empty()
+                                || std::str::from_utf8(&query.path).is_ok_and(|path| !unported(path)))
+                    }
+                }
+            })
+        })
+}
+
+/// A part `cpa_common::json::get` reads as gjson does, between dots or pipes: gjson
+/// reads `@` and `!` as syntax only at a part's start.
+fn plain_read(part: &str) -> bool {
+    if part == "#" || part == "@this" {
+        return true;
+    }
+    let mut escaped = false;
+    !part.is_empty()
+        && !part.starts_with(['@', '!'])
+        && part.bytes().all(|c| {
+            if escaped {
+                escaped = false;
+                return true;
+            }
+            escaped = c == b'\\';
+            !b"[]{}()#|\"'".contains(&c)
+        })
 }
 
 /// [`apply_tracked`] without tracking.
@@ -1209,10 +1298,13 @@ fn query_matches(item: &Res<'_>, query: &str) -> bool {
                 if term.is_empty() || item.raw().is_empty() {
                     return false;
                 }
-                let wrapped = format!("[{}]", String::from_utf8_lossy(item.raw()));
-                // ponytail: gjson queries come from the `gjson` crate (tidwall's own Rust
-                // port); `crate::json` does not implement `#(...)`.
-                gjson::get(&wrapped, &format!("#({term})")).exists()
+                // gjson.GetBytes("[item]", "#("+term+")").Exists(): the one element is
+                // the item. An unbalanced term leaves gjson an empty query, which is
+                // `Query::default()` (tests/query.rs checks both against Go).
+                json::parse_query(format!("#({term})").as_bytes())
+                    .map(|(query, _)| query)
+                    .unwrap_or_default()
+                    .matches_raw(item.raw())
             })
     })
 }

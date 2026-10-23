@@ -18,6 +18,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
 use chrono::{DateTime, Local, SecondsFormat};
+use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::Runtime;
@@ -25,6 +26,7 @@ use crate::management::Management;
 use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
+const RESPONSE_CAPTURE_LIMIT: usize = 8 << 20;
 const DEFERRED_BODY: u64 = 32 << 20;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -128,7 +130,28 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
+    // Do not wait for large, chunked or multipart uploads before routing. In
+    // particular, logging must not hold a handler's early 401/413 response.
+    // With request logging enabled Go consumes the body before auth and routing.
+    // For bounded chunked uploads, probe at most the configured limit plus one
+    // byte so an oversized upload is refused consistently on every route.
+    if enabled
+        && length.is_none()
+        && let Some(max) = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0)
+    {
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        match axum::body::to_bytes(body, max.saturating_add(1) as usize).await {
+            Ok(bytes) => *request.body_mut() = Body::from(bytes),
+            Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
+            Err(error) => {
+                *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                    Err::<Bytes, _>(io::Error::other(error.to_string()))
+                }));
+                return next.run(request).await;
+            }
+        }
+    }
+    let eager = !multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY);
     let mut request_body = Vec::new();
     if eager {
         let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
@@ -147,9 +170,14 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             }
         };
         *request.body_mut() = Body::from(bytes.clone());
-        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
+        // A small compressed upload may inflate far beyond its wire length.
+        // Bound the diagnostic copy without altering the forwarded body.
+        let capture_limit = limit.unwrap_or(DEFERRED_BODY).min(DEFERRED_BODY);
+        request_body = decode(bytes.to_vec(), request.headers(), true, Some(capture_limit))
+            .await
+            .0;
     }
-    let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
+    let deferred = if !eager && (enabled || !multipart) && length != Some(0) && !request.body().is_end_stream() {
         Spool::new(&state.dir, "request-body").ok().map(|spool| {
             Arc::new(Mutex::new(Deferred {
                 spool,
@@ -196,6 +224,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             status: 200,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
+            response_truncated: false,
             response_spool: None,
             streaming: false,
             streaming_failed: false,
@@ -244,11 +273,11 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
             record.response_headers = response.headers().clone();
         }
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
+        let mut chunks = body.into_data_stream();
+        while let Some(Ok(bytes)) = chunks.next().await {
             if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                record.response.extend_from_slice(&bytes);
+                record.append_response(&bytes);
             }
-            *response.body_mut() = Body::from(bytes);
         }
     }
     let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -873,7 +902,7 @@ impl HttpBody for ResponseBody {
                 let config = record.state.rt.config();
                 if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
                 {
-                    record.response.extend_from_slice(bytes);
+                    record.append_response(bytes);
                 }
             }
         }
@@ -1005,8 +1034,8 @@ const SECTION_HEAD: usize = 32;
 /// session does not grow in memory. Here a section stays in memory until it
 /// passes SECTION_MEMORY bytes, then the buffered bytes and everything after
 /// them go to a spool file in the log directory. If the spool cannot be
-/// written, the section keeps the rest in memory, as Go's writeAttemptResponse
-/// falls back to a strings.Builder.
+/// written, keep only the diagnostic prefix and mark it truncated instead of
+/// allowing an unavailable log disk to turn a long stream into an OOM.
 struct Section {
     prefix: &'static str,
     memory: Vec<u8>,
@@ -1015,6 +1044,7 @@ struct Section {
     /// failed write can leave more after them, which are never read.
     spilled: u64,
     spill_failed: bool,
+    truncated: bool,
     /// The first SECTION_HEAD bytes of the section.
     head: Vec<u8>,
     /// Newlines at the end of the section.
@@ -1031,6 +1061,7 @@ impl Section {
             spool: None,
             spilled: 0,
             spill_failed: false,
+            truncated: false,
             head: Vec::new(),
             trailing: 0,
             blank: true,
@@ -1070,13 +1101,22 @@ impl Section {
             return;
         }
         self.track(bytes);
-        if !self.spill_failed && self.memory.len() + bytes.len() > SECTION_MEMORY {
+        if !self.spill_failed && self.memory.len().saturating_add(bytes.len()) > SECTION_MEMORY {
             if self.spill(dir, bytes).is_ok() {
                 return;
             }
             self.spill_failed = true;
         }
-        self.memory.extend_from_slice(bytes);
+        // A disk-full or unwritable log directory must not turn a long upstream
+        // response or WebSocket into an unbounded in-memory log. Preserve the
+        // prefix (and any bytes already spooled) for diagnostics.
+        let kept = if self.spill_failed {
+            bytes.len().min(SECTION_MEMORY.saturating_sub(self.memory.len()))
+        } else {
+            bytes.len()
+        };
+        self.memory.extend_from_slice(&bytes[..kept]);
+        self.truncated |= kept < bytes.len();
     }
 
     /// Moves the buffered bytes and then `bytes` to the spool file. On error,
@@ -1106,7 +1146,11 @@ impl Section {
                 ));
             }
         }
-        out.write_all(&self.memory)
+        out.write_all(&self.memory)?;
+        if self.truncated {
+            out.write_all(b"\n[LOG SECTION TRUNCATED: disk spool unavailable]\n")?;
+        }
+        Ok(())
     }
 }
 
@@ -1123,6 +1167,7 @@ struct Record {
     status: u16,
     response_headers: HeaderMap,
     response: Vec<u8>,
+    response_truncated: bool,
     response_spool: Option<Spool>,
     streaming: bool,
     streaming_failed: bool,
@@ -1143,6 +1188,16 @@ struct Record {
 }
 
 impl Record {
+    fn append_response(&mut self, bytes: &[u8]) {
+        // Diagnostic bytes must not grow with a large downstream response.
+        // ResponseBody still forwards the original frame to the client.
+        let kept = bytes
+            .len()
+            .min(RESPONSE_CAPTURE_LIMIT.saturating_sub(self.response.len()));
+        self.response.extend_from_slice(&bytes[..kept]);
+        self.response_truncated |= kept < bytes.len();
+    }
+
     async fn finish(mut self) {
         if self.streaming_failed {
             return;
@@ -1174,8 +1229,22 @@ impl Record {
             }
         }
         let decompress_error = if !self.streaming {
-            let (body, error) = decode(std::mem::take(&mut self.response), &self.response_headers, false, None).await;
+            let (body, error) = decode(
+                std::mem::take(&mut self.response),
+                &self.response_headers,
+                false,
+                Some(RESPONSE_CAPTURE_LIMIT as u64),
+            )
+            .await;
             self.response = body;
+            if self.response_truncated {
+                if !self.response.ends_with(b"\n") {
+                    self.response.push(b'\n');
+                }
+                self.response.extend_from_slice(
+                    format!("[RESPONSE BODY TRUNCATED: captured first {RESPONSE_CAPTURE_LIMIT} bytes]").as_bytes(),
+                );
+            }
             error
         } else {
             None
@@ -1279,7 +1348,7 @@ impl Record {
             writeln!(out, "Upstream Transport: {upstream}")?;
         }
         write!(out, "Timestamp: {}\n\n\n=== HEADERS ===\n", timestamp(self.timestamp))?;
-        headers(out, &self.headers, true)?;
+        headers(out, &self.headers)?;
         out.write_all(b"\n\n")?;
         if !websocket {
             out.write_all(b"=== REQUEST BODY ===\n")?;
@@ -1317,7 +1386,7 @@ impl Record {
             return Ok(());
         }
         write!(out, "=== RESPONSE ===\nStatus: {}\n", self.status)?;
-        headers(out, &self.response_headers, false)?;
+        headers(out, &self.response_headers)?;
         if let Some(spool) = &self.response_spool
             && self.redact_sdp
         {
@@ -1451,16 +1520,11 @@ fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
     }
 }
 
-fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<()> {
+fn headers(out: &mut dyn Write, headers: &HeaderMap) -> io::Result<()> {
     for (name, value) in headers {
         write!(out, "{}: ", header_name(name.as_str()))?;
-        if mask {
-            out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
-        } else if cookie(name.as_str()) {
-            out.write_all(REDACTED.as_bytes())?;
-        } else {
-            out.write_all(value.as_bytes())?;
-        }
+        // Even response headers may carry credentials. Never persist them verbatim.
+        out.write_all(&masked_header(name.as_str(), value.as_bytes()))?;
         out.write_all(b"\n")?;
     }
     Ok(())
@@ -1644,7 +1708,11 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             if !output.ends_with(b"\n") {
                 output.push(b'\n');
             }
-            output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
+            output.extend_from_slice(if request {
+                b"[DECOMPRESSED REQUEST BODY TRUNCATED]".as_slice()
+            } else {
+                b"[DECOMPRESSED RESPONSE BODY TRUNCATED]".as_slice()
+            });
             return (output, None);
         }
         body = output;
@@ -1658,6 +1726,20 @@ mod tests {
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::response::IntoResponse;
     use tower_service::Service;
+
+    #[test]
+    fn response_headers_mask_sensitive_values() {
+        let mut response = HeaderMap::new();
+        response.insert("authorization", "Bearer marker-response-123456".parse().unwrap());
+        response.insert("x-api-key", "marker-key-123456".parse().unwrap());
+        response.insert("content-type", "application/json".parse().unwrap());
+        let mut output = Vec::new();
+        headers(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("marker-response"));
+        assert!(!output.contains("marker-key"));
+        assert!(output.contains("Content-Type: application/json"));
+    }
 
     /// `capture_go.json`, recorded with the Go generator's `buildinfo.Version` pinned to
     /// `cliproxy-rs-0.1.0` (tests/reference/capture/main.go). The version of this build
@@ -1741,6 +1823,247 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "log"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn head_large_response_capture_stays_bounded_and_returns_empty_body() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().route(
+            "/head-large",
+            axum::routing::head(|| async {
+                let chunk = Bytes::from(vec![b'h'; 1 << 20]);
+                let chunks = futures_util::stream::iter((0..16).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+                Response::new(Body::from_stream(chunks))
+            }),
+        );
+        let mut app = router(&state, crate::app(state.rt.clone(), app));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.call(
+                HttpRequest::builder()
+                    .method("HEAD")
+                    .uri("/head-large")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(body.is_empty(), "HEAD must never forward the handler body");
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if logs(&dir)
+                    .iter()
+                    .any(|path| std::fs::read_to_string(path).is_ok_and(|s| s.contains(marker)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_response_logging_is_bounded_without_truncating_client_bytes() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().fallback(|| async {
+            let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+            let chunks = futures_util::stream::iter((0..9).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+            Response::new(Body::from_stream(chunks))
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivered = axum::body::to_bytes(response.into_body(), 10 << 20).await.unwrap();
+        assert_eq!(delivered.len(), 9 << 20, "logging must not truncate the HTTP response");
+
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        let content = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = logs(&dir).first()
+                    && let Ok(content) = std::fs::read_to_string(path)
+                    && content.contains(marker)
+                {
+                    return content;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(content.len() < (9 << 20), "log storage must be bounded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_only_large_response_log_is_bounded() {
+        let dir = scratch();
+        let state = management(&dir, false, false);
+        let app = axum::Router::new().fallback(|| async {
+            let chunk = Bytes::from(vec![b'e'; 1 << 20]);
+            let chunks = futures_util::stream::iter((0..9).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+            let mut response = Response::new(Body::from_stream(chunks));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let delivered = axum::body::to_bytes(response.into_body(), 10 << 20).await.unwrap();
+        assert_eq!(delivered.len(), 9 << 20);
+
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        let content = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = logs(&dir).first()
+                    && let Ok(content) = std::fs::read_to_string(path)
+                    && content.contains(marker)
+                {
+                    return content;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(content.len() < (9 << 20));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_response_log_has_an_inflation_ceiling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let (body, error) = decode(
+            include_bytes!("../tests/fixtures/response_bomb.gz").to_vec(),
+            &headers,
+            false,
+            Some(RESPONSE_CAPTURE_LIMIT as u64),
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(&body[..8], &[0; 8]);
+        assert!(body.ends_with(b"[DECOMPRESSED RESPONSE BODY TRUNCATED]"));
+        assert!(body.len() < (9 << 20), "gzip inflation must be bounded");
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_does_not_wait_for_unconsumed_request_bodies() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|| async { StatusCode::UNAUTHORIZED })),
+        );
+        // A handler that rejects before reading the body must not wait forever
+        // for an unknown-length, oversized, or multipart client upload.
+        for (name, length, content_type) in [
+            ("chunked", None, None),
+            ("large", Some(SMALL_BODY + 1), None),
+            ("multipart", None, Some("multipart/form-data; boundary=fixture")),
+            (
+                "multipart-small",
+                Some(SMALL_BODY - 1),
+                Some("multipart/form-data; boundary=fixture"),
+            ),
+        ] {
+            let mut request = HttpRequest::builder().method("POST").uri("/fixture");
+            if let Some(length) = length {
+                request = request.header("content-length", length.to_string());
+            }
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), app.call(request.body(body).unwrap()))
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}: logger waited for an unread request body"))
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+            let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while logs(&dir)
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .filter(|content| content.contains("Status: 401"))
+            .count()
+            < 4
+        {
+            assert!(tokio::time::Instant::now() < deadline, "request logs did not finalize");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_logging_deferred_body_forwards_original_chunks() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let mut app = router(
+            &state,
+            axum::Router::new().route("/fixture", axum::routing::post(|body: Bytes| async move { body })),
+        );
+        let body = Body::from_stream(futures_util::stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ]));
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/fixture")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap(),
+            "hello world"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if logs(&dir)
+                .iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .any(|content| content.contains("hello world"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "deferred request log did not finalize"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -2818,5 +3141,49 @@ mod tests {
         let mut stream = vec![chunk.clone(); CHUNKS].join(&b"\n\n"[..]);
         stream.extend_from_slice(b"\n\n\n=== RESPONSE ===\nStatus: 200\n");
         expect(start, &stream);
+    }
+
+    #[test]
+    fn upstream_section_spool_failure_does_not_accumulate_unbounded_memory() {
+        let dir = scratch();
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        let mut section = Section::new("api-response");
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..32 {
+            section.append(&blocked, &chunk);
+        }
+        assert!(section.spill_failed);
+        assert!(section.memory.len() <= SECTION_MEMORY, "{}", section.memory.len());
+        let mut output = Vec::new();
+        section.write_to(&mut output).unwrap();
+        assert!(output.starts_with(b"xxxx"));
+        assert!(
+            output
+                .windows(b"SECTION TRUNCATED".len())
+                .any(|w| w == b"SECTION TRUNCATED")
+        );
+
+        // Also cover a spool that was created successfully but whose write
+        // fails after the stream begins (e.g. disk-full / read-only handle).
+        let mut section = Section::new("api-response");
+        let mut spool = Spool::new(&dir, "api-response").unwrap();
+        spool.file = unwritable(&dir);
+        section.spool = Some(spool);
+        for _ in 0..32 {
+            section.append(&dir, &chunk);
+        }
+        assert!(section.spill_failed);
+        assert!(section.truncated);
+        assert!(section.memory.len() <= SECTION_MEMORY);
+        let mut output = Vec::new();
+        section.write_to(&mut output).unwrap();
+        assert!(
+            output
+                .windows(b"SECTION TRUNCATED".len())
+                .any(|w| w == b"SECTION TRUNCATED")
+        );
+        drop(section);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

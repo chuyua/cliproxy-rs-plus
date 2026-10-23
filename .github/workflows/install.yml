@@ -9,6 +9,7 @@ on:
     branches: [master]
     paths: [install.sh, install.ps1, .github/workflows/install.yml, .github/scripts/test-installers.py, .github/scripts/installer-fixture.rs, crates/cliproxy/**, crates/cpa-server/src/logging.rs, crates/cpa-server/build.rs, crates/cpa-server/src/management.rs, ui/dist/**]
   pull_request:
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths: [install.sh, install.ps1, .github/workflows/install.yml, .github/scripts/test-installers.py, .github/scripts/installer-fixture.rs, crates/cliproxy/**, crates/cpa-server/src/logging.rs, crates/cpa-server/build.rs, crates/cpa-server/src/management.rs, ui/dist/**]
   workflow_dispatch:

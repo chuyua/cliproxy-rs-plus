@@ -1,0 +1,43 @@
+# Development PRs run one Linux build and targeted concurrency, failover and logging regressions.
+# Full multi-OS, integration, and resource-budget gates remain on main promotion PRs.
+name: Develop fast gates
+
+on:
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: develop-fast-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-fast:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: Linux build and core concurrency tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+      - name: Rust 1.99.0
+        run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Linux compile
+        run: cargo build --locked -p cliproxy
+      - name: SQLite concurrent first-bind regression
+        run: cargo test --locked -p cpa-server --lib concurrent_double_bind_keeps_single_node_and_one_cursor_advance -- --nocapture
+      - name: Scheduler concurrent reset regression
+        run: cargo test --locked -p cpa-server --lib concurrent_resets_keep_or_shorten_the_window -- --nocapture
+      - name: Request log streaming and early-rejection regression
+        run: cargo test --locked -p cpa-server --lib enabled_logging_does_not_wait_for_unconsumed_request_bodies -- --nocapture
+      - name: Request log response bounds and decompression regressions
+        run: 'cargo test --locked -p cpa-server --lib request_logging::tests:: -- --nocapture'

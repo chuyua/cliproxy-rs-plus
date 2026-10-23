@@ -22,7 +22,7 @@ mod schema;
 mod text;
 mod trusted;
 mod validate;
-pub use document::{ConfigDocument, archive_comments, is_v8_layout};
+pub use document::{ConfigDocument, archive_comments, credential_error, is_v8_layout, v8_group_error, v8_layout_error};
 pub use schema::validate as validate_config_fields;
 pub use schema::{coerce_typed_scalars, go_bool, go_int};
 
@@ -36,37 +36,36 @@ pub fn yaml_value(text: &str) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+/// yaml.v3's error for a merge value that is not a mapping or a list of mappings.
+const MERGE_NOT_MAPS: &str = "yaml: map merge requires map or sequence of maps as the value";
+
 /// Go `expandConfigAliases` plus yaml.v3's merge rules: `<<` keys expand bottom-up
 /// (nested merges first); explicit keys win, then earlier merged mappings. A merge
-/// value that is not a mapping or a list of mappings is yaml.v3's decode error.
-/// (Aliases are already expanded by the parser.)
-///
-/// ponytail: the parsed value no longer says whether a key was quoted, so a quoted
-/// `<<` key in config.yaml merges here, where yaml.v3 loads it as a plain key. Go's
-/// style-normalizing v8 save clears double quotes only: a double-quoted `"<<"` then
-/// merges a mapping or fails on a scalar, a single-quoted `'<<'` stays a plain key, and
-/// an unknown section archived before the save never merges. A JSON body sent to
-/// `/config.yaml` is the same gap (Go 422, here 400). JSON bodies elsewhere keep `<<`
-/// literal until the completed candidate is expanded. Telling quoted keys apart needs
-/// the yaml-edit syntax tree walked alongside the value.
+/// value that is not a mapping or a list of mappings is yaml.v3's decode error, even in
+/// a merge source an explicit key or an earlier source shadows, which yaml.v3 never
+/// decodes.
+/// (Aliases are already expanded by the parser.) The parsed value no longer says whether
+/// a key was quoted or a merge operand an alias, so [`yaml_value`] refuses a quoted
+/// `<<` key (yaml.v3 reads it as a plain key) and fails an alias of a sequence as a
+/// merge operand. A JSON management body, which is not read through it, keeps `<<`
+/// literal until the completed candidate is expanded, as Go's save ends up writing it plain.
 pub fn expand_merges(value: &mut Value) -> anyhow::Result<()> {
-    const NOT_MAPS: &str = "map merge requires map or sequence of maps as the value";
     match value {
         Value::Mapping(map) => {
             for (_, child) in map.iter_mut() {
                 expand_merges(child)?;
             }
             if let Some(merge) = map.shift_remove("<<") {
-                let sources: Vec<Mapping> = match merge {
+                let sources: Vec<Mapping> = match untagged(merge) {
                     Value::Mapping(m) => vec![m],
                     Value::Sequence(items) => items
                         .into_iter()
-                        .map(|item| match item {
+                        .map(|item| match untagged(item) {
                             Value::Mapping(m) => Ok(m),
-                            _ => Err(anyhow::anyhow!(NOT_MAPS)),
+                            _ => Err(anyhow::anyhow!(MERGE_NOT_MAPS)),
                         })
                         .collect::<anyhow::Result<_>>()?,
-                    _ => bail!(NOT_MAPS),
+                    _ => bail!(MERGE_NOT_MAPS),
                 };
                 for source in sources {
                     for (key, item) in source {
@@ -84,6 +83,14 @@ pub fn expand_merges(value: &mut Value) -> anyhow::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// A merge operand without its local tags: yaml.v3 merges a tagged mapping by its kind.
+fn untagged(value: Value) -> Value {
+    match value {
+        Value::Tagged(tagged) => untagged(tagged.value),
+        other => other,
+    }
 }
 pub use trusted::{TrustedProxies, go_trim_space};
 pub use validate::{catalog_sources as validate_catalog_sources, parse_duration};
@@ -236,40 +243,6 @@ impl Default for Config {
     }
 }
 
-const V8_PARENTS: &[&str] = &[
-    "server",
-    "management",
-    "access",
-    "credentials",
-    "routing",
-    "routing.retry",
-    "routing.cooldown",
-    "requests",
-    "oauth",
-    "oauth.providers",
-    "multimedia",
-    "observability",
-    "observability.logs",
-    "observability.usage",
-    "server.tls",
-    "server.discovery",
-    "server.discovery.interfaces",
-    "credentials.concurrency",
-    "credentials.in-flight",
-    "requests.streaming",
-    "requests.payload",
-    "client",
-    "client.codex",
-    "oauth.providers.codex",
-    "oauth.providers.aistudio",
-    "oauth.providers.antigravity",
-    "upstream",
-    "upstream.codex",
-    "upstream.claude",
-    "upstream.claude.header-defaults",
-    "upstream.xai",
-];
-
 /// Writes `hash` over the plaintext `secret-key` (see [`with_secret_hash`]).
 fn persist_secret_hash(path: &Path, text: &str, hash: &str) -> anyhow::Result<()> {
     ConfigDocument::write(path, &with_secret_hash(text, hash)?)
@@ -355,8 +328,9 @@ fn with_secret_hash(text: &str, hash: &str) -> anyhow::Result<String> {
 /// would still be a scalar value elsewhere in it (a YAML anchor or a copy). A failure
 /// of the write itself can leave a partial file, as in Go.
 ///
-/// Like Go, this only decodes the file: the validators of a startup load do not run,
-/// so their messages, which quote setting values, cannot carry a secret into the log.
+/// Like Go, this only decodes the file: the validators of a startup load, and its
+/// credential weight preflight, do not run, so their messages, which quote setting
+/// values, cannot carry a secret into the log.
 pub fn prepare_for_upload(path: &Path) -> anyhow::Result<()> {
     let text = String::from_utf8(std::fs::read(path)?).context("failed to parse config file")?;
     let prepared = prepared_for_upload(&text)?;
@@ -367,7 +341,7 @@ pub fn prepare_for_upload(path: &Path) -> anyhow::Result<()> {
 }
 
 fn prepared_for_upload(text: &str) -> anyhow::Result<String> {
-    decode(text).context("failed to parse config file")?;
+    decode(text, Decode::Upload).context("failed to parse config file")?;
     // yaml.v3 and libyaml end a line at NEL, LS and PS too; yaml-edit, which places
     // the edits and reads the secret's tag, does not, so a comment would hide what
     // follows it. Refuse rather than misread the file.
@@ -574,9 +548,24 @@ fn scalar_exists(node: &Value, value: &str) -> bool {
     }
 }
 
+/// Which Go entry point [`decode`] follows.
+#[derive(Clone, Copy, PartialEq)]
+enum Decode {
+    /// `LoadConfig`: the credential preflight (`validateCredentialWeightYAML`), then the
+    /// typed decode.
+    Load,
+    /// `ParseConfigBytes`: as `Load`, with typed-decode errors wrapped as
+    /// `parse config payload: ...` (Go wraps its `yaml.Unmarshal`).
+    Payload,
+    /// `prepareConfigForUpload`: the typed decode only, so of the credential checks only
+    /// the v8 key groups, which `flattenV8` makes while decoding.
+    Upload,
+}
+
 /// The decoding part of [`Config::parse`]: the YAML, its layout and the setting types,
-/// before the validators. Its errors name settings, not their values.
-fn decode(text: &str) -> anyhow::Result<(Mapping, ConfigDocument)> {
+/// before the validators. Its errors name settings, not their values. The layout checks
+/// come first, unwrapped, as in Go.
+fn decode(text: &str, mode: Decode) -> anyhow::Result<(Mapping, ConfigDocument)> {
     let mut parsed = yaml_value(text)?;
     // Before any migration, as Go expands aliases first.
     expand_merges(&mut parsed)?;
@@ -586,10 +575,25 @@ fn decode(text: &str) -> anyhow::Result<(Mapping, ConfigDocument)> {
         _ => bail!("config must be a mapping"),
     };
     validate_shape(&root)?;
+    let credentials = if mode == Decode::Upload {
+        v8_group_error(&root)
+    } else {
+        credential_error(&root)
+    };
+    if let Some(e) = credentials {
+        bail!(e);
+    }
     let mut document = ConfigDocument::from_mapping(root.clone())?;
     document.coerce_typed_scalars();
-    schema::validate(document.value(), false)?;
-    validate::decoded(document.value())?;
+    schema::validate(document.value(), false)
+        .and_then(|()| validate::decoded(document.value()))
+        .map_err(|e| {
+            if mode == Decode::Payload {
+                anyhow::anyhow!("parse config payload: {e}")
+            } else {
+                e
+            }
+        })?;
     Ok((root, document))
 }
 
@@ -614,8 +618,18 @@ impl Config {
         Ok(config)
     }
 
+    /// Go `ParseConfigBytes`, as the v8 config writer reports it: [`Config::parse`] with
+    /// typed-decode errors wrapped as `parse config payload: ...` (see [`decode`]).
+    pub fn parse_payload(text: &str) -> anyhow::Result<Self> {
+        Self::parse_as(text, Decode::Payload)
+    }
+
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let (root, document) = decode(text)?;
+        Self::parse_as(text, Decode::Load)
+    }
+
+    fn parse_as(text: &str, mode: Decode) -> anyhow::Result<Self> {
+        let (root, document) = decode(text, mode)?;
         let canonical = document.value().as_mapping().expect("document is a mapping");
         let routing = decode_section::<RoutingConfig>(canonical, "routing")?;
         let mut routing = routing;
@@ -719,13 +733,8 @@ fn null_scalars_to_zero(mut value: Value) -> Value {
 }
 
 fn validate_shape(root: &Mapping) -> anyhow::Result<()> {
-    for parent in V8_PARENTS {
-        match lookup(root, parent) {
-            None | Some(Value::Mapping(_)) => {}
-            // Routing is shared with the legacy layout, where null means defaults.
-            Some(Value::Null) if *parent == "routing" => {}
-            Some(_) => bail!("{parent} must be a mapping"),
-        }
+    if let Some(e) = document::shape_error(root) {
+        bail!(e);
     }
     if let Some(version) = lookup(root, "config-version")
         && version.as_u64() != Some(8)
@@ -872,6 +881,26 @@ mod tests {
         assert!(
             Config::parse("routing: null\nconfig-version: 8\n").is_ok(),
             "routing: null means defaults"
+        );
+    }
+
+    #[test]
+    fn image_generation_mode_reads_go_spellings() {
+        let mode = |yaml: &str| {
+            Config::parse(&format!("multimedia:\n  disable-image-generation: {yaml}\n"))
+                .map(|c| c.document["multimedia"]["disable-image-generation"].clone())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(mode("' Off '"), Ok(Value::Bool(false)));
+        assert_eq!(mode("~"), Ok(Value::Bool(false)));
+        assert_eq!(mode("YES"), Ok(Value::Bool(true)));
+        assert_eq!(mode("' Chat'"), Ok(Value::from("chat")));
+        assert_eq!(
+            mode("\"\\u00dc\\u0001\""),
+            Err(
+                "invalid disable-image-generation value \"\u{fc}\\x01\" (allowed: true, false, chat, passthrough)"
+                    .into()
+            )
         );
     }
 

@@ -45,8 +45,15 @@ class UpstreamProvenanceTests(unittest.TestCase):
 
     def test_stale_upstream_lock_fails_strict_gate(self):
         self.git("branch", "-f", "provenance/master", self.private)
+        self.assertEqual(self.check(), self.upstream)
         with self.assertRaises(ValueError):
             self.check(require_tip=True)
+
+    def test_stale_lock_still_requires_real_upstream_lineage(self):
+        self.git("branch", "-f", "provenance/master", self.private)
+        self.lock.write_text("f" * 40 + "\n")
+        with self.assertRaises(ValueError):
+            self.check()
 
     def test_missing_object_fails(self):
         self.lock.write_text("f" * 40 + "\n")
