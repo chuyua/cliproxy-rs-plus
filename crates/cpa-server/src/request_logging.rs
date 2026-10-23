@@ -231,6 +231,18 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     capture_response(sink, head, response).await
 }
 
+fn append_response_bounded(target: &mut Vec<u8>, chunk: &[u8]) {
+    const MARKER: &[u8] = b"\n[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+    if target.len() > RESPONSE_CAPTURE_LIMIT {
+        return;
+    }
+    let remaining = RESPONSE_CAPTURE_LIMIT - target.len();
+    target.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    if chunk.len() > remaining {
+        target.extend_from_slice(MARKER);
+    }
+}
+
 async fn capture_response(sink: RequestLog, head: bool, mut response: Response) -> Response {
     if response.extensions().get::<Captured>().is_some() {
         return response;
@@ -255,7 +267,7 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
         let body = std::mem::replace(response.body_mut(), Body::empty());
         if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
             if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                record.response.extend_from_slice(&bytes);
+                append_response_bounded(&mut record.response, &bytes);
             }
             *response.body_mut() = Body::from(bytes);
         }
@@ -882,7 +894,7 @@ impl HttpBody for ResponseBody {
                 let config = record.state.rt.config();
                 if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
                 {
-                    record.response.extend_from_slice(bytes);
+                    append_response_bounded(&mut record.response, bytes);
                 }
             }
         }
