@@ -26,6 +26,9 @@ use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
 const DEFERRED_BODY: u64 = 32 << 20;
+/// Bound non-SSE downstream log capture independently of the response size.
+/// This is log storage only: bytes forwarded to the client are untouched.
+const RESPONSE_CAPTURE_LIMIT: usize = 8 << 20;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! { static CURRENT: RequestLog; }
@@ -196,6 +199,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             status: 200,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
+            response_truncated: false,
             response_spool: None,
             streaming: false,
             streaming_failed: false,
@@ -244,11 +248,20 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
             record.response_headers = response.headers().clone();
         }
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
-            if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                record.response.extend_from_slice(&bytes);
+        match axum::body::to_bytes(body, RESPONSE_CAPTURE_LIMIT).await {
+            Ok(bytes) => {
+                if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                    record.capture_response_chunk(&bytes);
+                }
+                *response.body_mut() = Body::from(bytes);
             }
-            *response.body_mut() = Body::from(bytes);
+            Err(_) => {
+                // HEAD bodies are suppressed by HTTP. Do not allocate an
+                // unbounded handler body solely for its diagnostic log.
+                if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                    record.response_truncated = true;
+                }
+            }
         }
     }
     let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -873,7 +886,7 @@ impl HttpBody for ResponseBody {
                 let config = record.state.rt.config();
                 if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
                 {
-                    record.response.extend_from_slice(bytes);
+                    record.capture_response_chunk(bytes);
                 }
             }
         }
@@ -1123,6 +1136,7 @@ struct Record {
     status: u16,
     response_headers: HeaderMap,
     response: Vec<u8>,
+    response_truncated: bool,
     response_spool: Option<Spool>,
     streaming: bool,
     streaming_failed: bool,
@@ -1143,6 +1157,12 @@ struct Record {
 }
 
 impl Record {
+    fn capture_response_chunk(&mut self, bytes: &[u8]) {
+        let remaining = RESPONSE_CAPTURE_LIMIT.saturating_sub(self.response.len());
+        self.response.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        self.response_truncated |= bytes.len() > remaining;
+    }
+
     async fn finish(mut self) {
         if self.streaming_failed {
             return;
@@ -1174,7 +1194,19 @@ impl Record {
             }
         }
         let decompress_error = if !self.streaming {
-            let (body, error) = decode(std::mem::take(&mut self.response), &self.response_headers, false, None).await;
+            // Truncated compressed input cannot be decoded reliably. Even a
+            // complete small gzip body can inflate many gigabytes.
+            let (body, error) = if self.response_truncated {
+                (std::mem::take(&mut self.response), None)
+            } else {
+                decode(
+                    std::mem::take(&mut self.response),
+                    &self.response_headers,
+                    false,
+                    Some(RESPONSE_CAPTURE_LIMIT as u64),
+                )
+                .await
+            };
             self.response = body;
             error
         } else {
@@ -1343,6 +1375,13 @@ impl Record {
                 out.write_all(b"\n")?;
             }
             out.write_all(&self.response)?;
+            if self.response_truncated {
+                write!(
+                    out,
+                    "\n[RESPONSE BODY TRUNCATED: captured first {} bytes]",
+                    self.response.len()
+                )?;
+            }
             if let Some(error) = decompress_error {
                 write!(out, "\n[DECOMPRESSION ERROR: {error}]")?;
             }
@@ -1644,7 +1683,11 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             if !output.ends_with(b"\n") {
                 output.push(b'\n');
             }
-            output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
+            output.extend_from_slice(if request {
+                b"[DECOMPRESSED REQUEST BODY TRUNCATED]".as_slice()
+            } else {
+                b"[DECOMPRESSED RESPONSE BODY TRUNCATED]".as_slice()
+            });
             return (output, None);
         }
         body = output;
@@ -1741,6 +1784,64 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "log"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn large_response_logging_is_bounded_without_truncating_client_bytes() {
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let app = axum::Router::new().fallback(|| async {
+            let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+            let chunks = futures_util::stream::iter((0..9).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+            Response::new(Body::from_stream(chunks))
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivered = axum::body::to_bytes(response.into_body(), 10 << 20).await.unwrap();
+        assert_eq!(delivered.len(), 9 << 20, "logging must not truncate the HTTP response");
+
+        let marker = "[RESPONSE BODY TRUNCATED: captured first 8388608 bytes]";
+        let content = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = logs(&dir).first()
+                    && let Ok(content) = std::fs::read_to_string(path)
+                    && content.contains(marker)
+                {
+                    return content;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(content.len() < (9 << 20), "log storage must be bounded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_response_log_has_an_inflation_ceiling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let (body, error) = decode(
+            include_bytes!("../tests/fixtures/response_bomb.gz").to_vec(),
+            &headers,
+            false,
+            Some(RESPONSE_CAPTURE_LIMIT as u64),
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(&body[..8], &[0; 8]);
+        assert!(body.ends_with(b"[DECOMPRESSED RESPONSE BODY TRUNCATED]"));
+        assert!(body.len() < (9 << 20), "gzip inflation must be bounded");
     }
 
     #[tokio::test]
