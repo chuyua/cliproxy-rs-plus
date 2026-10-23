@@ -268,6 +268,8 @@ impl<'a> Res<'a> {
 fn array_or_map(json: &[u8], vc: u8, base: usize) -> (Vec<Res<'_>>, Vec<(Vec<u8>, Res<'_>)>) {
     let mut items = vec![];
     let mut pairs: Vec<(Vec<u8>, Res<'_>)> = vec![];
+    // The first of duplicate keys wins; `seen` keeps that check constant-time.
+    let mut seen = std::collections::HashSet::new();
     let mut i = 0;
     while i < json.len() {
         if json[i] == vc {
@@ -315,7 +317,7 @@ fn array_or_map(json: &[u8], vc: u8, base: usize) -> (Vec<Res<'_>>, Vec<(Vec<u8>
             if count % 2 == 0 {
                 key = Some(value.s.to_vec());
             } else if let Some(k) = key.take()
-                && !pairs.iter().any(|(existing, _)| *existing == k)
+                && seen.insert(k.clone())
             {
                 pairs.push((k, value));
             }
@@ -467,7 +469,8 @@ pub fn go_parse_float(s: &[u8]) -> Result<f64, f64> {
         return Ok(sign * f64::INFINITY);
     }
     if text.eq_ignore_ascii_case("nan") {
-        return Ok(f64::NAN);
+        // math.NaN(): Go's NaN bits differ from Rust's f64::NAN (0x7FF8000000000000).
+        return Ok(f64::from_bits(0x7FF8_0000_0000_0001));
     }
     let bytes = body.as_bytes();
     if bytes.len() > 2 && bytes[0] == b'0' && bytes[1] | 0x20 == b'x' {
@@ -652,12 +655,40 @@ fn underscore_ok(s: &[u8]) -> bool {
     saw != b'_'
 }
 
+/// Go's shortest digits for a finite non-zero `f` (Ryū, an exact tie rounded half to
+/// even; Rust's `Display` rounds it up): the significant digits and the decimal point's
+/// position, `f = ±0.digits × 10^point`.
+fn shortest(f: f64) -> (String, i32) {
+    let mut buf = ryu::Buffer::new();
+    let text = buf.format_finite(f.abs());
+    let (mantissa, exp) = text.split_once('e').unwrap_or((text, "0"));
+    let exp: i32 = exp.parse().unwrap_or_default();
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{int}{frac}");
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    let digits = digits.trim_matches('0').to_owned();
+    (digits, int.len() as i32 + exp - lead as i32)
+}
+
 /// `strconv.FormatFloat(f, 'f', -1, 64)`.
 pub fn fmt_float(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "+Inf".into() } else { "-Inf".into() };
     }
-    format!("{f}")
+    if f == 0.0 || f.is_nan() {
+        return format!("{f}");
+    }
+    let (digits, point) = shortest(f);
+    let sign = if f < 0.0 { "-" } else { "" };
+    let len = digits.len() as i32;
+    if point <= 0 {
+        format!("{sign}0.{}{digits}", "0".repeat(-point as usize))
+    } else if point >= len {
+        format!("{sign}{digits}{}", "0".repeat((point - len) as usize))
+    } else {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{sign}{int}.{frac}")
+    }
 }
 
 /// encoding/json's float64 encoding (shortest digits, exponent form outside
@@ -668,16 +699,18 @@ pub fn json_float(f: f64) -> Option<String> {
     }
     let abs = f.abs();
     if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
-        let e = format!("{f:e}");
-        let (mantissa, exp) = e.split_once('e').unwrap();
-        let exp: i32 = exp.parse().unwrap();
+        let (digits, point) = shortest(f);
+        let sign = if f < 0.0 { "-" } else { "" };
+        let (first, rest) = digits.split_at(1);
+        let dot = if rest.is_empty() { "" } else { "." };
+        let exp = point - 1;
         return Some(if exp < 0 {
-            format!("{mantissa}e-{}", -exp)
+            format!("{sign}{first}{dot}{rest}e-{}", -exp)
         } else {
-            format!("{mantissa}e+{exp:02}")
+            format!("{sign}{first}{dot}{rest}e+{exp:02}")
         });
     }
-    Some(format!("{f}"))
+    Some(fmt_float(f))
 }
 
 fn tonum(json: &[u8]) -> &[u8] {
@@ -3394,6 +3427,8 @@ mod parse_float_tests {
         ok("+Inf", f64::INFINITY);
         ok("-infinity", f64::NEG_INFINITY);
         ok("NaN", f64::NAN);
+        // math.NaN() is 0x7FF8000000000001 (Go 1.26 prints 9221120237041090561).
+        assert_eq!(go_parse_float(b"nAn").map(f64::to_bits), Ok(9221120237041090561));
         ok("1e-400", 0.0);
         ok("1.", 1.0);
         ok(".5", 0.5);

@@ -774,25 +774,47 @@ async fn usage_records_the_payload_override_reasoning_effort() {
     }
 }
 
-/// Go `TestCodexImageResolvedModelOnWire` ("custom upstream" and "routing and thinking
-/// suffix", 51bde0ff) through the executor: a configured, prefixed upstream name reaches
-/// the direct Images endpoint as resolved, for a JSON generation and a multipart edit.
+/// Go `TestCodexImageResolvedModelOnWire` ("custom upstream", "routing and thinking
+/// suffix" and the two "final payload" rows, 51bde0ff and 868e137) through the executor:
+/// a configured, prefixed upstream name reaches the direct Images endpoint as resolved,
+/// for a JSON generation and a multipart edit, and the payload rules run once, last.
 #[tokio::test]
 async fn direct_images_send_the_configured_upstream_model() {
     let executor = executor();
     let form = "--XB\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nREQ\r\n--XB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ndiagnostic\r\n--XB--\r\n";
-    for (requested, resolved, configured, want) in [
+    let models = "[{name: openai/gpt-image-2-cpr, protocol: openai, match: [{model: openai/gpt-image-2-cpr}]}]";
+    let override_rules = format!(
+        "payload:\n  override:\n    - models: {models}\n      params: {{model: policy/image-model}}\n    - models: [{{name: \"*\"}}]\n      params: {{\"audit.-1\": once}}\n"
+    );
+    let filter_rules = format!("payload:\n  filter:\n    - models: {models}\n      params: [model]\n");
+    for (requested, resolved, configured, want, rules) in [
         (
             "gpt-image-2",
             "openai/gpt-image-2-cpr",
             "openai/gpt-image-2-cpr",
             "openai/gpt-image-2-cpr",
+            "",
         ),
         (
             "tenant/gpt-image-2(high)",
             "OpenAI/GPT-Image-2(high)",
             "OpenAI/GPT-Image-2",
             "OpenAI/GPT-Image-2",
+            "",
+        ),
+        (
+            "gpt-image-2",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "policy/image-model",
+            override_rules.as_str(),
+        ),
+        (
+            "gpt-image-2",
+            "openai/gpt-image-2-cpr",
+            "openai/gpt-image-2-cpr",
+            "",
+            filter_rules.as_str(),
         ),
     ] {
         for (request_path, upstream_path, content_type, body) in [
@@ -818,7 +840,7 @@ async fn direct_images_send_the_configured_upstream_model() {
                 )],
             );
             let cfg = Config::parse(&format!(
-                "codex-api-key:\n  - api-key: codex-token\n    base-url: {}\n    prefix: tenant\n    models:\n      - name: {configured}\n        alias: gpt-image-2\n",
+                "codex-api-key:\n  - api-key: codex-token\n    base-url: {}\n    prefix: tenant\n    models:\n      - name: {configured}\n        alias: gpt-image-2\n{rules}",
                 mock.url
             ))
             .unwrap();
@@ -858,7 +880,15 @@ async fn direct_images_send_the_configured_upstream_model() {
             assert_eq!(captured.len(), 1, "{resolved} {request_path}");
             assert_eq!(captured[0].path, upstream_path);
             let sent: Value = serde_json::from_slice(&captured[0].body).unwrap();
-            assert_eq!(sent["model"], want, "{resolved} {request_path}");
+            assert_eq!(
+                sent["model"].as_str().unwrap_or_default(),
+                want,
+                "{resolved} {request_path}"
+            );
+            assert_eq!(sent["prompt"], "diagnostic", "{request_path}");
+            if rules.contains("audit") {
+                assert_eq!(sent["audit"], serde_json::json!(["once"]), "{request_path}");
+            }
         }
     }
 }
@@ -1665,7 +1695,7 @@ async fn siwc_requests_match_go() {
             let settings = Settings::scoped(&cfg, &view);
             let shaped = request::shape(&req, &view, &settings, Call::Websocket).unwrap();
             let (body, cache) = request::prompt_cache(&req, shaped.body, Some("exec-session"), true);
-            let body = crate::codex_ws::siwc_turn_body(&view, &req, body);
+            let body = crate::codex_ws::turn_body(&view, &req, &settings, &shaped.finalize, body);
             assert_eq!(body, case["body"].as_str().unwrap(), "{name}: body");
             let headers = request::ws_headers(
                 &view,
@@ -1906,4 +1936,73 @@ async fn siwc_partition_refreshes_like_go() {
     mock.take();
     mock.script(SIWC, vec![json(500, "{}"); 3]);
     assert!(executor.prepare(&cred("j", true, &at(-1)), &cfg).await.is_err());
+}
+
+/// TestPayloadBarrierCodexImageFilter, HTTP half (868e137): a filter removes what the
+/// executor adds late (the image tool, the empty instructions, the prompt cache key).
+#[tokio::test]
+async fn payload_filters_remove_late_codex_additions() {
+    let executor = executor();
+    let cfg = Config::parse(
+        "payload:\n  filter:\n    - models: [{name: gpt-5.6-sol}]\n      params: ['tools.#(type==\"image_generation\")#', instructions, prompt_cache_key]\n",
+    )
+    .unwrap();
+    for stream in [false, true] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna"] {
+            let mock = Mock::start().await;
+            mock.script(
+                "/responses",
+                vec![Reply {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    body: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_barrier\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n".into(),
+                }],
+            );
+            let mut credential = oauth_credential(&mock.url);
+            credential.attributes.insert("api_key".into(), "test".into());
+            credential.attributes.insert("plan_type".into(), "pro".into());
+            let mut req = plain_request(stream, None);
+            req.source_format = Format::OpenAIResponse;
+            req.response_format = Format::OpenAIResponse;
+            req.model = model.into();
+            req.requested_model = model.into();
+            req.body = Bytes::from_static(br#"{"input":"hello","prompt_cache_key":"injected-cache"}"#);
+            req.original_body = req.body.clone();
+            match executor.execute(&credential, req, &cfg).await.unwrap().body {
+                ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
+                ResponseBody::Buffered(_) => {}
+            }
+            let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
+            let image = gjson::get(&sent, r#"tools.#(type=="image_generation")"#).exists();
+            assert_eq!(image, model == "gpt-5.6-luna", "{model} stream={stream}: {sent}");
+            if model == "gpt-5.6-sol" {
+                assert!(!gjson::get(&sent, "instructions").exists(), "{sent}");
+                assert!(!gjson::get(&sent, "prompt_cache_key").exists(), "{sent}");
+            }
+        }
+    }
+}
+
+/// Go 868e137 gives CountTokens the payload barrier: the rules run on the shaped body
+/// before the tokenizer, so a configured `input` changes the count.
+#[test]
+fn count_tokens_sees_the_payload_rules() {
+    let count = |config: &str| {
+        let mut req = plain_request(false, None);
+        req.operation = Operation::CountTokens;
+        req.body = Bytes::from_static(br#"{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#);
+        req.original_body = req.body.clone();
+        let out = super::count_tokens(&req, &Config::parse(config).unwrap()).unwrap();
+        let ResponseBody::Buffered(bytes) = out.body else {
+            panic!("count answers are buffered")
+        };
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        gjson::get(&text, "response.usage.input_tokens").i64()
+    };
+    let plain = count("");
+    let configured = count(
+        "payload:\n  override:\n    - models: [{name: gpt-5.4}]\n      params: {input.0.content.0.text: one two three four five six seven eight nine ten}\n",
+    );
+    assert!(plain > 0);
+    assert!(configured > plain + 5, "{plain} -> {configured}");
 }

@@ -256,6 +256,7 @@ fn check_capsules(name: &str, text: &str, summary: &str) {
 
 #[tokio::test]
 async fn go_reference_scenarios() {
+    cpa_core::registry::install_overlay(Some(Arc::new(WebSearchModels)));
     let ran = replay_go_scenarios(scenarios()).await;
     assert!(ran >= 49, "fixture lost scenarios: {ran}");
 }
@@ -561,13 +562,20 @@ async fn redirect_host(
 }
 
 /// The installed registry answering only Antigravity's available models, which carry
-/// native web search; every other lookup falls through to the pinned catalog as with no
-/// registry installed.
+/// native web search, and `gemini-3.1-pro-low`; every other lookup falls through to the
+/// pinned catalog as with no registry installed.
 struct WebSearchModels;
 
 impl cpa_core::registry::Overlay for WebSearchModels {
-    fn lookup(&self, _: &str, _: Option<&str>) -> Option<cpa_core::registry::ModelInfo> {
-        None
+    /// `go_stream_interactions` was recorded with 6fecc6e's catalog, which listed
+    /// `gemini-3.1-pro-low` for Antigravity; Go v8.0.35 (f62d4d28) drops it. This is its
+    /// definition from that catalog.
+    fn lookup(&self, id: &str, provider: Option<&str>) -> Option<cpa_core::registry::ModelInfo> {
+        if id != "gemini-3.1-pro-low" || provider != Some("antigravity") {
+            return None;
+        }
+        let raw = r#"{"id":"gemini-3.1-pro-low","object":"model","owned_by":"antigravity","type":"antigravity","supports_web_search":true,"display_name":"Gemini 3.1 Pro (Low)","name":"gemini-3.1-pro-low","description":"Gemini 3.1 Pro (Low)","context_length":1048576,"max_completion_tokens":65535,"thinking":{"min":1,"max":65535,"dynamic_allowed":true,"levels":["low","medium","high"]},"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"],"native_capabilities":{"web_search":true}}"#;
+        cpa_core::registry::ModelInfo::from_raw(serde_json::from_str(raw).unwrap()).ok()
     }
 
     fn for_credential(&self, _: &str, _: &str) -> Option<cpa_core::registry::ModelInfo> {
@@ -1059,4 +1067,50 @@ async fn bound_level_model_keeps_the_thinking_level() {
     let thinking = gj::get(&body, "request.generationConfig.thinkingConfig");
     assert_eq!(thinking.get("thinkingLevel").str(), "medium", "{wire}");
     assert!(!thinking.get("thinkingBudget").exists(), "{wire}");
+}
+
+/// TestPayloadBarrierAntigravityRebuiltAttempts (868e137): the payload rules run on the
+/// finished envelope, so the built-in `maxOutputTokens` cleanup and the session ID
+/// cannot undo them, and a filter applies once.
+#[tokio::test]
+async fn payload_rules_run_after_the_envelope() {
+    let answer = serde_json::json!({
+        "status": 200,
+        "headers": [["Content-Type", "application/json"]],
+        "body": r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}"#,
+    });
+    let cfg = Config::parse(
+        r#"
+payload:
+  override:
+    - models: [{name: "gemini-*"}]
+      params: {"generationConfig.maxOutputTokens": 123}
+  filter:
+    - models: [{name: "gemini-*"}]
+      params: ["sessionId", "contents.0"]
+"#,
+    )
+    .unwrap();
+    let mock = Mock::start(&answer).await;
+    let cred = credential(scenario("gemini_execute_basic"), mock.addr());
+    let payload =
+        r#"{"contents":[{"role":"user","parts":[{"text":"first"}]},{"role":"user","parts":[{"text":"second"}]}]}"#;
+    let req = request(&serde_json::json!({
+        "op": "execute", "source": "gemini", "model": "gemini-3.1-pro-preview", "payload": payload,
+    }));
+    AntigravityExecutor::default().execute(&cred, req, &cfg).await.unwrap();
+    let wire = mock.request().unwrap();
+    let body = wire.split_once("\r\n\r\n").unwrap().1.as_bytes().to_vec();
+    assert_eq!(
+        gj::get(&body, "request.generationConfig.maxOutputTokens").int(),
+        123,
+        "{wire}"
+    );
+    assert!(!gj::get(&body, "request.sessionId").exists(), "{wire}");
+    assert_eq!(gj::get(&body, "request.contents.#").int(), 1, "{wire}");
+    assert_eq!(
+        gj::get(&body, "request.contents.0.parts.0.text").str(),
+        "second",
+        "{wire}"
+    );
 }

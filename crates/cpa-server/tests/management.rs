@@ -146,9 +146,12 @@ impl Fixture {
         let hash = bcrypt::hash("fake-management-only", 4).unwrap();
         std::fs::write(&path, yaml(&dir.join("auth"), &hash)).unwrap();
         let cfg = Config::load(&path).unwrap();
+        let scan = cpa_core::config::credentials::scan_auth_dir(&cfg);
+        let mut loaded = scan.credentials;
+        loaded.extend(cpa_core::config::credentials::from_config(&cfg));
         let rt = Arc::new(cpa_server::testing::runtime(
             cfg.clone(),
-            cpa_core::config::credentials::load(&cfg),
+            loaded,
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex,
@@ -157,6 +160,8 @@ impl Fixture {
                 google: Default::default(),
             },
         ));
+        // As the binary records what it loaded.
+        rt.store().note_loaded(&scan.read);
         let state = Management::new(rt.clone(), path);
         Self { dir, state, rt }
     }
@@ -1347,6 +1352,108 @@ async fn excluded_models_writes_are_validated() {
 /// `/credentials/models` reports what the credential registers in the dynamic
 /// registry (Go `GetModelsForClient`): config aliases here, nothing once disabled.
 #[tokio::test]
+async fn fields_refuses_values_its_auth_loader_cannot_read() {
+    // Go writes these values (DIFFERENCES-FROM-GO.md): serde holds the file, so a
+    // number past f64 or nesting past its 127 levels, counted from the file's root
+    // object, is refused before anything is written.
+    let f = Fixture::from_yaml("fields-limits", |auth, hash| {
+        std::fs::write(auth.join("credential.json"), r#"{"type":"claude"}"#).unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        )
+    });
+    let auth = f.dir.join("auth");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+    let deep = ["q"; 128].join(".");
+    let deep_error = format!("invalid field {deep}");
+    for (fields, want) in [
+        (format!(r#""x":{}"#, nested(126)), None),
+        (format!(r#""x":{}"#, nested(127)), Some("invalid field x")),
+        (format!(r#""a.b":{}"#, nested(125)), None),
+        (format!(r#""a.b":{}"#, nested(126)), Some("invalid field a.b")),
+        // A dotted path's objects count too, around a scalar as around a container.
+        (format!(r#""{}":1"#, ["p"; 127].join(".")), None),
+        (format!(r#""{deep}":1"#), Some(deep_error.as_str())),
+        (r#""note":1e400"#.to_owned(), Some("invalid field note")),
+        (r#""note":1e308"#.to_owned(), None),
+    ] {
+        let before = std::fs::read(auth.join("credential.json")).unwrap();
+        let r = client
+            .patch(format!("{base}/v8/management/credentials/fields"))
+            .bearer_auth("fake-management-only")
+            .body(format!(r#"{{"name":"credential.json",{fields}}}"#))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let body: Value = r.json().await.unwrap();
+        let label = &fields[..fields.len().min(12)];
+        match want {
+            Some(message) => {
+                assert_eq!((status, body), (400, json!({ "error": message })), "{label}");
+                assert_eq!(std::fs::read(auth.join("credential.json")).unwrap(), before, "{label}");
+            }
+            None => {
+                assert_eq!((status, body), (200, json!({ "status": "ok" })), "{label}");
+                assert!(f.rt.store().get("credential.json").is_some(), "{label}: reloads");
+            }
+        }
+    }
+    server.abort();
+}
+
+/// Go's `PersistCodexAuthFile` keeps the disk's `siwc` subtree, and Go saves it at any
+/// depth its decoder reads. A subtree added behind the watcher's back deeper than the
+/// auth loader reads (127 levels) would make the saved file unreadable here, so the save
+/// is refused (DIFFERENCES-FROM-GO.md, "Auth file saves") and nothing changes.
+#[tokio::test]
+async fn a_codex_save_refuses_a_disk_subtree_its_loader_cannot_read() {
+    let f = Fixture::from_yaml("codex-deep", |auth, hash| {
+        std::fs::write(auth.join("codex.json"), r#"{"type":"codex","access_token":"fake-a"}"#).unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        )
+    });
+    let file = f.dir.join("auth").join("codex.json");
+    let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+    let before = f.rt.store().get("codex.json").unwrap();
+    let (base, server) = f.server().await;
+    // As edited, and already in the bytes the save would write (an equal save, which
+    // writes nothing but would still publish what the bytes synthesize).
+    let edited = format!(
+        r#"{{"type":"codex","access_token":"fake-a","siwc":{{"x":{}}}}}"#,
+        nested(200)
+    );
+    let canonical = format!(
+        r#"{{"access_token":"fake-a","disabled":false,"siwc":{{"x":{}}},"type":"codex"}}"#,
+        nested(200)
+    );
+    for (disk, disabled) in [(&edited, true), (&canonical, false)] {
+        std::fs::write(&file, disk).unwrap();
+        let r = wreq::Client::new()
+            .patch(format!("{base}/v8/management/credentials/status"))
+            .bearer_auth("fake-management-only")
+            .body(format!(r#"{{"name":"codex.json","disabled":{disabled}}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 500, "disabled {disabled}");
+        assert_eq!(
+            r.json::<Value>().await.unwrap(),
+            json!({"error": "failed to update auth: Io(\"the saved auth file could not be read back\")"})
+        );
+        assert_eq!(&std::fs::read_to_string(&file).unwrap(), disk);
+        let after = f.rt.store().get("codex.json").unwrap();
+        assert_eq!((after.revision, after.disabled), (before.revision, false));
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn credential_models_come_from_registrations() {
     let f = Fixture::from_yaml("models", |auth, hash| {
         format!(
@@ -1444,6 +1551,52 @@ async fn model_definitions_fall_back_to_registered_models_by_channel() {
         r.json::<Value>().await.unwrap(),
         json!({"channel": "nobody", "error": "unknown channel"})
     );
+    server.abort();
+}
+
+/// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
+/// the Codex, xAI and Devin built-ins. Every channel answers Go's bytes, recorded by
+/// `reference/manage` (its second output).
+#[tokio::test]
+async fn model_definitions_match_go_by_channel() {
+    let go: serde_json::Map<String, Value> =
+        serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
+    let f = Fixture::from_yaml("definitions-go", |auth, hash| {
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        )
+    });
+    let (base, server) = f.server().await;
+    let get = |channel: String| {
+        wreq::Client::new()
+            .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
+            .bearer_auth("fake-management-only")
+            .send()
+    };
+    // Aliases answer their canonical section under the requested (lowercased) name.
+    let aliases = [
+        ("kimi-ai", "kimi"),
+        ("Kimi.AI", "kimi"),
+        ("kimi.com", "kimi"),
+        ("x-ai", "xai"),
+        ("GROK", "xai"),
+        ("muse", "meta"),
+    ];
+    let requests = go.keys().map(|c| (c.as_str(), c.as_str())).chain(aliases);
+    let mut compared = 0;
+    for (channel, section) in requests {
+        let r = get(channel.to_owned()).await.unwrap();
+        assert_eq!(r.status(), 200, "{channel}");
+        let want = format!(
+            r#"{{"channel":{},"models":{}}}"#,
+            Value::from(channel.go_lower()),
+            serde_json::to_string(&go[section]).unwrap()
+        );
+        assert_eq!(r.text().await.unwrap(), want, "{channel}");
+        compared += 1;
+    }
+    assert_eq!(compared, 17);
     server.abort();
 }
 
@@ -1840,6 +1993,69 @@ async fn github_token_stays_out_of_the_v0_config_json() {
         assert_eq!(v8, r#""fake-github-secret""#, "{name}");
         server.abort();
     }
+}
+
+/// Go v8.0.35 `TestModelCatalogConfigRoundTrip` with `migrate` false: a v0 save keeps
+/// the `models` sources, which load back unchanged. `models` is a v8 root that Go's
+/// `IsV8ConfigLayout` does not share with the legacy layout, so the save writes v8. The
+/// v8 saves (`migrate` true), clearing and the refusals are the `model_catalog_sources`
+/// scenario in `manage_go.json`; the load refusals are its `load_errors`. Unix only:
+/// `/abs/models.json` is not absolute on Windows.
+#[cfg(unix)]
+#[tokio::test]
+async fn model_catalog_sources_survive_a_legacy_save() {
+    let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n  devin-catalog: 'http://localhost/devin.json'\n";
+    let f = Fixture::from_yaml("catalog-legacy", |auth, hash| private_config(raw, auth, hash, true));
+    let (base, server) = f.server().await;
+    let (status, text) = call(
+        &base,
+        wreq::Method::PUT,
+        "/v0/management/request-retry",
+        r#"{"value":2}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let file = f.file();
+    assert!(file.contains("config-version: 8"), "{file}");
+    let models = Config::parse(&file).unwrap().document["models"].clone();
+    assert_eq!(
+        serde_json::to_value(models).unwrap(),
+        json!({"catalog": "/abs/models.json", "codex-catalog": "https://codex.example.invalid/codex.json", "devin-catalog": "http://localhost/devin.json"}),
+        "{file}"
+    );
+    server.abort();
+}
+
+/// A v0 setter edits the file on disk and validates the result, so a file a reload
+/// refused (here a relative catalog source) refuses an unrelated v0 write and stays as
+/// it is, while the running config keeps the last valid source. Go marshals its valid
+/// in-memory config over the file and saves (DIFFERENCES: v0 setters over a refused file).
+/// Unix only: `/ok/models.json` is not absolute on Windows.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_v0_write_over_a_file_with_an_invalid_catalog_source_is_refused() {
+    let raw = "models:\n  catalog: /ok/models.json\n";
+    let f = Fixture::from_yaml("catalog-v0-refused", |auth, hash| private_config(raw, auth, hash, true));
+    let (base, server) = f.server().await;
+    let disk = f.file().replace("/ok/models.json", "relative.json");
+    std::fs::write(f.dir.join("config.yaml"), &disk).unwrap();
+    let (status, text) = call(
+        &base,
+        wreq::Method::PUT,
+        "/v0/management/request-retry",
+        r#"{"value":2}"#,
+    )
+    .await;
+    assert_eq!(
+        (status, text.as_str()),
+        (
+            422,
+            r#"{"error":"invalid_config","message":"models.catalog must be an http(s) URL or an absolute local path"}"#
+        )
+    );
+    assert_eq!(f.file(), disk);
+    assert_eq!(f.rt.config().document["models"]["catalog"], "/ok/models.json");
+    server.abort();
 }
 
 /// Separate processes give the environment fallback a fresh proxy snapshot without
